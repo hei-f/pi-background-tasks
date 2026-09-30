@@ -32,6 +32,9 @@ import {
   createReloadShellOwnerHubForTests,
   makeReloadShellIdentity,
 } from '../../src/core/reload-shell-owner.js';
+import {
+  seedLegacyReloadSurvivor,
+} from '../helpers/reload-survival-fixture.js';
 import { BG_TERMINAL_CHANNEL, BG_TERMINAL_SCHEMA } from '../../src/core/extension-api.js';
 
 const isWindows = process.platform === 'win32';
@@ -75,7 +78,7 @@ function isTaskSnapshot(value: unknown): value is BgTaskSnapshot {
   return (
     typeof Reflect.get(value, 'id') === 'string' &&
     typeof Reflect.get(value, 'command') === 'string' &&
-    (status === 'running' || status === 'completed' || status === 'failed' || status === 'killed') &&
+    (status === 'running' || status === 'completed' || status === 'failed' || status === 'killed' || status === 'cancelled' || status === 'lost') &&
     typeof Reflect.get(value, 'outputPath') === 'string' &&
     typeof Reflect.get(value, 'cwd') === 'string' &&
     typeof Reflect.get(value, 'startTime') === 'number' &&
@@ -131,8 +134,11 @@ async function createWindowsReloadHarness(): Promise<WindowsReloadHarness> {
     settingsManager,
     modelRuntime,
     noTools: 'builtin',
+    // reload 语义首次激活:认领 hub 中预置的遗留存活任务(M4 起新启动入口
+    // 不再暴露 surviveReload,opt 存活任务仅来自遗留 fixture/dock rerun)。
+    sessionStartEvent: { type: 'session_start', reason: 'reload' },
   });
-  await created.session.bindExtensions({ onError: (error) => assert.fail(error.error) });
+  // 不在此处绑定:opt 存活 fixture 必须先于扩展首次激活注册到进程级 hub。
   return { root, cwd, agentDir, loader, eventBus, session: created.session };
 }
 
@@ -420,16 +426,13 @@ void describe('windows integration', { concurrency: false }, () => {
     });
     try {
       const script = 'process.stdout.write("before\\n");setTimeout(()=>process.stdout.write("after\\n"),400);setTimeout(()=>process.exit(0),800)';
-      const launched = (
-        await executeTaskTool(h.session, 'bg_run', {
-          name: 'Windows continuity',
-          command: `node -e ${JSON.stringify(script)}`,
-          isAgent: false,
-          surviveReload: true,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        })
-      ).task;
+      const launched = await seedLegacyReloadSurvivor(
+        h.session,
+        h.cwd,
+        `node -e ${JSON.stringify(script)}`,
+        { name: 'Windows continuity', notifyOnCompletion: false },
+      );
+      await h.session.bindExtensions({ onError: (error) => assert.fail(error.error) });
       const pid = launched.pid;
       const nonce = launched.reloadSurvival?.launchNonce;
       await waitForCondition(
@@ -469,23 +472,21 @@ void describe('windows integration', { concurrency: false }, () => {
         `require('node:child_process').spawn(process.execPath,[${JSON.stringify(grandchild)}],{stdio:'ignore'});setInterval(()=>{},1000);`,
         'utf8',
       );
-      const launched = (
-        await executeTaskTool(h.session, 'bg_run', {
-          name: 'Windows reload tree',
-          command: `node ${JSON.stringify(parent)}`,
-          isAgent: false,
-          surviveReload: true,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        })
-      ).task;
+      const launched = await seedLegacyReloadSurvivor(
+        h.session,
+        h.cwd,
+        `node ${JSON.stringify(parent)}`,
+        { name: 'Windows reload tree', notifyOnCompletion: false },
+      );
+      await h.session.bindExtensions({ onError: (error) => assert.fail(error.error) });
       await waitForCondition(async () => {
         grandchildPid = Number(await readFile(pidFile, 'utf8').catch(() => '0'));
         return grandchildPid > 0;
       }, 'Windows reload grandchild pid');
       await h.session.reload();
       const killed = (await executeTaskTool(h.session, 'bg_kill', { taskId: launched.id })).task;
-      assert.equal(killed.status, 'killed');
+      // M2 迁移表:bg_kill 为 model 发起停止 → cancelled
+      assert.equal(killed.status, 'cancelled');
       await waitForCondition(() => !processExists(grandchildPid), 'Windows reload grandchild exit');
     } finally {
       if (grandchildPid > 0 && processExists(grandchildPid)) {
@@ -501,39 +502,33 @@ void describe('windows integration', { concurrency: false }, () => {
     const h = await createWindowsReloadHarness();
     try {
       const timeoutStart = Date.now();
-      const timed = (
-        await executeTaskTool(h.session, 'bg_run', {
-          name: 'Windows absolute timeout',
-          command: `node -e ${JSON.stringify('setInterval(()=>{},1000)')}`,
-          isAgent: false,
-          surviveReload: true,
-          timeoutSeconds: 1,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        })
-      ).task;
-      await sleep(650);
-      await h.session.reload();
-      const timedTerminal = await waitForWindowsTask(h.session, timed.id);
-      assert.equal(timedTerminal.status, 'failed');
-      assert.ok((timedTerminal.endTime ?? Date.now()) - timeoutStart < 1800);
-
+      // 两条 opt 存活任务均在首次激活前预置进 hub,由 reload 语义绑定的
+      // 新激活一并认领(M4 后新启动入口不再暴露 surviveReload)。
+      const timed = await seedLegacyReloadSurvivor(
+        h.session,
+        h.cwd,
+        `node -e ${JSON.stringify('setInterval(()=>{},1000)')}`,
+        { name: 'Windows absolute timeout', notifyOnCompletion: false, timeoutSeconds: 1 },
+      );
       const capScript = [
         'const cap=Number(process.env.PI_BG_MAX_OUTPUT_BYTES||20*1024*1024)',
         'const chunk=Buffer.alloc(Math.ceil(cap*0.6),97)',
         'process.stdout.write(chunk,()=>setTimeout(()=>process.stdout.write(chunk),500))',
         'setTimeout(()=>{},5000)',
       ].join(';');
-      const capped = (
-        await executeTaskTool(h.session, 'bg_run', {
-          name: 'Windows cumulative cap',
-          command: `node -e ${JSON.stringify(capScript)}`,
-          isAgent: false,
-          surviveReload: true,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        })
-      ).task;
+      const capped = await seedLegacyReloadSurvivor(
+        h.session,
+        h.cwd,
+        `node -e ${JSON.stringify(capScript)}`,
+        { name: 'Windows cumulative cap', notifyOnCompletion: false },
+      );
+      await h.session.bindExtensions({ onError: (error) => assert.fail(error.error) });
+      await sleep(650);
+      await h.session.reload();
+      const timedTerminal = await waitForWindowsTask(h.session, timed.id);
+      assert.equal(timedTerminal.status, 'failed');
+      assert.ok((timedTerminal.endTime ?? Date.now()) - timeoutStart < 1800);
+
       const cap = capped.reloadSurvival?.outputCapBytes;
       assert.equal(typeof cap, 'number');
       await waitForCondition(
@@ -569,16 +564,13 @@ void describe('windows integration', { concurrency: false }, () => {
       };
     });
     try {
-      const launched = (
-        await executeTaskTool(h.session, 'bg_run', {
-          name: 'Windows gap close',
-          command: `node -e ${JSON.stringify('process.stdout.write("gap\\n");setTimeout(()=>process.exit(9),120)')}`,
-          isAgent: false,
-          surviveReload: true,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        })
-      ).task;
+      const launched = await seedLegacyReloadSurvivor(
+        h.session,
+        h.cwd,
+        `node -e ${JSON.stringify('process.stdout.write("gap\\n");setTimeout(()=>process.exit(9),120)')}`,
+        { name: 'Windows gap close', notifyOnCompletion: false },
+      );
+      await h.session.bindExtensions({ onError: (error) => assert.fail(error.error) });
       const reload = h.session.reload();
       await entered;
       await sleep(250);
@@ -606,22 +598,20 @@ void describe('windows integration', { concurrency: false }, () => {
     });
     let pid = 0;
     try {
-      const launched = (
-        await executeTaskTool(h.session, 'bg_run', {
-          name: 'Windows repeated reload',
-          command: `node -e ${JSON.stringify('setInterval(()=>{},1000)')}`,
-          isAgent: false,
-          surviveReload: true,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        })
-      ).task;
+      const launched = await seedLegacyReloadSurvivor(
+        h.session,
+        h.cwd,
+        `node -e ${JSON.stringify('setInterval(()=>{},1000)')}`,
+        { name: 'Windows repeated reload', notifyOnCompletion: false },
+      );
+      await h.session.bindExtensions({ onError: (error) => assert.fail(error.error) });
       pid = launched.pid ?? 0;
       await h.session.reload();
       await h.session.reload();
       const claimed = await windowsStatus(h.session, launched.id);
       assert.equal(claimed.pid, pid);
-      assert.equal(claimed.reloadSurvival?.handoffCount, 2);
+      // 预置 fixture 自带一次初始 handoff;两次 reload 后累计 3 次
+      assert.equal(claimed.reloadSurvival?.handoffCount, 3);
       await executeTaskTool(h.session, 'bg_kill', { taskId: launched.id });
       await waitForCondition(() => !processExists(pid), 'repeated reload root exit');
       await waitForCondition(

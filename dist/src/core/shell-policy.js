@@ -20,20 +20,20 @@ export function shellPolicyGuidance(policy) {
         args: displayedArgs(policy),
     });
     const lines = [
-        `bg_run and /bg execute commands with the activation shell policy ${launch}.`,
+        `bash run_in_background:true and the dock "to background" entry execute commands with the activation shell policy ${launch}.`,
         'The executable and arguments are passed directly to process spawn; the executable path is never interpolated into another shell command.',
     ];
     if (policy.dialect === 'user-non-posix') {
-        lines.push('This inherited user shell is not classified as POSIX or Bash. Do not generate Bash/POSIX syntax or assume Bash startup files for bg_run or /bg.', 'Bash remediation: set PI_BG_POSIX_SHELL=bash before starting or reloading Pi; optionally set PI_BG_POSIX_SHELL_PATH to an absolute executable Bash path.');
+        lines.push('This inherited user shell is not classified as POSIX or Bash. Do not generate Bash/POSIX syntax or assume Bash startup files for background commands.', 'Bash remediation: set PI_BG_POSIX_SHELL=bash before starting or reloading Pi; optionally set PI_BG_POSIX_SHELL_PATH to an absolute executable Bash path.');
     }
     else if (policy.dialect === 'bash') {
-        lines.push('Generate Bash syntax for bg_run and /bg. Commands use Bash -c, never -lc, so login-shell startup files are not loaded implicitly.');
+        lines.push('Generate Bash syntax for background commands. Commands use Bash -c, never -lc, so login-shell startup files are not loaded implicitly.');
     }
     else if (policy.dialect === 'posix') {
-        lines.push('Generate portable POSIX shell syntax for bg_run and /bg; do not assume Bash-only syntax. Commands use -c and do not request login-shell startup.');
+        lines.push('Generate portable POSIX shell syntax for background commands; do not assume Bash-only syntax. Commands use -c and do not request login-shell startup.');
     }
     else {
-        lines.push('Generate Windows cmd.exe syntax for bg_run and /bg. The POSIX shell-selection variables do not change Windows execution.');
+        lines.push('Generate Windows cmd.exe syntax for background commands. The POSIX shell-selection variables do not change Windows execution.');
     }
     return lines.join('\n');
 }

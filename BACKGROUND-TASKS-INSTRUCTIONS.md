@@ -32,21 +32,18 @@ Current authored ownership map:
 - **Code is authority for runtime facts; docs describe code.** Do not change code to satisfy prose. When code and docs disagree, update docs or file a code-owner blocker.
 - **Generated regions are not hand-edited.** Regions named `<!-- pi-docs:begin ... -->` / `<!-- pi-docs:end ... -->`, `docs/INDEX.md`, `docs/read-before-edit.md`, README generated facts, and `docs/manifest.json` belong to the docs engine.
 - **No silent truncation, fallback, or route substitution.** Oversized data must be persisted with hashes or rejected loudly. Unavailable model routes, missing context windows, stale config, malformed frames, missing artifacts, and unknown schemas are hard errors.
-- **Parent and child tools are distinct.** Parent tools include `bg_run`, `bg_delegate`, `bg_result`, `bg_status`, `bg_logs`, `bg_kill`, `bg_run_pi_attested`, and the public Fusion tools. Delegate children are inspect-only (`read`, `grep`, `find`, `ls`, `delegate_read_artifact`). Fusion children receive only the workflow-specific candidate tools; evaluator/merger are no-tools.
+- **Background task tools are a covered `bash` plus `bg_status`/`bg_logs`/`bg_kill`.** The covered `bash` (same-name override) detaches a command with `run_in_background:true` and otherwise behaves exactly like the host built-in bash; `run_in_background` is the model-facing entry only. There is no standalone `bg_run` tool (retired with M4) and no `/bg` user command; the user starts background tasks through the dock「转后台」entry (`entrySource:'user'`, notify-only). Delegate/Fusion/attested tool surfaces were removed with M0.
 - **Frontier routing is subscription-only.** GPT/Codex and Claude-class work must use Pi subscription/OAuth channels. Never route them through metered OpenAI, Anthropic API, OpenRouter, Azure, or other paid API channels.
-- **Durability and integrity are contract surfaces.** Terminal task truth is published only after output/metadata durability. Delegate/Fusion artifacts and attested Pi sidecars carry hashes and schema versions; do not replace these with best-effort writes.
+- **Durability and integrity are contract surfaces.** Terminal task truth is published only after output/metadata durability; do not replace these with best-effort writes.
 - **No self-certification.** If a doc freshness or attestation mechanism exists, do not stamp the same change as verified without the required independent check. If the mechanism is absent, say so plainly.
-- **Do not use Fusion tools or commands for package maintenance.** Read files and run focused local checks only.
+- **Scope is process background tasks only.** Delegate/Fusion/attested surfaces are removed with M0; do not use or reference them for package maintenance. Read files and run focused local checks only.
 
 ---
 
 ## Runtime roots
 
 - Task runtime: `.pi/tasks/<session-id>-<pid>/` under the active project cwd.
-- Fusion runtime: `.pi/fusion/<session-id>-<pid>/<run-id>/` under the active project cwd.
-- Delegate artifacts: task-owned artifact directories referenced from task metadata/result packages.
-- Fusion model config: `fusion-models.json` under Pi's agent directory (`getAgentDir()`), not the project `.pi/tasks` tree.
-- Published Pi entrypoints, in load order: `dist/extensions/anthropic-attribution.js`, then `dist/extensions/background-tasks.js`, via `package.json.pi.extensions`. Authoritative TypeScript remains under `extensions/` and `src/`; `npm run build:runtime` produces the shipped JavaScript closure.
+- Published Pi entrypoint: `dist/extensions/background-tasks.js`, via `package.json.pi.extensions`. Authoritative TypeScript remains under `extensions/` and `src/`; `npm run build:runtime` produces the shipped JavaScript closure.
 
 ---
 

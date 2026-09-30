@@ -1,11 +1,17 @@
 import { describe, it, afterEach, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createServer } from 'node:http';
 import {
   ModelRuntime,
   createAgentSession,
@@ -19,7 +25,11 @@ import {
   type ExtensionAPI,
   type ExtensionUIContext,
 } from '@earendil-works/pi-coding-agent';
-import { parseJsonText, type BgTaskSnapshot, type TaskStatus } from '../../src/core/common.js';
+import {
+  parseJsonText,
+  type BgTaskSnapshot,
+  type TaskStatus,
+} from '../../src/core/common.js';
 import { BackgroundTaskRegistry } from '../../src/core/registry.js';
 import {
   BG_EXTENSION_CAPABILITIES,
@@ -32,24 +42,19 @@ import {
   type BackgroundTaskExtensionResponse,
   type BackgroundTaskExtensionTerminal,
 } from '../../src/core/extension-api.js';
-import { parsePackageInfo } from '../../src/core/update-check.js';
 import backgroundTasksExtension from '../../src/extension.js';
 
 const extensionPath = resolve('extensions/background-tasks.ts');
-const scriptedProviderPath = resolve('tests/scripted-provider/scripted-provider-extension.ts');
+const scriptedProviderPath = resolve(
+  'tests/scripted-provider/scripted-provider-extension.ts',
+);
 const roots: string[] = [];
-
-function skipWin32PiPathFixture(t: TestContext, target: string): boolean {
-  if (process.platform !== 'win32') return false;
-  t.skip(
-    `${target} fake Pi PATH interception is not applicable on win32 because production resolves the Pi package instead of PATH by design`,
-  );
-  return true;
-}
 
 function skipWin32PosixPiTelemetry(t: TestContext): boolean {
   if (process.platform !== 'win32') return false;
-  t.skip('POSIX-shell Pi telemetry wrapping is not applicable on win32 cmd tasks by design');
+  t.skip(
+    'POSIX-shell Pi telemetry wrapping is not applicable on win32 cmd tasks by design',
+  );
   return true;
 }
 
@@ -58,7 +63,9 @@ function shellQuote(value: string): string {
 }
 
 function resolvePiCli(): string | undefined {
-  const which = spawnSync('bash', ['-lc', 'command -v pi'], { encoding: 'utf8' });
+  const which = spawnSync('bash', ['-lc', 'command -v pi'], {
+    encoding: 'utf8',
+  });
   return which.status === 0 ? which.stdout.trim() || undefined : undefined;
 }
 
@@ -139,11 +146,6 @@ interface CustomNotificationEntry {
   details: JsonObject;
 }
 
-interface PreparedBgRunArgs extends JsonObject {
-  name?: string;
-  command?: string;
-  isAgent: boolean;
-}
 
 interface UiNotification {
   message: string;
@@ -151,7 +153,14 @@ interface UiNotification {
 }
 
 function isTaskStatus(value: unknown): value is TaskStatus {
-  return value === 'running' || value === 'completed' || value === 'failed' || value === 'killed';
+  return (
+    value === 'running' ||
+    value === 'completed' ||
+    value === 'failed' ||
+    value === 'killed' ||
+    value === 'cancelled' ||
+    value === 'lost'
+  );
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
@@ -199,7 +208,9 @@ function isTestToolResult(value: unknown): value is TestToolResult {
   );
 }
 
-function isCustomNotificationEntry(value: unknown): value is CustomNotificationEntry {
+function isCustomNotificationEntry(
+  value: unknown,
+): value is CustomNotificationEntry {
   return (
     isJsonObject(value) &&
     value['type'] === 'custom_message' &&
@@ -209,23 +220,12 @@ function isCustomNotificationEntry(value: unknown): value is CustomNotificationE
   );
 }
 
-function isPreparedBgRunArgs(value: unknown): value is PreparedBgRunArgs {
-  return (
-    isJsonObject(value) &&
-    typeof value['isAgent'] === 'boolean' &&
-    (value['name'] === undefined || typeof value['name'] === 'string') &&
-    (value['command'] === undefined || typeof value['command'] === 'string')
-  );
-}
 
 function requiredTask(value: unknown, message: string): BgTaskSnapshot {
   assert.ok(isBgTaskSnapshot(value), message);
   return value;
 }
 
-function taskFromResult(result: TestToolResult): BgTaskSnapshot {
-  return requiredTask(result.details.task, 'tool result should include a background task snapshot');
-}
 
 function tasksFromResult(result: TestToolResult): BgTaskSnapshot[] {
   const tasks = result.details.tasks;
@@ -237,7 +237,10 @@ function tasksFromResult(result: TestToolResult): BgTaskSnapshot[] {
 
 function firstTask(result: TestToolResult): BgTaskSnapshot {
   const task = tasksFromResult(result)[0];
-  assert.ok(task, 'tool result should include at least one background task snapshot');
+  assert.ok(
+    task,
+    'tool result should include at least one background task snapshot',
+  );
   return task;
 }
 
@@ -250,15 +253,38 @@ function resultText(result: TestToolResult): string {
   return content.text;
 }
 
-function requiredPrepared(value: unknown): PreparedBgRunArgs {
-  assert.ok(
-    isPreparedBgRunArgs(value),
-    'prepared bg_run arguments should satisfy the bg_run schema',
-  );
-  return value;
+/** 覆盖版 bash receipt 文本内的任务 id(`Started background task ... (bXXXX)`)。 */
+function taskIdFromReceipt(text: string): string {
+  const match = /\(b[0-9a-f]{8}\)/u.exec(text);
+  assert.ok(match, 'background task receipt should carry an id');
+  return match[0].slice(1, -1);
 }
 
-async function exec(session: AgentSession, name: string, params: unknown): Promise<TestToolResult> {
+/**
+ * 以覆盖版 bash `run_in_background:true` 启动后台任务并立即取回快照:
+ * M4 起模型入口只暴露 `{command, timeout, run_in_background}` 三个参数,
+ * receipt 文本携带任务 id,快照经 `bg_status` 取回。
+ */
+async function launchBackgroundTask(
+  session: AgentSession,
+  command: string,
+  timeout?: number,
+): Promise<BgTaskSnapshot> {
+  const receipt = await exec(session, 'bash', {
+    command,
+    run_in_background: true,
+    ...(timeout === undefined ? {} : { timeout }),
+  });
+  const id = taskIdFromReceipt(resultText(receipt));
+  const status = await exec(session, 'bg_status', { taskId: id });
+  return firstTask(status);
+}
+
+async function exec(
+  session: AgentSession,
+  name: string,
+  params: unknown,
+): Promise<TestToolResult> {
   const tool = session.getToolDefinition(name);
   assert.ok(tool, `missing tool ${name}`);
   const result: unknown = await tool.execute(
@@ -268,11 +294,18 @@ async function exec(session: AgentSession, name: string, params: unknown): Promi
     undefined,
     session.extensionRunner.createContext(),
   );
-  assert.ok(isTestToolResult(result), `${name} should return a tool result object`);
+  assert.ok(
+    isTestToolResult(result),
+    `${name} should return a tool result object`,
+  );
   return result;
 }
 
-async function wait(session: AgentSession, id: string, iterations = 100): Promise<BgTaskSnapshot> {
+async function wait(
+  session: AgentSession,
+  id: string,
+  iterations = 100,
+): Promise<BgTaskSnapshot> {
   for (let i = 0; i < iterations; i++) {
     const s = await exec(session, 'bg_status', { taskId: id });
     const t = firstTask(s);
@@ -291,13 +324,17 @@ async function readJsonEventually(path: string): Promise<JsonObject> {
   let last = '';
   for (let i = 0; i < 20; i++) {
     last = await readFile(path, 'utf8').catch(() => '');
-    if (last.trim()) return parseJsonObject(last, 'metadata JSON should be an object');
+    if (last.trim())
+      return parseJsonObject(last, 'metadata JSON should be an object');
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   return parseJsonObject(last, 'metadata JSON should be an object');
 }
 
-async function readJsonWithStatus(path: string, status: string): Promise<JsonObject> {
+async function readJsonWithStatus(
+  path: string,
+  status: string,
+): Promise<JsonObject> {
   let metadata = await readJsonEventually(path);
   for (let attempt = 0; attempt < 40; attempt++) {
     metadata = await readJsonEventually(path);
@@ -330,9 +367,22 @@ function requireOkResult(response: BackgroundTaskExtensionResponse): unknown {
 
 function requireTerminal(value: unknown): BackgroundTaskExtensionTerminal {
   assert.ok(isJsonObject(value), 'EventBus terminal must be an object');
-  assert.deepEqual(Object.keys(value).sort(), ['schema_version', 'task']);
+  const keys = Object.keys(value);
+  assert.ok(
+    keys.includes('schema_version') && keys.includes('task'),
+    'terminal frame must carry schema_version and task',
+  );
   assert.equal(value['schema_version'], BG_TERMINAL_SCHEMA);
-  return { schema_version: BG_TERMINAL_SCHEMA, task: requiredTask(value['task'], 'terminal task') };
+  // M5 向后兼容字段(originMeta/status/failedReason/initiator/summaryTail/usage)
+  // 均为可选;originMeta 为 bash 后台来源标识
+  assert.equal(
+    (value['originMeta'] as JsonObject | undefined)?.['backgroundSource'],
+    'bash',
+  );
+  return {
+    schema_version: BG_TERMINAL_SCHEMA,
+    task: requiredTask(value['task'], 'terminal task'),
+  };
 }
 
 // The EventBus kill response is only emitted after stopTask resolves. On Windows
@@ -380,7 +430,8 @@ async function emitEventRequest(
 // Matches EVENT_RESPONSE_TIMEOUT_MS: a killed task only reaches a terminal state
 // after the Windows grace window elapses, so the same platform budget applies.
 const TERMINAL_SNAPSHOT_POLL_MS = 25;
-const TERMINAL_SNAPSHOT_ATTEMPTS = EVENT_RESPONSE_TIMEOUT_MS / TERMINAL_SNAPSHOT_POLL_MS;
+const TERMINAL_SNAPSHOT_ATTEMPTS =
+  EVENT_RESPONSE_TIMEOUT_MS / TERMINAL_SNAPSHOT_POLL_MS;
 
 async function waitForTerminalSnapshot(
   terminals: readonly BgTaskSnapshot[],
@@ -389,7 +440,9 @@ async function waitForTerminalSnapshot(
   for (let attempt = 0; attempt < TERMINAL_SNAPSHOT_ATTEMPTS; attempt++) {
     const terminal = terminals.find((task) => task.id === taskId);
     if (terminal) return terminal;
-    await new Promise((resolve) => setTimeout(resolve, TERMINAL_SNAPSHOT_POLL_MS));
+    await new Promise((resolve) =>
+      setTimeout(resolve, TERMINAL_SNAPSHOT_POLL_MS),
+    );
   }
   throw new Error(`timed out waiting for terminal ${taskId}`);
 }
@@ -401,7 +454,11 @@ async function cleanupRoot(root: string): Promise<void> {
       await rm(root, { recursive: true, force: true });
       return;
     } catch (error) {
-      if (!(error instanceof Error) || !/ENOTEMPTY/.test(error.message) || attempt === 4)
+      if (
+        !(error instanceof Error) ||
+        !/ENOTEMPTY/.test(error.message) ||
+        attempt === 4
+      )
         throw error;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -430,68 +487,6 @@ function makeStatusUi(
   };
 }
 
-async function startRegistry(
-  payload: string,
-  status = 200,
-): Promise<{ url: string; close: () => Promise<void> }> {
-  const server = createServer((_req, res) => {
-    res.writeHead(status, { 'content-type': 'application/json' });
-    res.end(payload);
-  });
-  await new Promise<void>((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      resolve();
-    });
-  });
-  const address = server.address();
-  assert.ok(
-    address !== null && typeof address === 'object',
-    'registry server must report an address',
-  );
-  return {
-    url: `http://127.0.0.1:${String(address.port)}`,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.close(() => {
-          resolve();
-        });
-      }),
-  };
-}
-
-async function renderFooterViaJobs(session: AgentSession): Promise<void> {
-  const jobs = session.extensionRunner
-    .getRegisteredCommands()
-    .find((cmd) => cmd.invocationName === 'jobs');
-  assert.ok(jobs);
-  await jobs.handler('', session.extensionRunner.createCommandContext());
-}
-
-const UPDATE_ENV_KEYS = ['PI_OFFLINE', 'PI_BG_DISABLE_UPDATE_CHECK', 'PI_BG_REGISTRY_URL'] as const;
-
-type EnvOverrides = Record<string, string>;
-
-interface SettledFooterOptions {
-  env: EnvOverrides;
-  registryPayload: string;
-  registryStatus?: number;
-}
-
-function git(cwd: string, args: string[]): void {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
-  assert.equal(result.status, 0, result.stderr || result.stdout);
-}
-
-async function initCleanGit(cwd: string): Promise<void> {
-  git(cwd, ['init']);
-  git(cwd, ['config', 'user.email', 'pi-bg@example.invalid']);
-  git(cwd, ['config', 'user.name', 'Pi BG Tests']);
-  await writeFile(join(cwd, 'README.md'), 'clean\n', 'utf8');
-  await writeFile(join(cwd, '.gitignore'), '.pi/\nbin/\nreport.md\n', 'utf8');
-  git(cwd, ['add', 'README.md', '.gitignore']);
-  git(cwd, ['commit', '-m', 'init']);
-}
-
 function restoreEnvValue(key: string, value: string | undefined): void {
   if (value === undefined) {
     Reflect.deleteProperty(process.env, key);
@@ -500,140 +495,173 @@ function restoreEnvValue(key: string, value: string | undefined): void {
   process.env[key] = value;
 }
 
-async function settledFooter(
-  options: SettledFooterOptions,
-): Promise<{ status: string | undefined; threw: boolean }> {
-  const saved = new Map<string, string | undefined>();
-  for (const key of UPDATE_ENV_KEYS) {
-    saved.set(key, process.env[key]);
-    restoreEnvValue(key, undefined);
-  }
-  for (const [key, value] of Object.entries(options.env)) process.env[key] = value;
-  const registry = await startRegistry(options.registryPayload, options.registryStatus);
-  process.env['PI_BG_REGISTRY_URL'] = registry.url;
-  const { session } = await harness();
-  const statuses: Array<string | undefined> = [];
-  const notifications: UiNotification[] = [];
-  session.extensionRunner.setUIContext(
-    makeStatusUi(session.extensionRunner.getUIContext(), statuses, notifications),
-  );
-  let threw = false;
-  try {
-    await session.extensionRunner.emit({ type: 'session_start', reason: 'startup' });
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    await renderFooterViaJobs(session);
-  } catch {
-    threw = true;
-  } finally {
-    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
-    session.dispose();
-    await registry.close();
-    for (const key of UPDATE_ENV_KEYS) {
-      restoreEnvValue(key, saved.get(key));
-    }
-  }
-  return { status: statuses.at(-1), threw };
-}
-
 void describe('sdk', () => {
   void it('registers commands, tools, shortcuts, renderers, and runs with output and metadata files', async () => {
     const { session, cwd } = await harness();
     try {
-      for (const tool of ['bg_run', 'bg_status', 'bg_logs', 'bg_kill'])
+      for (const tool of ['bash', 'bg_status', 'bg_logs', 'bg_kill'])
         assert.ok(session.getActiveToolNames().includes(tool), tool);
-      const bgRunTool = session.getToolDefinition('bg_run');
-      assert.ok(bgRunTool, 'bg_run tool should be registered');
-      const bgRunParams: unknown = bgRunTool.parameters;
-      assert.ok(isJsonObject(bgRunParams), 'bg_run schema should be an object');
-      const required = bgRunParams['required'];
       assert.ok(
-        Array.isArray(required) && required.includes('isAgent'),
-        'bg_run schema must require isAgent',
+        !session.getActiveToolNames().includes('bg_run'),
+        'bg_run tool should be retired (M4)',
       );
-      const properties = bgRunParams['properties'];
-      const isAgentSchema = isJsonObject(properties) ? properties['isAgent'] : bgRunParams;
-      assert.match(JSON.stringify(isAgentSchema), /LLM\/agent/);
-      const cmds = session.extensionRunner.getRegisteredCommands().map((c) => c.invocationName);
-      for (const cmd of [
-        'bg',
-        'jobs',
-        'logs',
-        'kill',
-        'tasks',
-        'bg-tasks',
-        'bg-clear',
-        'bg-update',
-      ])
+      const bashTool = session.getToolDefinition('bash');
+      assert.ok(bashTool, 'covered bash tool should be registered');
+      const bashParams: unknown = bashTool.parameters;
+      assert.ok(isJsonObject(bashParams), 'bash schema should be an object');
+      const required = bashParams['required'];
+      assert.ok(
+        Array.isArray(required) && required.includes('command'),
+        'covered bash schema must require command',
+      );
+      const properties = bashParams['properties'];
+      const runInBackgroundSchema = isJsonObject(properties)
+        ? properties['run_in_background']
+        : undefined;
+      assert.match(
+        JSON.stringify(runInBackgroundSchema),
+        /background task/,
+        'bash schema must carry the optional run_in_background field',
+      );
+      const cmds = session.extensionRunner
+        .getRegisteredCommands()
+        .map((c) => c.invocationName);
+      for (const cmd of ['bg-jobs', 'bg-logs', 'bg-kill', 'bg-clear'])
         assert.ok(cmds.includes(cmd), cmd);
-      assert.ok(session.extensionRunner.getMessageRenderer('background-task-notification'));
+      assert.ok(
+        session.extensionRunner.getMessageRenderer(
+          'background-task-notification',
+        ),
+      );
       const shortcuts = session.extensionRunner.getShortcuts({});
       assert.ok(shortcuts.has('shift+down'));
       assert.ok(shortcuts.has('ctrl+alt+c'));
 
-      const r = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'SDK Echo',
+      const receipt = await exec(session, 'bash', {
         command: 'echo sdk-ok',
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
+        run_in_background: true,
       });
-      const t = await wait(session, taskFromResult(r).id);
+      const id = taskIdFromReceipt(resultText(receipt));
+      const t = await wait(session, id);
       assert.equal(t.status, 'completed');
-      assert.equal(t.name, 'SDK Echo');
+      const derivedName = t.name;
+      assert.ok(derivedName && derivedName.length > 0, 'derived task name should exist');
       assert.equal(t.isAgent, false);
       assert.ok(existsSync(join(cwd, t.outputPath)));
-      const metadataPath = join(cwd, t.outputPath.replace(/\.output$/, '.json'));
+      const metadataPath = join(
+        cwd,
+        t.outputPath.replace(/\.output$/, '.json'),
+      );
       assert.ok(existsSync(metadataPath));
       const metadata = await readJsonWithStatus(metadataPath, 'completed');
       assert.equal(metadata['status'], 'completed');
-      assert.equal(metadata['name'], 'SDK Echo');
+      assert.equal(metadata['name'], derivedName);
       assert.equal(metadata['isAgent'], false);
-      const logs = await exec(session, 'bg_logs', { taskId: t.id, maxBytes: 100 });
+      const logs = await exec(session, 'bg_logs', {
+        taskId: t.id,
+        maxBytes: 100,
+      });
       assert.match(resultText(logs), /sdk-ok/);
-      await assert.rejects(() => exec(session, 'bg_kill', { taskId: t.id }), /not running/);
+      await assert.rejects(
+        () => exec(session, 'bg_kill', { taskId: t.id }),
+        /not running/,
+      );
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
 
   void it('BUG-181 exposes an event-driven prompt contract and truthful launch receipts', async () => {
-    const { session } = await harness();
+    const eventBus = createEventBus();
+    const { session } = await harness({ eventBus });
     try {
+      await session.extensionRunner.emit({
+        type: 'session_start',
+        reason: 'startup',
+      });
       const ctx = session.extensionRunner.createContext();
       const systemPrompt = ctx.getSystemPrompt();
-      assert.match(systemPrompt, /Do not call sleep, bg_status, or bg_logs merely to wait/);
-      assert.match(systemPrompt, /automatically starts a follow-up agent turn/);
-      assert.match(systemPrompt, /A running result is not an instruction to poll again/);
-      assert.match(systemPrompt, /Do not repeatedly call bg_logs to wait for completion/);
-      assert.match(systemPrompt, /Treat <background-task-notification> as durable terminal truth/);
+      assert.match(
+        systemPrompt,
+        /do not sleep or poll merely to wait/,
+      );
+      assert.match(systemPrompt, /starts a follow-up agent turn/);
+      assert.match(
+        systemPrompt,
+        /A running result is not an instruction to poll again/,
+      );
+      assert.match(
+        systemPrompt,
+        /Do not repeatedly call bg_logs to wait for completion/,
+      );
+      assert.match(
+        systemPrompt,
+        /Treat <background-task-notification> as durable terminal truth/,
+      );
       assert.doesNotMatch(
         systemPrompt,
         /After bg_run, use bg_status and bg_logs to inspect progress/,
       );
 
-      const bgRun = session.getToolDefinition('bg_run');
+      const bash = session.getToolDefinition('bash');
       const bgStatus = session.getToolDefinition('bg_status');
       const bgLogs = session.getToolDefinition('bg_logs');
-      assert.ok(bgRun && bgStatus && bgLogs, 'background tools should be registered');
-      assert.match(bgRun.description, /do not sleep or poll merely to wait/);
+      assert.ok(
+        bash && bgStatus && bgLogs,
+        'covered bash and background inspection tools should be registered',
+      );
+      // 「不 sleep/poll 等待」指引位于系统提示(promptGuidelines);工具描述
+      // 层面断言覆盖版 bash 的等价宿主语义与后台入口字段
+      assert.match(
+        bash.description,
+        /identical to the built-in bash tool/,
+      );
+      assert.match(bash.description, /run_in_background:true/);
       assert.match(bgStatus.description, /not a waiting primitive/);
       assert.match(bgLogs.description, /not a waiting primitive/);
 
       // shellQuote emits POSIX single quotes, which cmd.exe does not understand.
       const longCommand = `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`;
+
+      // 覆盖版 bash 模型入口缺省绑定 notify+trigger:receipt 文本即交付指引。
+      const receipt = await exec(session, 'bash', {
+        command: longCommand,
+        run_in_background: true,
+      });
+      const receiptText = resultText(receipt);
+      assert.ok(
+        receiptText.includes('Terminal notification: enabled.'),
+        'default model entry receipt should enable terminal notification',
+      );
+      assert.ok(
+        receiptText.includes('Automatic follow-up turn: enabled.'),
+        'default model entry receipt should enable automatic follow-up',
+      );
+      assert.ok(
+        receiptText.includes('Next action: do not poll or sleep'),
+        'default model entry receipt should instruct not to poll',
+      );
+      assert.equal(
+        Reflect.get(receipt, 'terminate'),
+        undefined,
+        'covered bash background launch must remain non-terminating',
+      );
+
+      // 交付组合的 snapshot 真值经 EventBus run 请求验证(覆盖版 bash 不再
+      // 暴露 notifyOnCompletion/triggerOnCompletion 参数;run 请求闭包 schema
+      // 要求两布尔必填,「缺省」即显式 notify=true + trigger=false;receipt
+      // 文本组合由单测 deriveCompletionDeliveryGuidance 覆盖)。
       const cases = [
         {
           name: 'Default Delivery',
-          notifyOnCompletion: undefined,
-          triggerOnCompletion: undefined,
+          notifyOnCompletion: true,
+          triggerOnCompletion: false,
           expectedNotify: true,
-          expectedTrigger: true,
-          expected: [
-            'Terminal notification: enabled.',
-            'Automatic follow-up turn: enabled.',
-            'Next action: do not poll or sleep',
-          ],
+          expectedTrigger: false,
         },
         {
           name: 'Notification Only',
@@ -641,11 +669,6 @@ void describe('sdk', () => {
           triggerOnCompletion: false,
           expectedNotify: true,
           expectedTrigger: false,
-          expected: [
-            'Terminal notification: enabled.',
-            'Automatic follow-up turn: disabled.',
-            'will not start an agent turn',
-          ],
         },
         {
           name: 'Disabled Requested Wake',
@@ -653,11 +676,6 @@ void describe('sdk', () => {
           triggerOnCompletion: true,
           expectedNotify: false,
           expectedTrigger: true,
-          expected: [
-            'Terminal notification: disabled.',
-            'Automatic follow-up turn: disabled because terminal notifications are disabled.',
-            'triggerOnCompletion has no effect',
-          ],
         },
         {
           name: 'Manual Delivery',
@@ -665,44 +683,32 @@ void describe('sdk', () => {
           triggerOnCompletion: false,
           expectedNotify: false,
           expectedTrigger: false,
-          expected: [
-            'Terminal notification: disabled.',
-            'Automatic follow-up turn: disabled.',
-            'deliberate manual monitoring',
-          ],
         },
       ] as const;
 
       for (const testCase of cases) {
-        const params = {
-          isAgent: false,
+        const payload: Record<string, unknown> = {
           name: testCase.name,
           command: longCommand,
-          ...(testCase.notifyOnCompletion === undefined
-            ? {}
-            : { notifyOnCompletion: testCase.notifyOnCompletion }),
-          ...(testCase.triggerOnCompletion === undefined
-            ? {}
-            : { triggerOnCompletion: testCase.triggerOnCompletion }),
+          isAgent: false,
+          notifyOnCompletion: testCase.notifyOnCompletion,
+          triggerOnCompletion: testCase.triggerOnCompletion,
         };
-        const result = await exec(session, 'bg_run', params);
-        const task = taskFromResult(result);
+        const run = await emitEventRequest(
+          eventBus,
+          `sdk-delivery-${testCase.name.replaceAll(' ', '-')}`,
+          'run',
+          payload,
+        );
+        const task = requiredTask(requireOkResult(run), 'delivery run task');
         assert.equal(task.notifyOnCompletion, testCase.expectedNotify);
         assert.equal(task.triggerOnCompletion, testCase.expectedTrigger);
-        for (const expected of testCase.expected) {
-          assert.ok(
-            resultText(result).includes(expected),
-            `${testCase.name} receipt should include ${JSON.stringify(expected)}`,
-          );
-        }
-        assert.equal(
-          Reflect.get(result, 'terminate'),
-          undefined,
-          'bg_run must remain non-terminating for workflows that continue useful work',
-        );
       }
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
@@ -711,12 +717,18 @@ void describe('sdk', () => {
     const eventBus = createEventBus();
     const terminals: BgTaskSnapshot[] = [];
     const eventOrder: string[] = [];
-    const unsubscribeResponseOrder = eventBus.on(BG_RESPONSE_CHANNEL, (data) => {
-      const response = requireEventResponse(data);
-      if (response.request_id === 'sdk-run' || response.request_id === 'sdk-kill') {
-        eventOrder.push(`response:${response.request_id}`);
-      }
-    });
+    const unsubscribeResponseOrder = eventBus.on(
+      BG_RESPONSE_CHANNEL,
+      (data) => {
+        const response = requireEventResponse(data);
+        if (
+          response.request_id === 'sdk-run' ||
+          response.request_id === 'sdk-kill'
+        ) {
+          eventOrder.push(`response:${response.request_id}`);
+        }
+      },
+    );
     const unsubscribeTerminal = eventBus.on(BG_TERMINAL_CHANNEL, (data) => {
       const task = requireTerminal(data).task;
       terminals.push(task);
@@ -724,8 +736,16 @@ void describe('sdk', () => {
     });
     const { session, cwd } = await harness({ eventBus });
     try {
-      await session.extensionRunner.emit({ type: 'session_start', reason: 'startup' });
-      const caps = await emitEventRequest(eventBus, 'sdk-cap', 'capabilities', {});
+      await session.extensionRunner.emit({
+        type: 'session_start',
+        reason: 'startup',
+      });
+      const caps = await emitEventRequest(
+        eventBus,
+        'sdk-cap',
+        'capabilities',
+        {},
+      );
       assert.deepEqual(requireOkResult(caps), BG_EXTENSION_CAPABILITIES);
 
       const run = await emitEventRequest(eventBus, 'sdk-run', 'run', {
@@ -746,8 +766,9 @@ void describe('sdk', () => {
       assert.equal(terminal.status, 'completed');
       assert.equal(terminals.filter((entry) => entry.id === task.id).length, 1);
       assert.ok(
-        eventOrder.findIndex((entry) => entry === `terminal:${task.id}:completed`) >
-          eventOrder.indexOf('response:sdk-run'),
+        eventOrder.findIndex(
+          (entry) => entry === `terminal:${task.id}:completed`,
+        ) > eventOrder.indexOf('response:sdk-run'),
         'completed terminal must follow the correlated run response',
       );
 
@@ -756,19 +777,27 @@ void describe('sdk', () => {
         maxBytes: 100,
         tail: true,
       });
-      const logsResult = requiredJsonObject(requireOkResult(logs), 'logs result must be an object');
+      const logsResult = requiredJsonObject(
+        requireOkResult(logs),
+        'logs result must be an object',
+      );
       assert.match(String(logsResult['text']), /api-ok/u);
       assert.equal(requiredTask(logsResult['task'], 'logs task').id, task.id);
       assert.equal(logsResult['tail'], true);
 
-      const status = await emitEventRequest(eventBus, 'sdk-status', 'status', { taskId: task.id });
+      const status = await emitEventRequest(eventBus, 'sdk-status', 'status', {
+        taskId: task.id,
+      });
       const statusResult = requiredJsonObject(
         requireOkResult(status),
         'status result must be an object',
       );
       const statusTasks = statusResult['tasks'];
       assert.ok(Array.isArray(statusTasks), 'status tasks should be an array');
-      assert.equal(requiredTask(statusTasks[0], 'status task').status, 'completed');
+      assert.equal(
+        requiredTask(statusTasks[0], 'status task').status,
+        'completed',
+      );
 
       const sleep = await emitEventRequest(eventBus, 'sdk-sleep', 'run', {
         name: 'EventBus Sleep',
@@ -780,42 +809,84 @@ void describe('sdk', () => {
         triggerOnCompletion: false,
       });
       const sleepTask = requiredTask(requireOkResult(sleep), 'sleep run task');
-      const kill = await emitEventRequest(eventBus, 'sdk-kill', 'kill', { taskId: sleepTask.id });
-      const killResult = requiredJsonObject(requireOkResult(kill), 'kill result must be an object');
-      assert.equal(requiredTask(killResult['task'], 'kill task').status, 'killed');
-      const sleepTerminal = await waitForTerminalSnapshot(terminals, sleepTask.id);
-      assert.equal(sleepTerminal.status, 'killed');
-      assert.equal(terminals.filter((entry) => entry.id === sleepTask.id).length, 1);
+      const kill = await emitEventRequest(eventBus, 'sdk-kill', 'kill', {
+        taskId: sleepTask.id,
+      });
+      const killResult = requiredJsonObject(
+        requireOkResult(kill),
+        'kill result must be an object',
+      );
+      // M2 迁移表:user/model 发起停止 → cancelled(system 关闭 → killed)
+      assert.equal(
+        requiredTask(killResult['task'], 'kill task').status,
+        'cancelled',
+      );
+      const sleepTerminal = await waitForTerminalSnapshot(
+        terminals,
+        sleepTask.id,
+      );
+      assert.equal(sleepTerminal.status, 'cancelled');
+      assert.equal(
+        terminals.filter((entry) => entry.id === sleepTask.id).length,
+        1,
+      );
       assert.ok(
-        eventOrder.findIndex((entry) => entry === `terminal:${sleepTask.id}:killed`) >
-          eventOrder.indexOf('response:sdk-kill'),
-        'killed terminal must follow the kill response',
+        eventOrder.findIndex(
+          (entry) => entry === `terminal:${sleepTask.id}:cancelled`,
+        ) > eventOrder.indexOf('response:sdk-kill'),
+        'cancelled terminal must follow the kill response',
       );
 
-      const malformed = await emitEventRequest(eventBus, 'sdk-malformed', 'run', {
-        name: 'Bad EventBus Run',
-        command: 'echo nope',
-        isAgent: false,
-        timeoutSeconds: null,
-        notifyOnCompletion: true,
-        triggerOnCompletion: true,
-      });
+      const malformed = await emitEventRequest(
+        eventBus,
+        'sdk-malformed',
+        'run',
+        {
+          name: 'Bad EventBus Run',
+          command: 'echo nope',
+          isAgent: false,
+          timeoutSeconds: null,
+          notifyOnCompletion: true,
+          triggerOnCompletion: true,
+        },
+      );
       assert.equal(malformed.ok, false);
       assert.match(malformed.ok ? '' : malformed.error, /positive integer/u);
 
-      const unknown = await emitEventRequest(eventBus, 'sdk-unknown', 'mystery', {});
+      const unknown = await emitEventRequest(
+        eventBus,
+        'sdk-unknown',
+        'mystery',
+        {},
+      );
       assert.equal(unknown.ok, false);
       assert.equal(unknown.operation, 'mystery');
 
-      const firstDuplicate = await emitEventRequest(eventBus, 'sdk-dup', 'capabilities', {});
+      const firstDuplicate = await emitEventRequest(
+        eventBus,
+        'sdk-dup',
+        'capabilities',
+        {},
+      );
       assert.equal(firstDuplicate.ok, true);
-      const duplicate = await emitEventRequest(eventBus, 'sdk-dup', 'capabilities', {});
+      const duplicate = await emitEventRequest(
+        eventBus,
+        'sdk-dup',
+        'capabilities',
+        {},
+      );
       assert.equal(duplicate.ok, false);
-      assert.match(duplicate.ok ? '' : duplicate.error, /duplicate request_id/u);
+      assert.match(
+        duplicate.ok ? '' : duplicate.error,
+        /duplicate request_id/u,
+      );
     } finally {
       unsubscribeTerminal();
       unsubscribeResponseOrder();
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
@@ -839,19 +910,34 @@ void describe('sdk', () => {
         const oldRunner = session.extensionRunner;
         const oldContext = oldRunner.createContext();
         const runningRequestId = `real-reload-${String(cycle)}-running`;
-        const running = await emitEventRequest(eventBus, runningRequestId, 'run', {
-          name: `Real Reload Running ${String(cycle)}`,
-          command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-          isAgent: false,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        });
-        const runningTask = requiredTask(requireOkResult(running), 'real reload running task');
+        const running = await emitEventRequest(
+          eventBus,
+          runningRequestId,
+          'run',
+          {
+            name: `Real Reload Running ${String(cycle)}`,
+            command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+            isAgent: false,
+            notifyOnCompletion: false,
+            triggerOnCompletion: false,
+          },
+        );
+        const runningTask = requiredTask(
+          requireOkResult(running),
+          'real reload running task',
+        );
         assert.equal(runningTask.status, 'running');
 
         await session.reload();
-        assert.notEqual(session.extensionRunner, oldRunner, 'reload must install a fresh runner');
-        assert.throws(() => oldContext.cwd, /stale after session replacement or reload/u);
+        assert.notEqual(
+          session.extensionRunner,
+          oldRunner,
+          'reload must install a fresh runner',
+        );
+        assert.throws(
+          () => oldContext.cwd,
+          /stale after session replacement or reload/u,
+        );
         await new Promise((resolve) => setTimeout(resolve, 100));
         assert.equal(
           terminals.filter((task) => task.id === runningTask.id).length,
@@ -867,10 +953,14 @@ void describe('sdk', () => {
           notifyOnCompletion: false,
           triggerOnCompletion: false,
         });
-        const quickTask = requiredTask(requireOkResult(quick), 'real reload quick task');
+        const quickTask = requiredTask(
+          requireOkResult(quick),
+          'real reload quick task',
+        );
         await waitForTerminalSnapshot(terminals, quickTask.id);
         assert.equal(
-          responses.filter((response) => response.request_id === quickRequestId).length,
+          responses.filter((response) => response.request_id === quickRequestId)
+            .length,
           1,
           'only the freshly bound activation may answer after reload',
         );
@@ -884,14 +974,20 @@ void describe('sdk', () => {
       unsubscribeTerminals();
       unsubscribeResponses();
       if (bound) {
-        await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+        await session.extensionRunner.emit({
+          type: 'session_shutdown',
+          reason: 'quit',
+        });
       }
       session.dispose();
     }
   });
 
   void it('keeps an overlapping late session_start continuation from recreating status resources', async () => {
-    type LifecycleHandler = (event: Record<string, unknown>, ctx: JsonObject) => unknown;
+    type LifecycleHandler = (
+      event: Record<string, unknown>,
+      ctx: JsonObject,
+    ) => unknown;
     const root = await mkdtemp(join(tmpdir(), 'pi-bg-late-session-start-'));
     roots.push(root);
     const cwd = join(root, 'project');
@@ -927,12 +1023,17 @@ void describe('sdk', () => {
       mode: 'print',
       ui: { setStatus() {}, setWidget() {}, notify() {} },
     };
-    const dispatch = async (name: string, event: Record<string, unknown>): Promise<void> => {
-      for (const handler of [...(handlers.get(name) ?? [])]) await handler(event, ctx);
+    const dispatch = async (
+      name: string,
+      event: Record<string, unknown>,
+    ): Promise<void> => {
+      for (const handler of [...(handlers.get(name) ?? [])])
+        await handler(event, ctx);
     };
     await backgroundTasksExtension(pi);
 
-    const originalEnsureRuntimeDir = BackgroundTaskRegistry.prototype.ensureRuntimeDir;
+    const originalEnsureRuntimeDir =
+      BackgroundTaskRegistry.prototype.ensureRuntimeDir;
     const enteredEnsure = deferred<void>();
     const releaseEnsure = deferred<void>();
     const activeIntervals = new Set<ReturnType<typeof setInterval>>();
@@ -947,17 +1048,29 @@ void describe('sdk', () => {
       if (handle !== undefined) activeIntervals.delete(handle);
       return realClearInterval(handle);
     }) as typeof clearInterval;
-    BackgroundTaskRegistry.prototype.ensureRuntimeDir = async function (context) {
+    BackgroundTaskRegistry.prototype.ensureRuntimeDir = async function (
+      context,
+    ) {
       enteredEnsure.resolve(undefined);
       await releaseEnsure.promise;
       return originalEnsureRuntimeDir.call(this, context);
     };
 
     try {
-      const start = dispatch('session_start', { type: 'session_start', reason: 'startup' });
+      const start = dispatch('session_start', {
+        type: 'session_start',
+        reason: 'startup',
+      });
       await enteredEnsure.promise;
-      await dispatch('session_shutdown', { type: 'session_shutdown', reason: 'reload' });
-      assert.equal(activeIntervals.size, 0, 'shutdown must clear all pre-existing intervals');
+      await dispatch('session_shutdown', {
+        type: 'session_shutdown',
+        reason: 'reload',
+      });
+      assert.equal(
+        activeIntervals.size,
+        0,
+        'shutdown must clear all pre-existing intervals',
+      );
 
       releaseEnsure.resolve(undefined);
       await start;
@@ -970,152 +1083,34 @@ void describe('sdk', () => {
       releaseEnsure.resolve(undefined);
       for (const handle of activeIntervals) realClearInterval(handle);
       activeIntervals.clear();
-      BackgroundTaskRegistry.prototype.ensureRuntimeDir = originalEnsureRuntimeDir;
+      BackgroundTaskRegistry.prototype.ensureRuntimeDir =
+        originalEnsureRuntimeDir;
       globalThis.setInterval = realSetInterval;
       globalThis.clearInterval = realClearInterval;
-    }
-  });
-
-  void it('runs the structured bg_run_pi_attested tool and writes a complete flat attestation', async (t) => {
-    if (skipWin32PiPathFixture(t, 'attested')) return;
-    const { session, cwd, modelRegistry, modelRuntime } = await harness();
-    const oldPath = process.env['PATH'];
-    try {
-      await initCleanGit(cwd);
-      modelRegistry.registerProvider('openai-codex', {
-        name: 'OpenAI Codex Test OAuth',
-        baseUrl: 'https://example.invalid',
-        apiKey: 'PI_BG_TEST_KEY',
-        api: 'openai-codex-responses',
-        models: [
-          {
-            id: 'gpt-5.5',
-            name: 'GPT 5.5',
-            reasoning: false,
-            input: ['text'],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 100000,
-            maxTokens: 4096,
-          },
-        ],
-      });
-      // Pi 0.83 builds its own ModelRegistry facade per session, so the OAuth
-      // observation must be stubbed on the shared ModelRuntime it delegates to.
-      const originalOAuth = modelRuntime.isUsingOAuth.bind(modelRuntime);
-      modelRuntime.isUsingOAuth = (providerId: string) =>
-        providerId === 'openai-codex' ? true : originalOAuth(providerId);
-      const bin = join(cwd, 'bin');
-      await mkdir(bin, { recursive: true });
-      const fakePi = join(bin, 'pi');
-      await writeFile(
-        fakePi,
-        `#!/usr/bin/env node
-const { writeFileSync } = require('node:fs');
-const args = process.argv.slice(2);
-if (args[0] !== '--mode' || args[1] !== 'json') process.exit(10);
-writeFileSync('report.md', 'sdk report\\n');
-const provider = args[args.indexOf('--provider') + 1];
-const model = args[args.indexOf('--model') + 1];
-const events = [
-  { type: 'session', version: 3, id: 'pi-session-sdk', timestamp: '2026-01-01T00:00:00.000Z', cwd: process.cwd() },
-  { type: 'agent_start' },
-  { type: 'message_end', message: { role: 'assistant', provider, model, usage: { input: 20, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 30, cost: { total: 0.44 } }, content: [{ type: 'text', text: 'sdk attested done' }], stopReason: 'stop' } },
-  { type: 'agent_end', messages: [] },
-];
-for (const event of events) console.log(JSON.stringify(event));
-console.error('sdk stderr');
-`,
-        'utf8',
-      );
-      await chmod(fakePi, 0o755);
-      process.env['PATH'] = `${bin}${delimiter}${oldPath ?? ''}`;
-
-      const result = await exec(session, 'bg_run_pi_attested', {
-        name: 'SDK Attested',
-        provider: 'openai-codex',
-        model: 'gpt-5.5',
-        prompt: 'produce sdk attestation',
-        reportPath: 'report.md',
-        extraPiArgs: ['--no-extensions'],
-      });
-      const task = await wait(session, taskFromResult(result).id, 100);
-      assert.equal(task.status, 'completed');
-      assert.match(task.id, /^b[0-9a-f]{32}$/);
-      assert.equal(task.model, 'openai-codex/gpt-5.5');
-      assert.deepEqual(task.tokenUsage, {
-        input: 20,
-        output: 10,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 30,
-        costTotal: 0.44,
-      });
-      const attestationPath = join(cwd, task.outputPath.replace(/\.output$/, '.attestation.json'));
-      for (let attempt = 0; attempt < 100 && !existsSync(attestationPath); attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      assert.ok(existsSync(attestationPath));
-      const attestation = parseJsonObject(
-        await readFile(attestationPath, 'utf8'),
-        'SDK attestation should be JSON',
-      );
-      const invocation = requiredJsonObject(attestation['invocation'], 'invocation');
-      assert.equal(invocation['pi_session_id'], 'pi-session-sdk');
-      assert.deepEqual(invocation['argv'], [
-        'pi',
-        '--mode',
-        'json',
-        '--provider',
-        'openai-codex',
-        '--model',
-        'gpt-5.5',
-        '--no-extensions',
-        'produce sdk attestation',
-      ]);
-      assert.equal(invocation['credential_kind'], 'oauth');
-      const artifacts = requiredJsonObject(attestation['artifacts'], 'artifacts');
-      const sourceHashes = requiredJsonObject(attestation['source_hashes'], 'source hashes');
-      assert.equal(
-        requiredJsonObject(artifacts['task_output'], 'task output')['sha256'],
-        sourceHashes['output_sha256'],
-      );
-      assert.match(await readFile(join(cwd, task.outputPath), 'utf8'), /sdk attested done/);
-      assert.match(
-        await readFile(join(cwd, task.outputPath.replace(/\.output$/, '.stderr')), 'utf8'),
-        /sdk stderr/,
-      );
-    } finally {
-      restoreEnvValue('PATH', oldPath);
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
-      session.dispose();
     }
   });
 
   void it('supports status/log prefix resolution, all-task listing, head/tail truncation, and ambiguous/unknown ID errors', async () => {
     const { session } = await harness();
     try {
-      const first = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'SDK First',
-        // The head/tail assertions below are byte-exact, so the command must
-        // emit exactly six bytes with no trailing newline. `printf` is
-        // POSIX-only and `echo` appends a newline, so use node directly.
-        command: `node -e ${JSON.stringify('process.stdout.write("abcdef")')}`,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const second = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'SDK Second',
-        command: `node -e ${JSON.stringify('process.stdout.write("123456")')}`,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const firstDone = await wait(session, taskFromResult(first).id);
-      await wait(session, taskFromResult(second).id);
+      // The head/tail assertions below are byte-exact, so the command must
+      // emit exactly six bytes with no trailing newline. `printf` is
+      // POSIX-only and `echo` appends a newline, so use node directly.
+      const first = await launchBackgroundTask(
+        session,
+        `node -e ${JSON.stringify('process.stdout.write("abcdef")')}`,
+      );
+      const second = await launchBackgroundTask(
+        session,
+        `node -e ${JSON.stringify('process.stdout.write("123456")')}`,
+      );
+      const firstDone = await wait(session, first.id);
+      await wait(session, second.id);
       const all = await exec(session, 'bg_status', {});
       assert.ok(tasksFromResult(all).length >= 2);
-      const byPrefix = await exec(session, 'bg_status', { taskId: firstDone.id.slice(0, 5) });
+      const byPrefix = await exec(session, 'bg_status', {
+        taskId: firstDone.id.slice(0, 5),
+      });
       assert.equal(firstTask(byPrefix).id, firstDone.id);
       await assert.rejects(
         () => exec(session, 'bg_status', { taskId: 'b' }),
@@ -1144,7 +1139,10 @@ console.error('sdk stderr');
         /Unknown background task ID/,
       );
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
@@ -1152,25 +1150,28 @@ console.error('sdk stderr');
   void it('kills running tasks and rejects unknown or completed kills loudly', async () => {
     const { session } = await harness();
     try {
-      const r = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'SDK Sleep',
-        command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const task = taskFromResult(r);
+      const task = await launchBackgroundTask(
+        session,
+        `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+      );
       const k = await exec(session, 'bg_kill', { taskId: task.id.slice(0, 6) });
-      assert.match(resultText(k), /Killed/);
+      // M2 迁移表:工具(bg_kill)为 model 发起停止 → cancelled
+      assert.match(resultText(k), /Killed|cancelled|Cancelled/);
       const t = await wait(session, task.id);
-      assert.equal(t.status, 'killed');
-      await assert.rejects(() => exec(session, 'bg_kill', { taskId: t.id }), /not running/);
+      assert.equal(t.status, 'cancelled');
+      await assert.rejects(
+        () => exec(session, 'bg_kill', { taskId: t.id }),
+        /not running/,
+      );
       await assert.rejects(
         () => exec(session, 'bg_kill', { taskId: 'bdeadbeef' }),
         /Unknown background task ID/,
       );
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
@@ -1178,50 +1179,72 @@ console.error('sdk stderr');
   void it('fails timed-out tasks loudly', async () => {
     const { session } = await harness();
     try {
-      const r = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'SDK Timeout',
-        command: `node -e ${JSON.stringify('setTimeout(() => {}, 5000)')}`,
-        timeoutSeconds: 1,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const t = await wait(session, taskFromResult(r).id, 80);
+      // 覆盖版 bash 的 `timeout` 秒参映射为后台 timeoutSeconds。
+      const task = await launchBackgroundTask(
+        session,
+        `node -e ${JSON.stringify('setTimeout(() => {}, 5000)')}`,
+        1,
+      );
+      const t = await wait(session, task.id, 80);
       assert.equal(t.status, 'failed');
       assert.match(t.error ?? '', /Timed out after 1s/);
-      const logs = await exec(session, 'bg_logs', { taskId: t.id, maxBytes: 1000 });
+      const logs = await exec(session, 'bg_logs', {
+        taskId: t.id,
+        maxBytes: 1000,
+      });
       assert.match(resultText(logs), /background task timeout/);
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
 
   void it('records completion notifications exactly once when enabled and suppresses them when disabled', async () => {
-    const { session } = await harness();
+    const eventBus = createEventBus();
+    const { session } = await harness({ eventBus });
     try {
-      const notified = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Notify SDK',
-        // The payload deliberately contains <, > and & to exercise escaping of
-        // task output. Those are cmd.exe redirection and separator
-        // metacharacters, so the literal must not appear in the command line;
-        // it is rebuilt from character codes inside the child instead.
-        command: `node -e ${JSON.stringify(
-          'process.stdout.write(String.fromCharCode(60)+"ok"+String.fromCharCode(62,38)+"done")',
-        )}`,
-        notifyOnCompletion: true,
-        triggerOnCompletion: false,
+      await session.extensionRunner.emit({
+        type: 'session_start',
+        reason: 'startup',
       });
-      const hidden = await exec(session, 'bg_run', {
-        isAgent: false,
+      // 交付选项在 M4 后仅经 EventBus run 请求携带(覆盖版 bash 不再暴露)。
+      const notifiedRun = await emitEventRequest(
+        eventBus,
+        'sdk-notified',
+        'run',
+        {
+          name: 'Notify SDK',
+          // The payload deliberately contains <, > and & to exercise escaping
+          // of task output. Those are cmd.exe redirection and separator
+          // metacharacters, so the literal must not appear in the command
+          // line; it is rebuilt from character codes inside the child instead.
+          command: `node -e ${JSON.stringify(
+            'process.stdout.write(String.fromCharCode(60)+"ok"+String.fromCharCode(62,38)+"done")',
+          )}`,
+          isAgent: false,
+          notifyOnCompletion: true,
+          triggerOnCompletion: false,
+        },
+      );
+      const notified = requiredTask(
+        requireOkResult(notifiedRun),
+        'notified run task',
+      );
+      const hiddenRun = await emitEventRequest(eventBus, 'sdk-hidden', 'run', {
         name: 'No Notify SDK',
         command: 'echo quiet',
+        isAgent: false,
         notifyOnCompletion: false,
         triggerOnCompletion: false,
       });
-      await wait(session, taskFromResult(notified).id);
-      const hiddenTask = taskFromResult(hidden);
+      const hiddenTask = requiredTask(
+        requireOkResult(hiddenRun),
+        'hidden run task',
+      );
+      await wait(session, notified.id);
       await wait(session, hiddenTask.id);
       await new Promise((resolve) => setTimeout(resolve, 20));
       const notes = customNotifications(session);
@@ -1232,39 +1255,55 @@ console.error('sdk stderr');
       assert.match(note.content, /<status>completed<\/status>/);
       assert.match(note.content, /&quot;|Notify SDK/);
       assert.equal(note.details['notified'], true);
-      const status = await exec(session, 'bg_status', { taskId: hiddenTask.id });
+      const status = await exec(session, 'bg_status', {
+        taskId: hiddenTask.id,
+      });
       assert.equal(firstTask(status).notified, false);
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
 
   void it('captures only task-owned explicit telemetry in snapshots and metadata', async () => {
-    const { session, cwd } = await harness();
+    const eventBus = createEventBus();
+    const { session, cwd } = await harness({ eventBus });
     try {
-      const tool = session.getToolDefinition('bg_run');
-      assert.ok(tool, 'bg_run tool should be registered');
-      const ctx = session.extensionRunner.createContext();
-      ctx.getContextUsage = () => ({ tokens: 999_000, contextWindow: 1_000_000, percent: 99.9 });
+      await session.extensionRunner.emit({
+        type: 'session_start',
+        reason: 'startup',
+      });
+      assert.ok(
+        !session.getActiveToolNames().includes('bg_run'),
+        'bg_run tool should be retired (M4)',
+      );
+      // 显式 agent 标记在 M4 后仅经 EventBus run 请求携带(覆盖版 bash 不暴露
+      // isAgent);父上下文 getContextUsage 不被采集,快照只含任务自有遥测。
       const script = `console.log(JSON.stringify({ type: "background-task-telemetry", model: "test-provider/test-model", contextUsage: { tokens: 50000, contextWindow: 200000, percent: 25 }, tokenUsage: { input: 1000, output: 200, cacheRead: 30, cacheWrite: 20, totalTokens: 1250 }, toolUsage: { total: 2, failed: 1, byName: { read: 1, bash: 1 } } })); console.log("context");`;
       const command = `node -e ${JSON.stringify(script)}`;
-      const rawResult: unknown = await tool.execute(
-        'call-context',
-        {
-          isAgent: false,
-          name: 'Context SDK',
-          command,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        },
-        undefined,
-        undefined,
-        ctx,
+      const run = await emitEventRequest(eventBus, 'sdk-context', 'run', {
+        name: 'Context SDK',
+        command,
+        isAgent: true,
+        notifyOnCompletion: false,
+        triggerOnCompletion: false,
+      });
+      assert.ok(
+        isJsonObject(requireOkResult(run)),
+        'run should return a snapshot result',
       );
-      assert.ok(isTestToolResult(rawResult), 'bg_run should return a typed tool result');
-      const t = await wait(session, taskFromResult(rawResult).id);
-      assert.deepEqual(t.contextUsage, { tokens: 50_000, contextWindow: 200_000, percent: 25 });
+      const t = await wait(
+        session,
+        requiredTask(requireOkResult(run), 'context run task').id,
+      );
+      assert.deepEqual(t.contextUsage, {
+        tokens: 50_000,
+        contextWindow: 200_000,
+        percent: 25,
+      });
       assert.deepEqual(t.tokenUsage, {
         input: 1000,
         output: 200,
@@ -1272,14 +1311,21 @@ console.error('sdk stderr');
         cacheWrite: 20,
         totalTokens: 1250,
       });
-      assert.deepEqual(t.toolUsage, { total: 2, failed: 1, byName: { read: 1, bash: 1 } });
+      assert.deepEqual(t.toolUsage, {
+        total: 2,
+        failed: 1,
+        byName: { read: 1, bash: 1 },
+      });
       assert.equal(t.model, 'test-provider/test-model');
       const status = await exec(session, 'bg_status', { taskId: t.id });
       assert.match(resultText(status), /ctx=25\.0%\/200k/);
       assert.match(resultText(status), /model=test-provider\/test-model/);
       assert.match(resultText(status), /tokens=1\.3k/);
       assert.match(resultText(status), /tools=2 failed=1/);
-      const metadataPath = join(cwd, t.outputPath.replace(/\.output$/, '.json'));
+      const metadataPath = join(
+        cwd,
+        t.outputPath.replace(/\.output$/, '.json'),
+      );
       let metadata = parseJsonObject(
         await readFile(metadataPath, 'utf8'),
         'telemetry metadata should be an object',
@@ -1301,40 +1347,68 @@ console.error('sdk stderr');
       assert.deepEqual(metadata['toolUsage'], t.toolUsage);
       assert.equal(metadata['model'], 'test-provider/test-model');
 
-      const legacy = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Legacy Context SDK',
-        command: `node -e ${JSON.stringify('console.log(JSON.stringify({ type: "background-task-context-usage", tokens: 42, contextWindow: 1000, percent: 4.2 }))')}`,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
+      const legacyRun = await emitEventRequest(
+        eventBus,
+        'sdk-legacy-context',
+        'run',
+        {
+          name: 'Legacy Context SDK',
+          command: `node -e ${JSON.stringify('console.log(JSON.stringify({ type: "background-task-context-usage", tokens: 42, contextWindow: 1000, percent: 4.2 }))')}`,
+          isAgent: false,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        },
+      );
+      const legacyTask = await wait(
+        session,
+        requiredTask(requireOkResult(legacyRun), 'legacy run task').id,
+      );
+      assert.deepEqual(legacyTask.contextUsage, {
+        tokens: 42,
+        contextWindow: 1000,
+        percent: 4.2,
       });
-      const legacyTask = await wait(session, taskFromResult(legacy).id);
-      assert.deepEqual(legacyTask.contextUsage, { tokens: 42, contextWindow: 1000, percent: 4.2 });
       assert.equal(legacyTask.tokenUsage, undefined);
 
-      const noTelemetry = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'No Context SDK',
-        command: 'echo no-context',
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const noTelemetryTask = await wait(session, taskFromResult(noTelemetry).id);
+      const noTelemetryRun = await emitEventRequest(
+        eventBus,
+        'sdk-no-context',
+        'run',
+        {
+          name: 'No Context SDK',
+          command: 'echo no-context',
+          isAgent: false,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        },
+      );
+      const noTelemetryTask = await wait(
+        session,
+        requiredTask(requireOkResult(noTelemetryRun), 'no-context run task').id,
+      );
       assert.equal(noTelemetryTask.contextUsage, undefined);
       assert.equal(noTelemetryTask.tokenUsage, undefined);
       assert.equal(noTelemetryTask.toolUsage, undefined);
       assert.equal(noTelemetryTask.model, undefined);
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
 
   void it('wraps explicitly marked background Pi agents and captures context telemetry', async (t) => {
     if (skipWin32PosixPiTelemetry(t)) return;
-    const { session, cwd } = await harness();
+    const eventBus = createEventBus();
+    const { session, cwd } = await harness({ eventBus });
     const oldPath = process.env['PATH'];
     try {
+      await session.extensionRunner.emit({
+        type: 'session_start',
+        reason: 'startup',
+      });
       const bin = join(cwd, 'bin');
       await mkdir(bin, { recursive: true });
       const fakePi = join(bin, 'pi');
@@ -1378,14 +1452,22 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
       await chmod(fakePi, 0o755);
       process.env['PATH'] = `${bin}${delimiter}${oldPath ?? ''}`;
 
-      const r = await exec(session, 'bg_run', {
-        isAgent: true,
-        name: 'Wrapped Pi Agent',
-        command: 'pi --model openai-codex/gpt-5.5 -p hello',
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const t = await wait(session, taskFromResult(r).id);
+      const runRequest = await emitEventRequest(
+        eventBus,
+        'sdk-wrapped-pi',
+        'run',
+        {
+          name: 'Wrapped Pi Agent',
+          command: 'pi --model openai-codex/gpt-5.5 -p hello',
+          isAgent: true,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        },
+      );
+      const t = await wait(
+        session,
+        requiredTask(requireOkResult(runRequest), 'wrapped pi run task').id,
+      );
       assert.equal(t.status, 'completed');
       assert.deepEqual(t.contextUsage, {
         tokens: 360,
@@ -1399,13 +1481,21 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
         cacheWrite: 30,
         totalTokens: 1610,
       });
-      assert.deepEqual(t.toolUsage, { total: 2, failed: 1, byName: { read: 1, bash: 1 } });
+      assert.deepEqual(t.toolUsage, {
+        total: 2,
+        failed: 1,
+        byName: { read: 1, bash: 1 },
+      });
       assert.equal(t.model, 'openai-codex/gpt-5.5');
       const status = await exec(session, 'bg_status', { taskId: t.id });
       assert.match(resultText(status), /model=openai-codex\/gpt-5\.5/);
       assert.match(resultText(status), /tokens=1\.6k/);
       assert.match(resultText(status), /tools=2 failed=1/);
-      const logs = await exec(session, 'bg_logs', { taskId: t.id, maxBytes: 4000, tail: false });
+      const logs = await exec(session, 'bg_logs', {
+        taskId: t.id,
+        maxBytes: 4000,
+        tail: false,
+      });
       const logText = resultText(logs);
       assert.match(logText, /\u2192 read README\.md/);
       assert.match(logText, /\u2717 bash failed/);
@@ -1413,7 +1503,10 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
       assert.doesNotMatch(logText, /background-task-telemetry/);
       assert.doesNotMatch(logText, /background-task-context-usage/);
       assert.doesNotMatch(logText, /background-task-activity/);
-      const metadataPath = join(cwd, t.outputPath.replace(/\.output$/, '.json'));
+      const metadataPath = join(
+        cwd,
+        t.outputPath.replace(/\.output$/, '.json'),
+      );
       const metadata = parseJsonObject(
         await readFile(metadataPath, 'utf8'),
         'wrapped Pi metadata should be an object',
@@ -1424,7 +1517,10 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
       assert.equal(metadata['model'], 'openai-codex/gpt-5.5');
     } finally {
       restoreEnvValue('PATH', oldPath);
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
@@ -1434,16 +1530,25 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
     { timeout: 20_000 },
     async (t) => {
       if (process.platform === 'win32') {
-        t.skip('POSIX shell env-prefix child-pi telemetry smoke is not portable to Windows');
+        t.skip(
+          'POSIX shell env-prefix child-pi telemetry smoke is not portable to Windows',
+        );
         return;
       }
       const piCli = resolvePiCli();
       if (!piCli) {
-        t.skip('pi CLI is not available on PATH for real child-pi telemetry smoke');
+        t.skip(
+          'pi CLI is not available on PATH for real child-pi telemetry smoke',
+        );
         return;
       }
-      const { session, cwd } = await harness();
+      const eventBus = createEventBus();
+      const { session, cwd } = await harness({ eventBus });
       try {
+        await session.extensionRunner.emit({
+          type: 'session_start',
+          reason: 'startup',
+        });
         const childAgentDir = join(cwd, 'child-agent');
         const childSessionDir = join(cwd, 'child-sessions');
         await mkdir(childAgentDir, { recursive: true });
@@ -1462,14 +1567,23 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
           .map(([key, value]) => `${key}=${shellQuote(value)}`)
           .join(' ');
         const command = `${envPrefix} pi --offline --no-session --no-extensions -e ${shellQuote(scriptedProviderPath)} --no-skills --no-prompt-templates --no-context-files --model pi-bg-scripted/scripted-model -p ${shellQuote('exercise real json tool telemetry')}`;
-        const r = await exec(session, 'bg_run', {
-          isAgent: true,
-          name: 'Real Pi Telemetry',
-          command,
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-        });
-        const t = await wait(session, taskFromResult(r).id, 240);
+        const runRequest = await emitEventRequest(
+          eventBus,
+          'sdk-real-pi-telemetry',
+          'run',
+          {
+            name: 'Real Pi Telemetry',
+            command,
+            isAgent: true,
+            notifyOnCompletion: false,
+            triggerOnCompletion: false,
+          },
+        );
+        const t = await wait(
+          session,
+          requiredTask(requireOkResult(runRequest), 'real pi run task').id,
+          240,
+        );
         assert.equal(t.status, 'completed');
         assert.deepEqual(t.tokenUsage, {
           input: 20,
@@ -1479,19 +1593,33 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
           totalTokens: 30,
           costTotal: 0,
         });
-        assert.deepEqual(t.toolUsage, { total: 2, failed: 1, byName: { scripted_echo: 2 } });
+        assert.deepEqual(t.toolUsage, {
+          total: 2,
+          failed: 1,
+          byName: { scripted_echo: 2 },
+        });
         assert.equal(t.model, 'pi-bg-scripted/scripted-model');
         const status = await exec(session, 'bg_status', { taskId: t.id });
-        assert.match(resultText(status), /model=pi-bg-scripted\/scripted-model/);
+        assert.match(
+          resultText(status),
+          /model=pi-bg-scripted\/scripted-model/,
+        );
         assert.match(resultText(status), /tokens=30/);
         assert.match(resultText(status), /tools=2 failed=1/);
-        const logs = await exec(session, 'bg_logs', { taskId: t.id, maxBytes: 8000, tail: false });
+        const logs = await exec(session, 'bg_logs', {
+          taskId: t.id,
+          maxBytes: 8000,
+          tail: false,
+        });
         const logText = resultText(logs);
         assert.match(logText, /JSON tool telemetry complete/);
         assert.match(logText, /scripted_echo/);
         assert.doesNotMatch(logText, /background-task-telemetry/);
       } finally {
-        await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+        await session.extensionRunner.emit({
+          type: 'session_shutdown',
+          reason: 'quit',
+        });
         session.dispose();
       }
     },
@@ -1502,17 +1630,15 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
     const statuses: Array<string | undefined> = [];
     const notifications: UiNotification[] = [];
     session.extensionRunner.setUIContext(
-      makeStatusUi(session.extensionRunner.getUIContext(), statuses, notifications),
+      makeStatusUi(
+        session.extensionRunner.getUIContext(),
+        statuses,
+        notifications,
+      ),
     );
     try {
-      const done = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Footer Done',
-        command: 'echo done',
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      await wait(session, taskFromResult(done).id);
+      const done = await launchBackgroundTask(session, 'echo done');
+      await wait(session, done.id);
       await new Promise((resolve) => setTimeout(resolve, 20));
       assert.match(statuses.at(-1) ?? '', /bg 1 done · Shift↓ · \/bg-clear/);
 
@@ -1522,33 +1648,36 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
         .getRegisteredCommands()
         .find((cmd) => cmd.invocationName === 'bg-clear');
       assert.ok(clearCommand);
-      await clearCommand.handler('', session.extensionRunner.createCommandContext());
+      await clearCommand.handler(
+        '',
+        session.extensionRunner.createCommandContext(),
+      );
       assert.equal(statuses.at(-1), undefined);
       assert.match(notifications.at(-1)?.message ?? '', /Cleared 1 finished/);
 
-      const running = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Footer Running',
-        command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const secondDone = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Footer Done Two',
-        command: 'echo two',
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      await wait(session, taskFromResult(secondDone).id);
+      const running = await launchBackgroundTask(
+        session,
+        `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+      );
+      const secondDone = await launchBackgroundTask(session, 'echo two');
+      await wait(session, secondDone.id);
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.match(statuses.at(-1) ?? '', /1 running · 1 done · Shift↓ · \/bg-clear/);
-      await clearCommand.handler('', session.extensionRunner.createCommandContext());
+      assert.match(
+        statuses.at(-1) ?? '',
+        /1 running · 1 done · Shift↓ · \/bg-clear/,
+      );
+      await clearCommand.handler(
+        '',
+        session.extensionRunner.createCommandContext(),
+      );
       assert.match(statuses.at(-1) ?? '', /bg 1 running · Shift↓/);
       assert.doesNotMatch(statuses.at(-1) ?? '', /done|\/bg-clear/);
-      await exec(session, 'bg_kill', { taskId: taskFromResult(running).id });
+      await exec(session, 'bg_kill', { taskId: running.id });
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
@@ -1558,45 +1687,37 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
     const statuses: Array<string | undefined> = [];
     const notifications: UiNotification[] = [];
     session.extensionRunner.setUIContext(
-      makeStatusUi(session.extensionRunner.getUIContext(), statuses, notifications),
+      makeStatusUi(
+        session.extensionRunner.getUIContext(),
+        statuses,
+        notifications,
+      ),
     );
     try {
-      const failed = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Footer Failed',
-        command: 'node -e "process.exit(2)"',
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      await wait(session, taskFromResult(failed).id);
-      const stopped = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Footer Stopped',
-        command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const stoppedTask = taskFromResult(stopped);
+      const failed = await launchBackgroundTask(
+        session,
+        'node -e "process.exit(2)"',
+      );
+      await wait(session, failed.id);
+      const stopped = await launchBackgroundTask(
+        session,
+        `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+      );
+      const stoppedTask = stopped;
       await exec(session, 'bg_kill', { taskId: stoppedTask.id });
       await wait(session, stoppedTask.id);
-      const done = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Footer Done Matrix',
-        command: 'echo done',
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      await wait(session, taskFromResult(done).id);
+      const done = await launchBackgroundTask(session, 'echo done');
+      await wait(session, done.id);
       await new Promise((resolve) => setTimeout(resolve, 30));
-      assert.match(statuses.at(-1) ?? '', /1 failed · 1 stopped · 1 done · Shift↓ · \/bg-clear/);
+      assert.match(
+        statuses.at(-1) ?? '',
+        /1 failed · 1 stopped · 1 done · Shift↓ · \/bg-clear/,
+      );
 
-      const running = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Footer Focused',
-        command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
+      const running = await launchBackgroundTask(
+        session,
+        `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+      );
       await new Promise((resolve) => setTimeout(resolve, 30));
       assert.match(
         statuses.at(-1) ?? '',
@@ -1609,44 +1730,44 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
       assert.ok(
         statuses.some(
           (status) =>
-            status?.includes('bg 1 running · 1 failed · 1 stopped · 1 done · focused') ?? false,
+            status?.includes(
+              'bg 1 running · 1 failed · 1 stopped · 1 done · focused',
+            ) ?? false,
         ),
       );
-      await exec(session, 'bg_kill', { taskId: taskFromResult(running).id });
+      await exec(session, 'bg_kill', { taskId: running.id });
       assert.equal(notifications.length, 0);
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
 
-  void it('uses bg_run prepareArguments for legacy calls without names', async () => {
+  void it('covered bash drops bg_run legacy preparation and rejects empty background commands', async () => {
     const { session } = await harness();
     try {
-      const tool = session.getToolDefinition('bg_run');
-      assert.ok(tool?.prepareArguments);
-      const prepared = requiredPrepared(
-        tool.prepareArguments({ command: 'npm run qa', description: 'Legacy QA', isAgent: false }),
+      const tool = session.getToolDefinition('bash');
+      assert.ok(tool, 'covered bash tool should be registered');
+      assert.equal(
+        tool.prepareArguments,
+        undefined,
+        'covered bash no longer exposes bg_run legacy argument preparation',
       );
-      assert.equal(prepared.name, 'Legacy QA');
-      assert.equal(prepared.isAgent, false);
-      const agent = requiredPrepared(
-        tool.prepareArguments({ name: 'Legacy Agent', command: 'pi -p hi', isAgent: true }),
-      );
-      assert.equal(agent.isAgent, true);
-      assert.throws(
-        () => tool.prepareArguments?.({ command: 'pnpm test' }),
-        /requires isAgent boolean/,
-      );
-      assert.throws(() => tool.prepareArguments?.(null), /arguments must be an object/);
-      const invalid = { name: 'Background task', command: '', isAgent: false };
       await assert.rejects(
-        () => exec(session, 'bg_run', { name: 'Missing Agent Flag', command: 'echo ok' }),
-        /requires isAgent boolean/,
+        () => exec(session, 'bash', { command: '', run_in_background: true }),
+        /Background command is empty/,
       );
-      await assert.rejects(() => exec(session, 'bg_run', invalid), /Background command is empty/);
+      const task = await launchBackgroundTask(session, 'echo ok');
+      const completed = await wait(session, task.id);
+      assert.equal(completed.status, 'completed');
     } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
@@ -1661,145 +1782,46 @@ console.log(JSON.stringify({ type: "message_end", message: secondMessage }));
     }
     const { session, cwd } = await harness();
     try {
-      const r = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Bad Shell',
-        command: 'echo nope',
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const t = await wait(session, taskFromResult(r).id);
+      const task = await launchBackgroundTask(session, 'echo nope');
+      const t = await wait(session, task.id);
       assert.equal(t.status, 'failed');
       assert.match(t.error ?? '', /ENOENT|no such file/i);
-      const metadataPath = join(cwd, t.outputPath.replace(/\.output$/, '.json'));
+      const metadataPath = join(
+        cwd,
+        t.outputPath.replace(/\.output$/, '.json'),
+      );
       const metadata = await readJsonWithStatus(metadataPath, 'failed');
       assert.equal(metadata['status'], 'failed');
     } finally {
       restoreEnvValue('SHELL', previousShell);
       restoreEnvValue('ComSpec', previousComSpec);
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+      await session.extensionRunner.emit({
+        type: 'session_shutdown',
+        reason: 'quit',
+      });
       session.dispose();
     }
   });
 
   void it('cleans up multiple running tasks on shutdown', async () => {
     const { session } = await harness();
-    const one = await exec(session, 'bg_run', {
-      isAgent: false,
-      name: 'SDK Shutdown One',
-      command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-      notifyOnCompletion: false,
-      triggerOnCompletion: false,
+    const one = await launchBackgroundTask(
+      session,
+      `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+    );
+    const two = await launchBackgroundTask(
+      session,
+      `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+    );
+    await session.extensionRunner.emit({
+      type: 'session_shutdown',
+      reason: 'quit',
     });
-    const two = await exec(session, 'bg_run', {
-      isAgent: false,
-      name: 'SDK Shutdown Two',
-      command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-      notifyOnCompletion: false,
-      triggerOnCompletion: false,
-    });
-    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
-    const s1 = await exec(session, 'bg_status', { taskId: taskFromResult(one).id });
-    const s2 = await exec(session, 'bg_status', { taskId: taskFromResult(two).id });
+    const s1 = await exec(session, 'bg_status', { taskId: one.id });
+    const s2 = await exec(session, 'bg_status', { taskId: two.id });
     assert.equal(firstTask(s1).status, 'killed');
     assert.equal(firstTask(s2).status, 'killed');
     assert.match(firstTask(s1).error ?? '', /shutdown/);
     session.dispose();
-  });
-
-  void it('surfaces an update-available footer segment and registers a non-installing /bg-update command', async () => {
-    const saved = new Map<string, string | undefined>();
-    for (const key of UPDATE_ENV_KEYS) {
-      saved.set(key, process.env[key]);
-      restoreEnvValue(key, undefined);
-    }
-    const registry = await startRegistry(
-      JSON.stringify({ name: 'pi-background-tasks', version: '999.0.0' }),
-    );
-    process.env['PI_BG_REGISTRY_URL'] = registry.url;
-    const { session } = await harness();
-    const statuses: Array<string | undefined> = [];
-    const notifications: UiNotification[] = [];
-    session.extensionRunner.setUIContext(
-      makeStatusUi(session.extensionRunner.getUIContext(), statuses, notifications),
-    );
-    try {
-      const commands = session.extensionRunner
-        .getRegisteredCommands()
-        .map((cmd) => cmd.invocationName);
-      assert.ok(commands.includes('bg-update'), 'bg-update command must be registered');
-
-      await session.extensionRunner.emit({ type: 'session_start', reason: 'startup' });
-      let footer: string | undefined;
-      for (let i = 0; i < 50; i++) {
-        await renderFooterViaJobs(session);
-        footer = statuses.at(-1);
-        if (footer?.includes('⬆ v999.0.0 /bg-update')) break;
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-      assert.match(footer ?? '', /bg \u2b06 v999\.0\.0 \/bg-update/);
-
-      // Append-to-active-footer path: segment trails the running/entry-hint status.
-      const running = await exec(session, 'bg_run', {
-        isAgent: false,
-        name: 'Update Footer Running',
-        command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      await renderFooterViaJobs(session);
-      assert.match(statuses.at(-1) ?? '', /bg 1 running · Shift↓ · \u2b06 v999\.0\.0 \/bg-update/);
-      await exec(session, 'bg_kill', { taskId: taskFromResult(running).id });
-
-      const updateCommand = session.extensionRunner
-        .getRegisteredCommands()
-        .find((cmd) => cmd.invocationName === 'bg-update');
-      assert.ok(updateCommand);
-      await updateCommand.handler('', session.extensionRunner.createCommandContext());
-      const message = notifications.at(-1)?.message ?? '';
-      assert.match(message, /pi install npm:pi-background-tasks@latest/);
-      assert.match(message, /pi install npm:pi-background-tasks@999\.0\.0/);
-      assert.match(message, /pi install git:github\.com\/ismailsaleekh\/pi-background-tasks@main/);
-      assert.match(message, /first verify the tag exists/);
-      assert.doesNotMatch(message, /pi-background-tasks@v999\.0\.0/);
-      assert.match(message, /999\.0\.0 is the latest published version/);
-      assert.match(message, /does not install or self-update/);
-    } finally {
-      await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
-      session.dispose();
-      await registry.close();
-      for (const [key, value] of saved) {
-        restoreEnvValue(key, value);
-      }
-    }
-  });
-
-  void it('shows no update segment when opted out, offline, already current, or the registry fails, and never throws', async () => {
-    const newer = JSON.stringify({ version: '999.0.0' });
-    const disabled = await settledFooter({
-      env: { PI_BG_DISABLE_UPDATE_CHECK: '1' },
-      registryPayload: newer,
-    });
-    assert.equal(disabled.threw, false);
-    assert.doesNotMatch(disabled.status ?? '', /bg-update/);
-
-    const offline = await settledFooter({ env: { PI_OFFLINE: '1' }, registryPayload: newer });
-    assert.equal(offline.threw, false);
-    assert.doesNotMatch(offline.status ?? '', /bg-update/);
-
-    const packageInfoPayload = parseJsonText(
-      await readFile(new URL('../../package.json', import.meta.url), 'utf8'),
-    );
-    const currentVersion = parsePackageInfo(packageInfoPayload).version ?? '0.0.0';
-    const current = await settledFooter({
-      env: {},
-      registryPayload: JSON.stringify({ version: currentVersion }),
-    });
-    assert.equal(current.threw, false);
-    assert.doesNotMatch(current.status ?? '', /bg-update/);
-
-    const failure = await settledFooter({ env: {}, registryPayload: '{}', registryStatus: 500 });
-    assert.equal(failure.threw, false);
-    assert.doesNotMatch(failure.status ?? '', /bg-update/);
   });
 });

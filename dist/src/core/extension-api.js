@@ -1,4 +1,4 @@
-import { DEFAULT_LOG_BYTES, normalizeMaxBytes, } from './common.js';
+import { boundedErrorMessage, DEFAULT_LOG_BYTES, normalizeMaxBytes, } from './common.js';
 export const BG_REQUEST_CHANNEL = 'pi-background-tasks:request:v1';
 export const BG_RESPONSE_CHANNEL = 'pi-background-tasks:response:v1';
 export const BG_TERMINAL_CHANNEL = 'pi-background-tasks:terminal:v1';
@@ -15,6 +15,8 @@ export class BackgroundTaskExtensionServiceClosedError extends Error {
 }
 const MAX_ERROR_CHARS = 240;
 const MAX_REQUEST_ID_CHARS = 200;
+/** REVIEW:EventBus 去重账本容量上限,防止请求 id 账本跨 session 激活无界增长。 */
+const MAX_SEEN_REQUEST_IDS = 4096;
 export const BG_EXTENSION_CAPABILITIES = Object.freeze({
     api_version: 1,
     run: true,
@@ -203,11 +205,62 @@ function combineTerminalPublicationGates(existing, next) {
 function errorText(error) {
     return error instanceof Error ? error.message : String(error);
 }
+/** terminal 帧的终态值映射:仅终态任务携带 status(防御性,框架侧只发布终态任务)。 */
+function terminalStatusOf(task) {
+    const status = task.status;
+    if (status === 'completed' ||
+        status === 'failed' ||
+        status === 'cancelled' ||
+        status === 'killed' ||
+        status === 'lost') {
+        return status;
+    }
+    return undefined;
+}
+/** usage 快照的模型用量投影:task.tokenUsage 缺失或无 total 时缺省(unavailable 不伪造 0)。 */
+function terminalModelUsageOf(task) {
+    const usage = task.tokenUsage;
+    if (usage === undefined || usage.totalTokens <= 0)
+        return undefined;
+    const out = {
+        inputTokens: usage.input,
+        outputTokens: usage.output,
+        cacheReadTokens: usage.cacheRead,
+        cacheWriteTokens: usage.cacheWrite,
+        totalTokens: usage.totalTokens,
+    };
+    return out;
+}
+/** terminal 帧 usage 快照:从任务快照聚合,至少一个字段在场才携带。 */
+function terminalUsageOf(task) {
+    const durationMs = task.endTime !== undefined &&
+        Number.isFinite(task.startTime) &&
+        Number.isFinite(task.endTime) &&
+        task.endTime >= task.startTime
+        ? task.endTime - task.startTime
+        : undefined;
+    const modelUsage = terminalModelUsageOf(task);
+    const toolUseCount = task.toolUsage !== undefined && task.toolUsage.total > 0
+        ? task.toolUsage.total
+        : undefined;
+    const usage = {};
+    if (durationMs !== undefined)
+        usage.durationMs = durationMs;
+    if (modelUsage !== undefined) {
+        usage.modelUsage = modelUsage;
+        usage.totalTokens = modelUsage.totalTokens;
+    }
+    if (toolUseCount !== undefined)
+        usage.toolUseCount = toolUseCount;
+    const hasAny = usage.durationMs !== undefined ||
+        usage.modelUsage !== undefined ||
+        usage.toolUseCount !== undefined ||
+        usage.totalTokens !== undefined;
+    return hasAny ? usage : undefined;
+}
 export function boundedBackgroundTaskError(error) {
-    const text = errorText(error).replace(/\s+/gu, ' ').trim();
-    if (text.length <= MAX_ERROR_CHARS)
-        return text;
-    return `${text.slice(0, MAX_ERROR_CHARS - 1)}…`;
+    // REVIEW:有界错误文案三处重复收敛到共享 boundedErrorMessage
+    return boundedErrorMessage(error, MAX_ERROR_CHARS);
 }
 function errorResponse(requestId, operation, error) {
     return {
@@ -261,16 +314,39 @@ class InstalledBackgroundTaskExtensionService {
     get state() {
         return this.serviceState;
     }
+    /** REVIEW:去重账本按容量上限裁剪,达到上限时清理最旧的 request_id(Set 按插入序迭代)。 */
+    recordSeenRequestId(requestId) {
+        this.seenRequestIds.add(requestId);
+        if (this.seenRequestIds.size > MAX_SEEN_REQUEST_IDS) {
+            const oldest = this.seenRequestIds.values().next().value;
+            if (oldest !== undefined)
+                this.seenRequestIds.delete(oldest);
+        }
+    }
     isClosed() {
         return this.serviceState === 'closed';
     }
-    publishTerminal(task) {
+    publishTerminal(publication) {
         if (this.serviceState === 'closed')
             throw new BackgroundTaskExtensionServiceClosedError();
+        const task = publication.task;
+        const status = terminalStatusOf(task);
+        const usage = terminalUsageOf(task);
         const terminal = {
             schema_version: BG_TERMINAL_SCHEMA,
             task,
+            originMeta: { backgroundSource: 'bash' },
         };
+        if (status !== undefined)
+            terminal.status = status;
+        if (task.failedReason !== undefined)
+            terminal.failedReason = task.failedReason;
+        if (task.stopInitiator !== undefined)
+            terminal.initiator = task.stopInitiator;
+        if (publication.summaryTail !== undefined)
+            terminal.summaryTail = publication.summaryTail;
+        if (usage !== undefined)
+            terminal.usage = usage;
         this.events.emit(BG_TERMINAL_CHANNEL, terminal);
     }
     close() {
@@ -291,7 +367,7 @@ class InstalledBackgroundTaskExtensionService {
             this.emitResponse(errorResponse(request.request_id, request.operation, `duplicate request_id ${request.request_id}`));
             return;
         }
-        this.seenRequestIds.add(request.request_id);
+        this.recordSeenRequestId(request.request_id);
         const terminalGate = request.operation === 'run' || request.operation === 'kill'
             ? createTerminalPublicationGate()
             : undefined;
@@ -358,7 +434,8 @@ class InstalledBackgroundTaskExtensionService {
                 const payload = killPayload(request.payload);
                 const task = this.registry.resolveTask(payload.taskId);
                 task.terminalPublicationGate = combineTerminalPublicationGates(task.terminalPublicationGate, terminalPublicationGate);
-                await this.registry.stopTask(task, 'user');
+                // EventBus kill 属程序化请求(其他扩展/编排器),按模型入口分派
+                await this.registry.stopTask(task, 'user', undefined, 'model');
                 const snapshot = this.registry.snapshot(task);
                 return {
                     task: snapshot,

@@ -20,16 +20,6 @@ import { fileURLToPath } from 'node:url';
 import { parseJsonText } from '../../src/core/common.js';
 import { startInstalledDependencyRegistry } from '../helpers/offline-npm-registry.js';
 import { findFileUrlPathnameViolations } from '../helpers/typescript-source-guards.js';
-import {
-  FusionInvestigateParams,
-  FusionReasonParams,
-  FusionResearchParams,
-  FusionValidateParams,
-  prepareFusionInvestigateArguments,
-  prepareFusionReasonArguments,
-  prepareFusionResearchArguments,
-  prepareFusionValidateArguments,
-} from '../../src/fusion-extension.js';
 
 // npm ships as npm.cmd on Windows, and spawnSync with shell:false does not
 // consult PATHEXT, so spawning the bare name yields status null with no child.
@@ -65,7 +55,8 @@ type NpmIgnoreScriptsObservation = readonly [
 
 function requireSupportedNpmVersion(rawVersion: string): string {
   const version = rawVersion.trim();
-  const match = /^(\d+)\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.exec(version);
+  const match =
+    /^(\d+)\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.exec(version);
   assert.ok(
     match,
     `expected npm --version to report a semantic version, received ${JSON.stringify(rawVersion)}`,
@@ -110,7 +101,11 @@ function runNpm(
     encoding: 'utf8',
     env: options.env,
   });
-  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  return {
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
 }
 
 function runNpmAsync(
@@ -181,7 +176,8 @@ function parseJsonValue(text: string): unknown {
 }
 
 function requireString(value: unknown, label: string): string {
-  if (typeof value !== 'string') throw new TypeError(`${label} must be a string`);
+  if (typeof value !== 'string')
+    throw new TypeError(`${label} must be a string`);
   return value;
 }
 
@@ -210,7 +206,10 @@ function parsePackageJson(value: unknown): PackageJson {
     keywords: requireStringArray(field(value, 'keywords'), 'keywords'),
     pi: {
       extensions: requireStringArray(field(pi, 'extensions'), 'pi.extensions'),
-      image: typeof field(pi, 'image') === 'string' ? (field(pi, 'image') as string) : undefined,
+      image:
+        typeof field(pi, 'image') === 'string'
+          ? (field(pi, 'image') as string)
+          : undefined,
     },
     scripts: Object.fromEntries(
       Object.entries(scripts).filter(
@@ -228,17 +227,24 @@ function parsePackageJson(value: unknown): PackageJson {
   };
 }
 
-function stringRecordField(value: object, key: string): Record<string, string> | undefined {
+function stringRecordField(
+  value: object,
+  key: string,
+): Record<string, string> | undefined {
   const raw = field(value, key);
   if (raw === undefined) return undefined;
   assert.ok(isObject(raw), `${key} must be an object`);
   return Object.fromEntries(
-    Object.entries(raw).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+    Object.entries(raw).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
+    ),
   );
 }
 
 async function pkg(): Promise<PackageJson> {
-  return parsePackageJson(parseJsonValue(await readFile(new URL('package.json', root), 'utf8')));
+  return parsePackageJson(
+    parseJsonValue(await readFile(new URL('package.json', root), 'utf8')),
+  );
 }
 
 async function text(file: string): Promise<string> {
@@ -262,13 +268,16 @@ async function readMarkdownTree(dir: string): Promise<string> {
   for (const entry of entries) {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) parts.push(await readMarkdownTree(path));
-    else if (entry.name.endsWith('.md')) parts.push(await readFile(path, 'utf8'));
+    else if (entry.name.endsWith('.md'))
+      parts.push(await readFile(path, 'utf8'));
   }
   return parts.join('\n');
 }
 
 function stripComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
 function compactExcerpt(source: string): string {
@@ -292,8 +301,15 @@ function isPathSyncHelperName(name: string): boolean {
     lower === 'syncpath'
   )
     return true;
-  if (lower.includes('fsync') && (lower.includes('file') || lower.includes('path'))) return true;
-  return lower.startsWith('sync') && (lower.includes('file') || lower.includes('path'));
+  if (
+    lower.includes('fsync') &&
+    (lower.includes('file') || lower.includes('path'))
+  )
+    return true;
+  return (
+    lower.startsWith('sync') &&
+    (lower.includes('file') || lower.includes('path'))
+  );
 }
 
 function addPatternViolations(
@@ -354,7 +370,10 @@ function addExportedPathSyncViolations(
   const exportedList = /\bexport\s*\{([^}]*)\}/g;
   for (const match of source.matchAll(exportedList)) {
     const names = match[1];
-    if (names !== undefined && names.split(',').some((name) => isPathSyncHelperName(name.trim()))) {
+    if (
+      names !== undefined &&
+      names.split(',').some((name) => isPathSyncHelperName(name.trim()))
+    ) {
       violations.push({
         file,
         rule: 'exported path sync helper',
@@ -375,21 +394,31 @@ function addSwallowedSyncViolations(
     const body = match[1] ?? '';
     const trimmed = body.trim();
     const recordsFailure =
-      /failure\(\s*['"]sync_(?:file|directory)['"]/.test(body) || /throwDurable\b/.test(body);
+      /failure\(\s*['"]sync_(?:file|directory)['"]/.test(body) ||
+      /throwDurable\b/.test(body);
     const throwsImmediately = /^throw\b/.test(trimmed);
     if (
       trimmed.length === 0 ||
       /\breturn\b/.test(body) ||
       (!recordsFailure && !throwsImmediately)
     ) {
-      violations.push({ file, rule: 'silent sync catch', excerpt: compactExcerpt(match[0] ?? '') });
+      violations.push({
+        file,
+        rule: 'silent sync catch',
+        excerpt: compactExcerpt(match[0] ?? ''),
+      });
     }
   }
 }
 
-function formatSourceViolations(violations: readonly SourceViolation[]): string {
+function formatSourceViolations(
+  violations: readonly SourceViolation[],
+): string {
   return violations
-    .map((violation) => `${violation.file} ${violation.rule}: ${violation.excerpt}`)
+    .map(
+      (violation) =>
+        `${violation.file} ${violation.rule}: ${violation.excerpt}`,
+    )
     .join('\n');
 }
 
@@ -446,7 +475,10 @@ function isolatedNpmEnv(rootDir: string): NodeJS.ProcessEnv {
   };
 }
 
-function localRegistryNpmEnv(rootDir: string, registry: string): NodeJS.ProcessEnv {
+function localRegistryNpmEnv(
+  rootDir: string,
+  registry: string,
+): NodeJS.ProcessEnv {
   const env = isolatedNpmEnv(rootDir);
   env['NPM_CONFIG_REGISTRY'] = registry;
   env['npm_config_registry'] = registry;
@@ -459,19 +491,29 @@ function hashReadOnlyTree(directory: string): string {
     const stat = lstatSync(path);
     const mode = stat.mode & 0o7777;
     if (stat.isSymbolicLink()) {
-      hash.update(`link\0${relativePath}\0${String(mode)}\0${readlinkSync(path)}\0`);
+      hash.update(
+        `link\0${relativePath}\0${String(mode)}\0${readlinkSync(path)}\0`,
+      );
       return;
     }
     if (stat.isFile()) {
-      hash.update(`file\0${relativePath}\0${String(mode)}\0${String(stat.size)}\0`);
+      hash.update(
+        `file\0${relativePath}\0${String(mode)}\0${String(stat.size)}\0`,
+      );
       hash.update(readFileSync(path));
       hash.update('\0');
       return;
     }
-    assert.ok(stat.isDirectory(), `fixture source contains unsupported entry ${path}`);
+    assert.ok(
+      stat.isDirectory(),
+      `fixture source contains unsupported entry ${path}`,
+    );
     hash.update(`directory\0${relativePath}\0${String(mode)}\0`);
     for (const name of readdirSync(path).sort()) {
-      visit(join(path, name), relativePath.length === 0 ? name : `${relativePath}/${name}`);
+      visit(
+        join(path, name),
+        relativePath.length === 0 ? name : `${relativePath}/${name}`,
+      );
     }
   };
   visit(directory, '');
@@ -480,12 +522,16 @@ function hashReadOnlyTree(directory: string): string {
 
 function parsePackEntries(stdout: string): NpmPackEntry[] {
   const trimmed = stdout.trim();
-  const arrayStart = trimmed.startsWith('[') ? 0 : stdout.lastIndexOf('\n[') + 1;
+  const arrayStart = trimmed.startsWith('[')
+    ? 0
+    : stdout.lastIndexOf('\n[') + 1;
   assert.ok(
     arrayStart > 0 || trimmed.startsWith('['),
     `npm pack output must end with a JSON array; received ${JSON.stringify(stdout.slice(0, 160))}`,
   );
-  const parsed = parseJsonValue(arrayStart === 0 ? trimmed : stdout.slice(arrayStart).trim());
+  const parsed = parseJsonValue(
+    arrayStart === 0 ? trimmed : stdout.slice(arrayStart).trim(),
+  );
   assert.ok(Array.isArray(parsed), 'npm pack output must be an array');
   return parsed.map((entry): NpmPackEntry => {
     assert.ok(isObject(entry), 'pack entry must be an object');
@@ -511,7 +557,6 @@ void describe('package', () => {
     assert.ok(p.keywords.includes('pi-package'));
     assert.ok(p.keywords.includes('pi-extension'));
     assert.deepEqual(p.pi.extensions, [
-      './dist/extensions/anthropic-attribution.js',
       './dist/extensions/background-tasks.js',
     ]);
     assert.equal(
@@ -520,7 +565,6 @@ void describe('package', () => {
     );
     assert.match(p.scripts['test:agent-loop'] ?? '', /scripted-provider/);
     assert.match(p.scripts['test:full'] ?? '', /test:agent-loop/);
-    assert.match(p.scripts['test:compat'] ?? '', /test-compat/);
     assert.match(p.scripts['test:pnpm-pack'] ?? '', /test-pnpm-pack-install/);
     assert.ok(p.files.includes('dist/'));
     assert.ok(p.files.includes('extensions/'));
@@ -551,113 +595,34 @@ void describe('package', () => {
       'THIRD_PARTY_NOTICES.md',
       'src/extension.ts',
       'src/ui/background-tasks-manager.ts',
-      'src/ui/fusion-model-selector.ts',
       'src/core/common.ts',
       'src/core/registry.ts',
       'src/core/extension-api.ts',
-      'src/core/attested-pi-contract.ts',
-      'src/core/attested-pi-run.ts',
       'src/core/canonical-json.ts',
       'src/core/task-durable.ts',
-      'src/core/anthropic-attribution.ts',
-      'src/core/anthropic-attribution-path.ts',
       'src/core/config.ts',
       'src/core/pi-launch.ts',
-      'src/core/fusion/orchestrator.ts',
-      'src/core/fusion/pi-child.ts',
-      'src/core/fusion/child-protocol.ts',
-      'src/core/fusion/budget.ts',
-      'src/core/fusion/output-contract.ts',
-      'src/core/fusion/workflows.ts',
-      'src/core/fusion/result-package.ts',
-      'src/fusion-extension.ts',
-      'src/fusion-child-extension.ts',
-      'src/core/context/visible-conversation-v2.ts',
-      'src/core/context/parent-snapshot.ts',
-      'src/core/context/token-budget.ts',
-      'src/core/delegate/types.ts',
-      'src/core/delegate/seed.ts',
-      'src/core/delegate/budget.ts',
-      'src/core/delegate/launch.ts',
-      'src/core/delegate/runner.ts',
-      'src/core/delegate/artifacts.ts',
-      'src/core/delegate/result-package.ts',
-      'src/core/delegate/hook-contract.ts',
-      'src/core/delegate/hook-contract-evidence.json',
-      'src/delegate-extension.ts',
-      'src/delegate-child-extension.ts',
-      'extensions/anthropic-attribution-child.ts',
-      'extensions/anthropic-attribution.ts',
       'extensions/background-tasks.ts',
-      'extensions/fusion-child.ts',
-      'extensions/delegate-child.ts',
-      'dist/extensions/anthropic-attribution.js',
       'dist/extensions/background-tasks.js',
-      'dist/extensions/anthropic-attribution-child.js',
-      'dist/extensions/delegate-child.js',
-      'dist/extensions/fusion-child.js',
-      'dist/src/core/delegate/hook-contract-evidence.json',
       'dist/package.json',
     ])
       assert.ok(existsSync(new URL(f, root)), f);
 
-    const extensionSource = await text('src/extension.ts');
-    assert.match(
-      extensionSource,
-      /if \(config\.features\.fusion\) \{[\s\S]*?registerFusionExtension\(pi, \{/,
-    );
-    assert.match(
-      extensionSource,
-      /if \(config\.features\.delegate\) \{[\s\S]*?registerDelegateExtension\(pi, \{/,
-    );
-    assert.match(
-      extensionSource,
-      /if \(config\.features\.delegate \|\| config\.features\.fusion\) \{[\s\S]*?registerBackgroundResultExtension\(pi, \{/,
-    );
-    assert.match(p.scripts['test:hook-contract'] ?? '', /pi-hook-contract/);
-    assert.match(
-      p.scripts['test'] ?? '',
-      /test:hook-contract/,
-      'the default gate must include the Pi hook characterisation gate',
-    );
     const readme = await text('README.md');
     const documentationInventory = `${readme}\n${await readMarkdownTree(fileURLToPath(new URL('docs/', root)))}`;
     const plan = await text('TEST_PLAN.md');
     for (const surface of [
-      '/bg',
-      '/jobs',
-      '/logs',
-      '/kill',
-      '/tasks',
-      '/bg-tasks',
       '/bg-clear',
-      '/bg-update',
-      '/claude-cache',
-      'bg_run',
-      'bg_delegate',
-      'extensionMode',
-      'bg_result',
-      'bg_run_pi_attested',
+      '/bg-jobs',
+      '/bg-logs',
+      '/bg-kill',
+      'run_in_background',
       'bg_status',
       'bg_logs',
       'bg_kill',
       'pi-background-tasks:request:v1',
       'pi-background-tasks:response:v1',
       'pi-background-tasks:terminal:v1',
-      '/fusion',
-      '/fusion-models',
-      'fusion_reason',
-      'fusion_investigate',
-      'fusion_research',
-      'fusion_validate',
-      'fusion-result',
-      'fusion-models.json',
-      '.pi/fusion',
-      'context-omission-ledger.json',
-      'budget-plan.json',
-      'fusion-input.v5',
-      'prompt_budget_exceeded_forecast',
-      'prompt_budget_exceeded_measured',
     ]) {
       assert.match(
         documentationInventory,
@@ -677,746 +642,6 @@ void describe('package', () => {
     assert.match(shortcutDocs, /Ctrl\+Alt\+C/);
   });
 
-  void it('validates Fusion v1 public tool arguments loudly', () => {
-    assert.deepEqual(prepareFusionReasonArguments({ prompt: ' hello ' }), { prompt: 'hello' });
-    assert.throws(
-      () => prepareFusionReasonArguments({ prompt: 'hello', capability: 'reason' }),
-      /unsupported key\(s\): capability/,
-    );
-
-    assert.deepEqual(
-      prepareFusionInvestigateArguments({
-        objective: ' find risk ',
-        background: [' repo changed '],
-        deliverable: ' report ',
-      }),
-      {
-        objective: 'find risk',
-        background: ['repo changed'],
-        deliverable: 'report',
-        scope: [],
-        constraints: [],
-      },
-    );
-
-    assert.deepEqual(
-      prepareFusionResearchArguments({
-        objective: ' compare docs ',
-        background: ['need citations'],
-        deliverable: 'answer',
-        sources: [{ url: 'HTTPS://Example.COM/a#frag', purpose: 'official docs' }],
-      }),
-      {
-        objective: 'compare docs',
-        background: ['need citations'],
-        deliverable: 'answer',
-        scope: [],
-        constraints: [],
-        sources: [{ url: 'https://example.com/a', purpose: 'official docs' }],
-      },
-    );
-    assert.throws(
-      () =>
-        prepareFusionResearchArguments({
-          objective: 'x',
-          background: [],
-          deliverable: 'x',
-          sources: [
-            { url: 'https://example.com/a#one', purpose: 'one' },
-            { url: 'https://example.com/a#two', purpose: 'two' },
-          ],
-        }),
-      /duplicates canonical URL/,
-    );
-    assert.throws(
-      () =>
-        prepareFusionResearchArguments({
-          objective: 'x',
-          background: [],
-          deliverable: 'x',
-          sources: [{ url: 'https://token@example.com/', purpose: 'bad' }],
-        }),
-      /credentials/,
-    );
-    assert.throws(
-      () =>
-        prepareFusionResearchArguments({
-          objective: 'x',
-          background: [],
-          deliverable: 'x',
-          sources: [{ url: 'http://127.0.0.1/', purpose: 'bad' }],
-        }),
-      /private|reserved|localhost/,
-    );
-    assert.throws(
-      () =>
-        prepareFusionResearchArguments({
-          objective: 'x',
-          background: [],
-          deliverable: 'x',
-          sources: [{ url: 'http://[::ffff:127.0.0.1]/', purpose: 'bad' }],
-        }),
-      /private|reserved/,
-    );
-    assert.throws(
-      () =>
-        prepareFusionResearchArguments({
-          objective: 'x',
-          background: [],
-          deliverable: 'x',
-          sources: [
-            { url: 'https://example.com/a', purpose: 'one' },
-            { url: 'https://example.com./a', purpose: 'two' },
-          ],
-        }),
-      /duplicates canonical URL/,
-    );
-
-    for (const schema of [
-      FusionReasonParams,
-      FusionInvestigateParams,
-      FusionResearchParams,
-      FusionValidateParams,
-    ]) {
-      assert.equal(Reflect.get(schema, 'additionalProperties'), false);
-    }
-    const investigateProperties = Reflect.get(FusionInvestigateParams, 'properties');
-    assert.equal(
-      Reflect.get(Reflect.get(investigateProperties, 'scope'), 'additionalProperties'),
-      undefined,
-    );
-    const researchProperties = Reflect.get(FusionResearchParams, 'properties');
-    assert.equal(Reflect.get(Reflect.get(researchProperties, 'sources'), 'minItems'), 1);
-    const verification = Reflect.get(
-      Reflect.get(FusionValidateParams, 'properties'),
-      'verification',
-    );
-    assert.equal(Reflect.get(verification, 'additionalProperties'), false);
-    const status = Reflect.get(Reflect.get(verification, 'properties'), 'status');
-    assert.deepEqual(Reflect.get(status, 'enum'), ['provided', 'not_run']);
-  });
-
-  void it('Fusion candidate tool policy cannot be weakened', async () => {
-    const types = await text('src/core/fusion/types.ts');
-    // The read-only allowlist is exactly Pi's read-only built-in subset. Any addition
-    // here grants fusion children a new capability and must be a deliberate, reviewed
-    // change - not an incidental edit.
-    assert.match(
-      types,
-      /FUSION_INSPECT_TOOLS\s*=\s*Object\.freeze\(\[\s*'read',\s*'grep',\s*'find',\s*'ls',?\s*\]/,
-      'fusion inspect allowlist must remain exactly read, grep, find, ls',
-    );
-    // Every tool that would grant shell access, mutation, recursion, or background
-    // spawning must stay denied. Removing even one entry is a security regression.
-    for (const forbidden of [
-      'bash',
-      'edit',
-      'write',
-      'fusion_brainstorm',
-      'fusion_reason',
-      'fusion_investigate',
-      'fusion_research',
-      'fusion_validate',
-      'bg_delegate',
-      'bg_result',
-      'bg_run',
-      'bg_kill',
-      'bg_status',
-      'bg_logs',
-      'bg_run_pi_attested',
-    ]) {
-      assert.match(
-        types,
-        new RegExp(`FUSION_FORBIDDEN_TOOLS[\\s\\S]*?'${forbidden}'[\\s\\S]*?\\]`),
-        `FUSION_FORBIDDEN_TOOLS must continue to deny ${forbidden}`,
-      );
-    }
-    assert.match(
-      types,
-      /FUSION_PUBLIC_WORKFLOW_NAMES\s*=\s*Object\.freeze\(\[\s*'fusion_reason',\s*'fusion_investigate',\s*'fusion_research',\s*'fusion_validate',?\s*\]/,
-      'public Fusion workflow names must remain the four fixed v1 tools',
-    );
-    assert.match(
-      types,
-      /FUSION_WEB_FETCH_TOOL_NAME\s*=\s*'fusion_web_fetch'/,
-      'fusion_web_fetch must be the package-owned research tool name',
-    );
-    assert.match(
-      types,
-      /FUSION_NO_TOOLS_CAPABILITY:\s*FusionCapability\s*=\s*'reason'/,
-      'fusion no-tools stage policy must remain reason',
-    );
-  });
-
-  void it('Fusion research web fetch registers only in research mode', async () => {
-    const childExtension = await text('src/fusion-child-extension.ts');
-    const registration = childExtension.indexOf('pi.registerTool<typeof FusionWebFetchParams');
-    assert.ok(registration > 0, 'fusion_web_fetch registration must exist');
-    const prefix = childExtension.slice(Math.max(0, registration - 500), registration);
-    assert.match(
-      prefix,
-      /if \(researchEnabled === '1'\) \{[\s\S]*$/,
-      'fusion_web_fetch registration must be guarded by the research env flag',
-    );
-    assert.doesNotMatch(
-      childExtension.slice(0, registration),
-      /pi\.registerTool<typeof FusionWebFetchParams/,
-      'fusion_web_fetch must not be registered before the research guard',
-    );
-  });
-
-  void it('Fusion evaluator and merger can never receive caller-selected tools', async () => {
-    const orchestrator = await text('src/core/fusion/orchestrator.ts');
-    // Stage policy, not caller input. The evaluation and merge child launches must pass
-    // the hardcoded no-tools capability; the caller-supplied capability must never
-    // appear in runEvaluationAttempt() or the merge launch. Assert on the launch regions
-    // rather than a global occurrence count, so legitimate uses (manifest record, budget
-    // forecast, candidate launch) can grow without silently disabling this guard.
-    const evaluationRegion = orchestrator.slice(
-      orchestrator.indexOf('private async runEvaluationAttempt('),
-    );
-    assert.ok(evaluationRegion.length > 0, 'runEvaluationAttempt must exist');
-    assert.doesNotMatch(
-      evaluationRegion.slice(0, 2000),
-      /input\.candidateCapability/,
-      'the evaluation stage must never receive the caller-selected capability',
-    );
-    assert.match(
-      orchestrator,
-      /evaluation:\s*FUSION_NO_TOOLS_CAPABILITY,[\s\S]*?merge:\s*FUSION_NO_TOOLS_CAPABILITY/,
-      'manifest capabilities must keep evaluator and merger no-tools',
-    );
-    // Both non-candidate launch sites annotate the invariant and pass the no-tools constant.
-    const stagePolicyComments = orchestrator.match(/Stage policy, not caller input/g) ?? [];
-    assert.equal(
-      stagePolicyComments.length,
-      2,
-      'evaluation and merge launches must each document the stage-policy invariant',
-    );
-  });
-
-  void it('Fusion golden byte gate has no fixture generation path', async () => {
-    const goldenTest = await text('tests/unit/fusion-golden-bytes.test.ts');
-    assert.doesNotMatch(
-      goldenTest,
-      /writeFile/,
-      'fusion golden byte gate must not auto-generate committed fixtures',
-    );
-    for (const fixture of [
-      'tests/fixtures/fusion-golden-bytes.json',
-      'tests/fixtures/fusion-validate-golden-bytes.json',
-    ]) {
-      assert.ok(existsSync(new URL(fixture, root)), `${fixture} must be committed`);
-    }
-  });
-
-  void it('validates fusion_validate verification contracts and legacy migration loudly', async () => {
-    assert.deepEqual(
-      prepareFusionValidateArguments({
-        objective: 'ship v1',
-        background: ['changed fusion facade'],
-        changeSummary: 'renamed public tools',
-        scope: ['src/fusion-extension.ts'],
-        acceptanceCriteria: ['four tools only'],
-        verification: { status: 'provided', evidence: [{ check: 'typecheck', outcome: 'passed' }] },
-      }),
-      {
-        objective: 'ship v1',
-        background: ['changed fusion facade'],
-        changeSummary: 'renamed public tools',
-        scope: ['src/fusion-extension.ts'],
-        acceptanceCriteria: ['four tools only'],
-        verification: { status: 'provided', evidence: [{ check: 'typecheck', outcome: 'passed' }] },
-        knownLimitations: [],
-        exclusions: [],
-      },
-    );
-    assert.deepEqual(
-      prepareFusionValidateArguments({
-        objective: 'ship v1',
-        background: [],
-        changeSummary: 'renamed public tools',
-        scope: ['src/fusion-extension.ts'],
-        acceptanceCriteria: ['four tools only'],
-        verification: { status: 'not_run', reason: 'core branch unavailable' },
-      }).verification,
-      { status: 'not_run', evidence: [], reason: 'core branch unavailable' },
-    );
-    assert.throws(
-      () => prepareFusionValidateArguments({ prompt: '  review it  ' }),
-      /no longer accepts \{prompt\}/,
-    );
-    assert.throws(
-      () =>
-        prepareFusionValidateArguments({
-          objective: 'x',
-          background: [],
-          changeSummary: 'x',
-          scope: ['x'],
-          acceptanceCriteria: ['x'],
-          verification: { status: 'provided' },
-        }),
-      /requires non-empty evidence/,
-    );
-    assert.throws(
-      () =>
-        prepareFusionValidateArguments({
-          objective: 'x',
-          background: [],
-          changeSummary: 'x',
-          scope: ['x'],
-          acceptanceCriteria: ['x'],
-          verification: {
-            status: 'not_run',
-            evidence: [{ check: 'x', outcome: 'x' }],
-            reason: 'x',
-          },
-        }),
-      /must not include evidence/,
-    );
-    assert.throws(
-      () =>
-        prepareFusionValidateArguments({
-          objective: 'x',
-          background: [],
-          changeSummary: 'x',
-          scope: [],
-          acceptanceCriteria: ['x'],
-          verification: { status: 'not_run', reason: 'x' },
-        }),
-      /scope must not be empty/,
-    );
-
-    const extension = await text('src/fusion-extension.ts');
-    assert.match(extension, /FUSION_REASON_TOOL_NAME = 'fusion_reason'/);
-    assert.match(extension, /FUSION_INVESTIGATE_TOOL_NAME = 'fusion_investigate'/);
-    assert.match(extension, /FUSION_RESEARCH_TOOL_NAME = 'fusion_research'/);
-    assert.match(
-      extension,
-      /RETIRED_FUSION_TOOL_NAMES = new Set<string>\(\['fusion_brainstorm'\]\)/,
-    );
-  });
-
-  void it('ships global package-owned Anthropic attribution with no exotic dependency', async () => {
-    const p = await pkg();
-    assert.equal(p.peerDependencies['@earendil-works/pi-ai'], '*');
-    assert.equal(
-      p.dependencies?.['@earendil-works/pi-ai'],
-      undefined,
-      'Pi AI must resolve through the host loader rather than a private runtime copy',
-    );
-    assert.equal(p.dependencies?.['@ravshansbox/pi-anthropic-sps'], undefined);
-    for (const [name, specifier] of Object.entries(p.dependencies ?? {})) {
-      assert.doesNotMatch(
-        specifier,
-        /^(?:https?:|git(?:\+|:)|github:|file:)/,
-        `production dependency ${name} must use a registry version`,
-      );
-    }
-    const attribution = await text('src/core/anthropic-attribution.ts');
-    assert.match(attribution, /X-Claude-Code-Session-Id/);
-    assert.match(attribution, /prompt-caching-scope-2026-01-05/);
-    assert.match(attribution, /cacheWrite1h/);
-    assert.match(attribution, /CLAUDE_CODE_200K_SUBSCRIPTION_CONTEXT_WINDOW/);
-    assert.match(attribution, /environment variables \(docs\/environment-variables\.md\)/);
-    assert.match(attribution, /ANTHROPIC_ATTRIBUTION_CLAIM_CHANNEL/);
-
-    const [compiledCore, compiledAmbientGateway, compiledChildGateway] = await Promise.all([
-      text('dist/src/core/anthropic-attribution.js'),
-      text('dist/extensions/anthropic-attribution.js'),
-      text('dist/extensions/anthropic-attribution-child.js'),
-    ]);
-    const runtimePiAiImport =
-      /from ['"]@earendil-works\/pi-ai(?:\/compat)?['"]/u;
-    assert.doesNotMatch(
-      compiledCore,
-      runtimePiAiImport,
-      'the lazy native-import target must not resolve a private Pi AI package',
-    );
-    assert.match(compiledAmbientGateway, runtimePiAiImport);
-    assert.match(compiledChildGateway, runtimePiAiImport);
-    assert.match(compiledAmbientGateway, /hostAnthropicMessagesApi: anthropicMessagesApi/u);
-    assert.match(compiledChildGateway, /hostAnthropicMessagesApi: anthropicMessagesApi/u);
-
-    const child = await text('src/core/fusion/pi-child.ts');
-    assert.match(child, /FUSION_SANITIZED_PROVIDER\s*=\s*'anthropic'/);
-    assert.doesNotMatch(child, /pi-anthropic-sps/);
-    assert.match(child, /resolveAnthropicAttributionExtensionPath/);
-    assert.match(child, /return \[resolveAttribution\(\), childExtensionPath\]/);
-    assert.match(
-      child,
-      /model\.provider !== FUSION_SANITIZED_PROVIDER/,
-      'attribution must be provider-gated so other routes keep identical argv',
-    );
-  });
-
-  void it('keeps Fusion Claude cache normalization before final-payload governance', async () => {
-    const cache = await text('src/core/fusion/claude-cache.ts');
-    assert.match(cache, /FUSION_CLAUDE_CACHE_DEFAULT_RETENTION\s*=\s*'long'/);
-    assert.match(cache, /PI_CACHE_RETENTION/);
-    assert.match(cache, /FUSION_CLAUDE_CACHE_BREAKPOINT_LIMIT\s*=\s*4/);
-    assert.match(cache, /upstream call-level opt-out/);
-    assert.match(cache, /prompt-caching-scope-2026-01-05/);
-
-    const childRunner = await text('src/core/fusion/pi-child.ts');
-    assert.match(childRunner, /out\[FUSION_CLAUDE_CACHE_RETENTION_ENV\] = 'long'/);
-    const childExtension = await text('src/fusion-child-extension.ts');
-    const normalizeAt = childExtension.indexOf('normalizeFusionClaudeCachePayload({');
-    const governAt = childExtension.indexOf('prepareFusionRuntimeRequest({', normalizeAt);
-    assert.ok(normalizeAt >= 0, 'Claude cache policy must normalize final provider payloads');
-    assert.ok(governAt > normalizeAt, 'runtime governor must measure the cache-normalized payload');
-    assert.match(childExtension, /model\?\.provider === 'anthropic'/);
-    const protocol = await text('src/core/fusion/child-protocol.ts');
-    assert.match(protocol, /cache_observation/);
-    assert.match(protocol, /cacheWrite1h/);
-    assert.match(protocol, /reasoning/);
-  });
-
-  void it('ships the markdown extractor as a real dependency without startup import', async () => {
-    const p = await pkg();
-    assert.equal(
-      p.dependencies?.['turndown'],
-      '7.2.4',
-      'the production markdown extractor dependency must be installed for package users',
-    );
-    assert.equal(
-      p.devDependencies?.['turndown'],
-      undefined,
-      'runtime markdown extraction must not be hidden in devDependencies',
-    );
-    const fetchSource = await text('src/core/fusion/web-fetch.ts');
-    assert.doesNotMatch(
-      fetchSource,
-      /import\s+TurndownService\s+from\s+['"]turndown['"]/,
-      'turndown must load lazily so a damaged package install does not block Pi startup',
-    );
-    assert.match(fetchSource, /import\('turndown'\)/);
-    const childLauncher = await text('src/core/fusion/pi-child.ts');
-    assert.doesNotMatch(childLauncher, /fusion-child-extension/);
-    assert.match(childLauncher, /child-protocol/);
-  });
-
-  void it('Fusion validate cannot recurse through each child tool policy', async () => {
-    const types = await text('src/core/fusion/types.ts');
-    const delegateLaunch = await text('src/core/delegate/launch.ts');
-    for (const source of [types, delegateLaunch]) {
-      assert.match(
-        source,
-        /'fusion_validate'/,
-        'fusion_validate must be denied to every tool-enabled child',
-      );
-    }
-  });
-
-  void it('Fusion facade exposes four fixed-purpose tools and no public capability mode', async () => {
-    const extension = await text('src/fusion-extension.ts');
-    const registeredNames = [
-      ...extension.matchAll(/registerTool\(\{\s*name:\s*(FUSION_[A-Z_]+_TOOL_NAME)/g),
-    ].map((match) => match[1]);
-    assert.deepEqual(registeredNames, [
-      'FUSION_REASON_TOOL_NAME',
-      'FUSION_INVESTIGATE_TOOL_NAME',
-      'FUSION_RESEARCH_TOOL_NAME',
-      'FUSION_VALIDATE_TOOL_NAME',
-    ]);
-    assert.doesNotMatch(extension, /registerTool[\s\S]*?name:\s*['"]fusion_brainstorm['"]/);
-    assert.match(extension, /CURRENT_FUSION_TOOL_NAMES = Object\.freeze\(\[/);
-    assert.match(
-      extension,
-      /pi\.setActiveTools\(next\)/,
-      'session_start must rewrite stale active tools deterministically',
-    );
-    assert.match(extension, /no capability argument/);
-    assert.match(extension, /targeted fetches of supplied URLs only/);
-    assert.match(extension, /no longer accepts \{prompt\}/);
-    const legacyBypass = `${'PI_BG_ALLOW'}_LEGACY_FUSION_CORE_FOR_TESTS`;
-    assert.doesNotMatch(extension, new RegExp(legacyBypass));
-    assert.doesNotMatch(extension, /legacy canonical input outside tests/);
-    assert.doesNotMatch(extension, /core fusion workflow export \$\{primaryName\} is missing/);
-  });
-
-  void it('fusion production code avoids direct completion APIs and local adapters', async () => {
-    const fusionFiles = [
-      'src/fusion-extension.ts',
-      'src/core/fusion/config.ts',
-      'src/core/fusion/context.ts',
-      'src/core/fusion/prompts.ts',
-      'src/core/fusion/evaluation.ts',
-      'src/core/fusion/pi-child.ts',
-      'src/core/fusion/child-protocol.ts',
-      'src/core/fusion/artifacts.ts',
-      'src/core/fusion/orchestrator.ts',
-      'src/core/fusion/budget.ts',
-      'src/core/fusion/output-contract.ts',
-      'src/core/fusion/web-fetch.ts',
-      'src/ui/fusion-model-selector.ts',
-      'src/fusion-child-extension.ts',
-      'extensions/background-tasks.ts',
-      'extensions/fusion-child.ts',
-    ];
-    for (const file of fusionFiles) {
-      const source = await text(file);
-      assert.doesNotMatch(source, /@earendil-works\/pi-ai\/compat/);
-      assert.doesNotMatch(
-        source,
-        /import\s*\{[^}]*\b(?:complete|stream|streamSimple)\b[^}]*}\s*from\s*['"]@earendil-works\/pi-ai/,
-      );
-      assert.doesNotMatch(source, /\.pi\/extensions/);
-      assert.doesNotMatch(source, /ai-pipeline/);
-    }
-    const child = await text('src/core/fusion/pi-child.ts');
-    for (const flag of [
-      '--no-tools',
-      '--no-extensions',
-      '--no-skills',
-      '--no-prompt-templates',
-      '--no-context-files',
-      '--no-session',
-    ])
-      assert.match(child, new RegExp(flag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  });
-
-  void it('BUG-182 keeps Fusion usage on the exact host contract across shipped producers and consumers', async () => {
-    const files = [
-      'src/fusion-child-extension.ts',
-      'src/fusion-extension.ts',
-      'src/core/fusion/types.ts',
-      'src/core/fusion/pi-child.ts',
-      'src/core/fusion/child-protocol.ts',
-      'src/core/fusion/orchestrator.ts',
-      'src/core/fusion/artifacts.ts',
-      'src/core/fusion/result-package.ts',
-      'src/delegate-extension.ts',
-    ];
-    for (const file of files) {
-      const source = await text(file);
-      assert.doesNotMatch(source, /costTotal/, `${file} must not carry the retired cost shape`);
-    }
-    const childProtocol = await text('src/core/fusion/child-protocol.ts');
-    assert.match(childProtocol, /fusion-child-result\.v4/);
-    assert.match(childProtocol, /fusion-child-settlement\.v3/);
-    for (const key of ['input', 'output', 'cacheRead', 'cacheWrite', 'total']) {
-      assert.match(childProtocol, new RegExp(`cost\\.${key}`));
-    }
-    const types = await text('src/core/fusion/types.ts');
-    assert.match(types, /fusion-result\.v4/);
-    assert.match(types, /fusion-manifest\.v3/);
-    assert.match(types, /export type FusionUsage = Usage/);
-    const extension = await text('src/fusion-extension.ts');
-    assert.match(extension, /usageDelivered: false/);
-    assert.match(extension, /resultDetails: result\.details/);
-    const resultExtension = await text('src/delegate-extension.ts');
-    assert.match(resultExtension, /claimFusionUsage/);
-    assert.match(resultExtension, /const usage = cloneFusionUsage\(verified\.details\.usage\)/);
-    assert.match(resultExtension, /resultWithUsage:[\s\S]*?usage,/);
-  });
-
-  void it('keeps background Fusion retrieval durable, verified, and once-accounted', async () => {
-    const artifacts = await text('src/core/fusion/artifacts.ts');
-    const resultPackage = await text('src/core/fusion/result-package.ts');
-    const resultExtension = await text('src/delegate-extension.ts');
-    const registry = await text('src/core/registry.ts');
-    const fusionFacade = await text('src/fusion-extension.ts');
-    assert.match(artifacts, /manifest\.artifacts\['result\.json'\]/);
-    assert.match(artifacts, /writeCommittedResult/);
-    assert.match(artifacts, /async writeFailureSummary/);
-    assert.match(artifacts, /failure summary is already bound in the manifest/);
-    assert.match(resultPackage, /FUSION_FAILURE_SUMMARY_MAX_BYTES/);
-    assert.match(resultPackage, /failure evidence ref diverges from manifest/);
-    assert.match(resultPackage, /failure summary exceeds its bounded artifact size/);
-    assert.match(resultPackage, /TextDecoder\('utf-8', \{ fatal: true \}\)/);
-    assert.doesNotMatch(resultPackage, /readUtf8\([^\n]*response\.(?:md|txt)/);
-    assert.match(resultPackage, /sha256Buffer\(resultFile\.bytes\)/);
-    assert.match(resultPackage, /sha256Buffer\(mergedFile\.bytes\)/);
-    assert.match(resultPackage, /TextDecoder\('utf-8', \{ fatal: true \}\)/);
-    assert.doesNotMatch(resultPackage, /\.slice\(|\.substring\(/);
-    assert.match(resultExtension, /loaded\.readFusionFailureResult/);
-    assert.match(resultExtension, /delivery: 'none'/);
-    assert.match(resultExtension, /loaded\.readFusionCommittedResult/);
-    assert.match(resultExtension, /await deps\.claimFusionUsage\(task\)/);
-    const orchestrator = await text('src/core/fusion/orchestrator.ts');
-    assert.ok(
-      orchestrator.indexOf('await store.writeError') <
-        orchestrator.indexOf('await store.writeFailureSummary'),
-      'terminal error publication must precede the one summary attempt',
-    );
-    assert.equal(
-      (orchestrator.match(/await store\.writeFailureSummary/g) ?? []).length,
-      1,
-      'summary persistence must have exactly one orchestrator call site',
-    );
-    assert.ok(
-      resultExtension.indexOf('loaded.readFusionFailureResult') <
-        resultExtension.indexOf('await deps.claimFusionUsage(task)'),
-      'failed retrieval must return before committed-result usage can be claimed',
-    );
-    assert.ok(
-      resultExtension.indexOf('loaded.readFusionCommittedResult') <
-        resultExtension.indexOf('await deps.claimFusionUsage(task)'),
-      'verification must finish before the once-only usage claim',
-    );
-    assert.ok(
-      resultExtension.indexOf('const usage = cloneFusionUsage(verified.details.usage)') <
-        resultExtension.indexOf('await deps.claimFusionUsage(task)'),
-      'usage cloning must finish before the durable claim settlement point',
-    );
-    assert.match(registry, /async claimFusionUsage/);
-    assert.match(
-      fusionFacade,
-      /The workflow passed durable preflight and no longer blocks this tool call/,
-    );
-    assert.match(fusionFacade, /onReady/);
-  });
-
-  void it('BUG-185 keeps post-launch Fusion guards free of token/output reservation admission', async () => {
-    const child = await text('src/fusion-child-extension.ts');
-    const protocol = await text('src/core/fusion/child-protocol.ts');
-    const parent = await text('src/core/fusion/pi-child.ts');
-    const types = await text('src/core/fusion/types.ts');
-
-    assert.doesNotMatch(
-      child,
-      /estimateInputTokens|knownJsonSegment|resolveTokenBudgetFamily|contextWindowTokens|maxOutputTokens|provider_request_budget|estimated_input_tokens|allowed_input_tokens|reserved_output_tokens|safety_reserve_tokens/,
-    );
-    assert.doesNotMatch(
-      protocol,
-      /provider_request_budget|estimated_input_tokens|allowed_input_tokens|reserved_output_tokens|safety_reserve_tokens|FUSION_CHILD_MIN_OUTPUT_RESERVE_TOKENS|FUSION_CHILD_SAFETY_RESERVE_TOKENS/,
-    );
-    assert.doesNotMatch(parent, /child_runtime_budget_exceeded|allowed-input arithmetic/);
-    assert.match(protocol, /pi-background-tasks\.fusion-runtime-guard\.v2/);
-    assert.match(types, /child_runtime_limit_exceeded/);
-    assert.match(types, /child_runtime_payload_invalid/);
-  });
-
-  void it('keeps expanded Fusion execution limits enforced at child and parent boundaries', async () => {
-    const child = await text('src/fusion-child-extension.ts');
-    const protocol = await text('src/core/fusion/child-protocol.ts');
-    const parent = await text('src/core/fusion/pi-child.ts');
-    const fetcher = await text('src/core/fusion/web-fetch.ts');
-
-    assert.match(protocol, /FUSION_CHILD_MAX_PROVIDER_REQUESTS = 550/);
-    assert.match(protocol, /FUSION_CHILD_MAX_TOOL_CALLS = 600/);
-    assert.match(protocol, /FUSION_CHILD_MAX_TOTAL_TOOL_RESULT_BYTES = 32 \* 1024 \* 1024/);
-    assert.match(child, /input\.toolCallCount <= FUSION_CHILD_MAX_TOOL_CALLS/);
-    assert.match(child, /totalToolResultBytes > FUSION_CHILD_MAX_TOTAL_TOOL_RESULT_BYTES/);
-    assert.match(parent, /recordCount > FUSION_CHILD_MAX_TOOL_CALLS/);
-    assert.match(parent, /totalResultBytes > FUSION_CHILD_MAX_TOTAL_TOOL_RESULT_BYTES/);
-    assert.match(fetcher, /Promise\.race\(\[extraction, timeout\]\)/);
-    assert.match(fetcher, /assertFetchDeadline\(options, deadlineMs, url, 'content extraction'\)/);
-  });
-
-  void it('keeps the Fusion context/budget path free of silent truncation and fallback shapes', async () => {
-    const context = await text('src/core/fusion/context.ts');
-    const budget = await text('src/core/fusion/budget.ts');
-    const outputContract = await text('src/core/fusion/output-contract.ts');
-    const orchestratorText = await text('src/core/fusion/orchestrator.ts');
-    const orchestratorSource = () => orchestratorText;
-    // The projection transform and the size arithmetic are shared with
-    // bg_delegate, so the guard follows the real implementation instead of only
-    // the Fusion facade. Scanning the facade alone would let a truncation or
-    // fallback shape be reintroduced one module away and go unnoticed.
-    const transform = await text('src/core/context/visible-conversation-v2.ts');
-    const parentSnapshot = await text('src/core/context/parent-snapshot.ts');
-    const tokenBudget = await text('src/core/context/token-budget.ts');
-    const delegateChild = await text('src/delegate-child-extension.ts');
-
-    // No clipping of retained conversational text. Scan code only: comments
-    // legitimately discuss truncation in order to forbid it.
-    const codeOnly = (source: string): string =>
-      source
-        .replace(/\/\*[\s\S]*?\*\//g, '')
-        .split('\n')
-        .filter((line) => !line.trim().startsWith('//'))
-        .join('\n');
-    for (const [label, source] of [
-      ['context', codeOnly(context)],
-      ['budget', codeOnly(budget)],
-      ['output-contract', codeOnly(outputContract)],
-      ['visible-conversation-v2', codeOnly(transform)],
-      ['parent-snapshot', codeOnly(parentSnapshot)],
-      ['token-budget', codeOnly(tokenBudget)],
-    ] as const) {
-      assert.doesNotMatch(source, /\.slice\(/, `${label} must not clip retained content`);
-      assert.doesNotMatch(source, /\.substring\(/, `${label} must not clip retained content`);
-      assert.doesNotMatch(source, /\.trim\(\)\.slice/, `${label} must not clip retained content`);
-      assert.doesNotMatch(source, /catch\s*\{\s*\}/, `${label} must not swallow errors`);
-    }
-
-    // The projection must never carry a payload preview, however it is spelled.
-    assert.match(context, /tool_payload_preview_bytes: 0/);
-
-    // Budget rejection must be a loud typed error, never a clamp or a downgrade.
-    assert.match(budget, /prompt_budget_exceeded_forecast/);
-    assert.match(budget, /prompt_budget_exceeded_measured/);
-    assert.match(budget, /model_capacity_unknown/);
-    assert.doesNotMatch(budget, /Math\.min\([^)]*allowed/i, 'budget must not clamp to fit');
-
-    // Output contracts must be enforced, which is what makes per-stage forecasts
-    // a guarantee rather than an assumption.
-    assert.match(budget, /assertChildOutputWithinContract/);
-    assert.match(outputContract, /child_output_cap/);
-    assert.match(outputContract, /fusionJsonRenderedTextBytes/);
-    assert.match(orchestratorSource(), /assertChildOutputWithinContract\('candidate'/);
-
-    // Forecasts must add contract maxima to real empty-slot prompt renderings.
-    assert.match(budget, /buildEvaluationRepairPrompt/);
-    assert.match(budget, /upstream_output_contract_bytes/);
-    assert.doesNotMatch(budget, /FUSION_DOWNSTREAM_RESERVE_TOKENS/);
-
-    // Route selection must rank byte capacity, not token capacity.
-    assert.doesNotMatch(budget, /Math\.max\([^)]*route\.allowed_input_tokens/);
-    assert.match(budget, /fusionLimitingRoute/);
-    assert.match(budget, /byte_capacity_utf8_bytes/);
-
-    // The shared estimator must stay affine, per-family, additive, and visibly
-    // conservative for unbacked routes.
-    assert.doesNotMatch(tokenBudget, /BYTES_PER_TOKEN_DIVISOR/);
-    assert.match(tokenBudget, /TOKEN_BUDGET_CALIBRATION_VERSION/);
-    assert.match(tokenBudget, /rate_bytes_per_token_x100: 173/);
-    assert.match(tokenBudget, /rate_bytes_per_token_x100: 289/);
-    assert.match(tokenBudget, /rate_bytes_per_token_x100: 100/);
-    assert.match(tokenBudget, /backed: false/);
-    assert.match(tokenBudget, /estimateInputTokens/);
-    assert.match(tokenBudget, /unknown_output_contract/);
-    assert.match(tokenBudget, /multibyteBytes/);
-    assert.match(tokenBudget, /variableTokenTotal \+ rateSource\.affine_f_tokens/);
-    assert.match(tokenBudget, /TOKEN_BUDGET_PROVABLE_RATE_X100 = 100/);
-    assert.match(tokenBudget, /TOKEN_BUDGET_CONSERVATIVE_RATE_X100 = 200/);
-    assert.match(tokenBudget, /TOKEN_BUDGET_DENSE_ASCII_WHITESPACE_THRESHOLD_X10000/);
-    assert.match(
-      tokenBudget,
-      /TOKEN_BUDGET_DELEGATE_CONSERVATIVE_RATE_X100 = TOKEN_BUDGET_PROVABLE_RATE_X100/,
-    );
-    assert.doesNotMatch(tokenBudget, /sessions:/);
-    assert.doesNotMatch(tokenBudget, /days:/);
-    assert.match(tokenBudget, /Math\.min\(configured, TOKEN_BUDGET_CONSERVATIVE_RATE_X100\)/);
-    assert.doesNotMatch(tokenBudget, /Math\.ceil\(utf8Bytes \//);
-    assert.match(delegateChild, /retainedInputMeasurement/);
-    assert.match(delegateChild, /retainedInputMultibyteBytes/);
-    assert.match(delegateChild, /retainedInputDenseBytes/);
-
-    // The shared transform must remain knob-free: a consumer must not be able to
-    // ask it for a weaker disclosure policy.
-    assert.match(transform, /export function projectVisibleConversationV2\(\s*messages/);
-    assert.doesNotMatch(
-      transform,
-      /projectVisibleConversationV2\([^)]*(?:options|policy|flags|config)/,
-      'the shared transform must not accept behavioural options',
-    );
-    assert.match(transform, /throw unsupportedBlock\(/);
-
-    // Every budget stage must be guarded in the orchestrator before spawning.
-    const orchestrator = orchestratorSource();
-    for (const stage of ['candidate', 'evaluation', 'evaluation_repair', 'merge']) {
-      assert.match(
-        orchestrator,
-        new RegExp(`assertStagePrompt\\(\\s*'${stage}'`),
-        `orchestrator must preflight the ${stage} stage`,
-      );
-    }
-    assert.match(orchestrator, /assertPlanFits\(/);
-  });
-
   void it('keeps production durable syncing handle-scoped and loud', async () => {
     const files = await walkSourceTree(fileURLToPath(new URL('src/', root)));
     const violations: SourceViolation[] = [];
@@ -1425,7 +650,9 @@ void describe('package', () => {
       // file is a native path from walkSourceTree, so the prefix must be native
       // too. Comparing against a URL pathname silently never matches on Windows.
       const rootPath = fileURLToPath(root);
-      const label = file.startsWith(rootPath) ? file.slice(rootPath.length) : file;
+      const label = file.startsWith(rootPath)
+        ? file.slice(rootPath.length)
+        : file;
       addPatternViolations(
         violations,
         label,
@@ -1472,9 +699,10 @@ void describe('package', () => {
       'const assignedPath = assigned.pathname;',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('file-url-antipatterns.ts', fileUrlAntipatterns).map(
-        (violation) => violation.line,
-      ),
+      findFileUrlPathnameViolations(
+        'file-url-antipatterns.ts',
+        fileUrlAntipatterns,
+      ).map((violation) => violation.line),
       [2, 7, 8, 9, 10, 12, 15],
     );
 
@@ -1496,7 +724,10 @@ void describe('package', () => {
       'const pattern = /file:\\/\\/\\/C:\\/repo|\\.pathname/u;',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('legitimate-url-paths.ts', legitimateUrlPaths),
+      findFileUrlPathnameViolations(
+        'legitimate-url-paths.ts',
+        legitimateUrlPaths,
+      ),
       [],
     );
   });
@@ -1522,7 +753,10 @@ void describe('package', () => {
       "const host = 'example.com';",
       'const fromTemplate = new URL(`https://${host}/v1`, import.meta.url).pathname;',
     ].join('\n');
-    assert.deepEqual(findFileUrlPathnameViolations('absolute-https-first.ts', httpsCases), []);
+    assert.deepEqual(
+      findFileUrlPathnameViolations('absolute-https-first.ts', httpsCases),
+      [],
+    );
   });
 
   void it('file URL guard retains explicit bases for possibly relative first inputs', () => {
@@ -1548,9 +782,10 @@ void describe('package', () => {
       'new URL(`file://${fileHost}/share/template.ts`, `https://example.com/base`).pathname;',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('possible-relative-file-bases.ts', fileBaseCases).map(
-        (violation) => violation.line,
-      ),
+      findFileUrlPathnameViolations(
+        'possible-relative-file-bases.ts',
+        fileBaseCases,
+      ).map((violation) => violation.line),
       [4, 5, 8, 11, 12, 14, 16, 17, 19],
     );
 
@@ -1571,7 +806,10 @@ void describe('package', () => {
       'new URL(`https://${httpsHost}/template`, import.meta.url).pathname;',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('possible-relative-https-bases.ts', httpsBaseControls),
+      findFileUrlPathnameViolations(
+        'possible-relative-https-bases.ts',
+        httpsBaseControls,
+      ),
       [],
     );
   });
@@ -1585,9 +823,10 @@ void describe('package', () => {
       "const normalizedTemplate = new URL(`\\r\\nfi\\tle://${host}/share/file.ts`, 'https://example.com/base').pathname;",
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('whatwg-file-preprocessing.ts', fileCases).map(
-        (violation) => violation.line,
-      ),
+      findFileUrlPathnameViolations(
+        'whatwg-file-preprocessing.ts',
+        fileCases,
+      ).map((violation) => violation.line),
       [2, 3, 4, 5],
     );
 
@@ -1600,7 +839,10 @@ void describe('package', () => {
       'const normalizedTemplate = new URL(`\\r\\nht\\ntps://${host}/v1`, import.meta.url).pathname;',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('whatwg-https-preprocessing.ts', httpsCases),
+      findFileUrlPathnameViolations(
+        'whatwg-https-preprocessing.ts',
+        httpsCases,
+      ),
       [],
     );
 
@@ -1612,15 +854,19 @@ void describe('package', () => {
       'new URL(`${dynamicScheme}://example.com/path`, import.meta.url).pathname;',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('whatwg-dynamic-boundary.ts', dynamicCases).map(
-        (violation) => violation.line,
-      ),
+      findFileUrlPathnameViolations(
+        'whatwg-dynamic-boundary.ts',
+        dynamicCases,
+      ).map((violation) => violation.line),
       [4, 5],
     );
 
     const runtimeHost = 'server';
     assert.equal(
-      new URL('\u0000\u001f file:///C:/work/file.ts', 'https://example.com/base').protocol,
+      new URL(
+        '\u0000\u001f file:///C:/work/file.ts',
+        'https://example.com/base',
+      ).protocol,
       'file:',
     );
     assert.equal(
@@ -1632,17 +878,33 @@ void describe('package', () => {
       'file:',
     );
     assert.equal(
-      new URL(`\r\nfi\tle://${runtimeHost}/share/file.ts`, 'https://example.com/base').protocol,
+      new URL(
+        `\r\nfi\tle://${runtimeHost}/share/file.ts`,
+        'https://example.com/base',
+      ).protocol,
       'file:',
     );
     assert.equal(
-      new URL('\u0000 \t\r\nhttps://example.com/request/path', import.meta.url).protocol,
+      new URL('\u0000 \t\r\nhttps://example.com/request/path', import.meta.url)
+        .protocol,
       'https:',
     );
-    assert.equal(new URL('ht\ntps://example.com/request/path', import.meta.url).protocol, 'https:');
-    assert.equal(new URL('ht\ttps://example.com/request/path', import.meta.url).protocol, 'https:');
-    assert.equal(new URL('ht\rtps://example.com/request/path', import.meta.url).protocol, 'https:');
-    assert.equal(new URL(`\r\nht\ntps://${runtimeHost}/v1`, import.meta.url).protocol, 'https:');
+    assert.equal(
+      new URL('ht\ntps://example.com/request/path', import.meta.url).protocol,
+      'https:',
+    );
+    assert.equal(
+      new URL('ht\ttps://example.com/request/path', import.meta.url).protocol,
+      'https:',
+    );
+    assert.equal(
+      new URL('ht\rtps://example.com/request/path', import.meta.url).protocol,
+      'https:',
+    );
+    assert.equal(
+      new URL(`\r\nht\ntps://${runtimeHost}/v1`, import.meta.url).protocol,
+      'https:',
+    );
   });
 
   void it('file URL guard preserves explicit abrupt completion states', () => {
@@ -1920,7 +1182,10 @@ void describe('package', () => {
       "present ?? (target = 'file:///C:/skipped-nullish.ts');",
       'new URL(target).pathname;',
     ].join('\n');
-    assert.deepEqual(findFileUrlPathnameViolations('short-circuit-controls.ts', controls), []);
+    assert.deepEqual(
+      findFileUrlPathnameViolations('short-circuit-controls.ts', controls),
+      [],
+    );
 
     const hazards = [
       "let andTarget = 'https://example.com/request/path';",
@@ -1974,7 +1239,10 @@ void describe('package', () => {
       '}',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('for-of-and-global-url-controls.ts', controls),
+      findFileUrlPathnameViolations(
+        'for-of-and-global-url-controls.ts',
+        controls,
+      ),
       [],
     );
   });
@@ -2014,7 +1282,10 @@ void describe('package', () => {
       '}',
       'export {};',
     ].join('\n');
-    assert.deepEqual(findFileUrlPathnameViolations('static-url-key-controls.ts', controls), []);
+    assert.deepEqual(
+      findFileUrlPathnameViolations('static-url-key-controls.ts', controls),
+      [],
+    );
   });
 
   void it('file URL guard uses feasible values at each pathname read', () => {
@@ -2024,9 +1295,10 @@ void describe('package', () => {
       "target = 'https://example.com/request/path';",
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('read-before-write.ts', readBeforeWrite).map(
-        (violation) => violation.line,
-      ),
+      findFileUrlPathnameViolations(
+        'read-before-write.ts',
+        readBeforeWrite,
+      ).map((violation) => violation.line),
       [2],
     );
 
@@ -2067,7 +1339,10 @@ void describe('package', () => {
       'const requestPath = parsed.pathname;',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('overwritten-before-read.ts', overwrittenBeforeRead),
+      findFileUrlPathnameViolations(
+        'overwritten-before-read.ts',
+        overwrittenBeforeRead,
+      ),
       [],
     );
 
@@ -2076,7 +1351,10 @@ void describe('package', () => {
       'const requestPath = new URL(target).pathname;',
       "target = 'file:///C:/work/file.ts';",
     ].join('\n');
-    assert.deepEqual(findFileUrlPathnameViolations('write-after-read.ts', writeAfterRead), []);
+    assert.deepEqual(
+      findFileUrlPathnameViolations('write-after-read.ts', writeAfterRead),
+      [],
+    );
 
     const unreachableFileWrite = [
       "let target = 'https://example.com/request/path';",
@@ -2084,7 +1362,10 @@ void describe('package', () => {
       'const requestPath = new URL(target).pathname;',
     ].join('\n');
     assert.deepEqual(
-      findFileUrlPathnameViolations('unreachable-file-write.ts', unreachableFileWrite),
+      findFileUrlPathnameViolations(
+        'unreachable-file-write.ts',
+        unreachableFileWrite,
+      ),
       [],
     );
   });
@@ -2116,7 +1397,10 @@ void describe('package', () => {
       "  return new URL('file:///C:/still-not-a-real-url-object')[key];",
       '}',
     ].join('\n');
-    assert.deepEqual(findFileUrlPathnameViolations('pathname-alias-controls.ts', controls), []);
+    assert.deepEqual(
+      findFileUrlPathnameViolations('pathname-alias-controls.ts', controls),
+      [],
+    );
   });
 
   void it('converts file URLs to native paths instead of using URL.pathname', async () => {
@@ -2131,7 +1415,9 @@ void describe('package', () => {
       for (const file of await walkSourceTree(dir)) {
         const source = await readFile(file, 'utf8');
         for (const violation of findFileUrlPathnameViolations(file, source)) {
-          offenders.push(`${violation.file}:${String(violation.line)} ${violation.text}`);
+          offenders.push(
+            `${violation.file}:${String(violation.line)} ${violation.text}`,
+          );
         }
       }
     }
@@ -2193,53 +1479,29 @@ void describe('package', () => {
     const envRoot = makeIsolatedEnvRoot('pi-bg-pack-env-');
     const packCwd = join(envRoot, 'pack-project');
     makeIsolatedNpmProject(packCwd, 'payload-pack-project');
-    const r = runNpm(['pack', '--dry-run', '--ignore-scripts', '--json', fileURLToPath(root)], {
-      cwd: packCwd,
-      env: isolatedNpmEnv(envRoot),
-    });
+    const r = runNpm(
+      ['pack', '--dry-run', '--ignore-scripts', '--json', fileURLToPath(root)],
+      {
+        cwd: packCwd,
+        env: isolatedNpmEnv(envRoot),
+      },
+    );
     removeIsolatedEnvRoot(envRoot);
     assert.equal(r.status, 0, r.stderr);
     const firstEntry = parsePackEntries(r.stdout)[0];
     assert.ok(firstEntry, 'npm pack must return one entry');
     const files = firstEntry.files.map((file) => file.path).sort();
     for (const f of [
-      'dist/extensions/anthropic-attribution-child.js',
-      'dist/extensions/anthropic-attribution.js',
       'dist/extensions/background-tasks.js',
-      'dist/extensions/delegate-child.js',
-      'dist/extensions/fusion-child.js',
-      'dist/src/core/delegate/hook-contract-evidence.json',
       'dist/package.json',
-      'extensions/anthropic-attribution-child.ts',
-      'extensions/anthropic-attribution.ts',
       'extensions/background-tasks.ts',
-      'extensions/fusion-child.ts',
       'src/extension.ts',
-      'src/fusion-child-extension.ts',
       'src/core/common.ts',
       'src/core/registry.ts',
-      'src/core/anthropic-attribution.ts',
-      'src/core/anthropic-attribution-path.ts',
       'src/core/config.ts',
       'src/core/extension-api.ts',
-      'src/core/attested-pi-run.ts',
       'src/core/pi-launch.ts',
       'src/ui/background-tasks-manager.ts',
-      'src/ui/fusion-model-selector.ts',
-      'src/fusion-extension.ts',
-      'src/core/fusion/types.ts',
-      'src/core/fusion/config.ts',
-      'src/core/fusion/context.ts',
-      'src/core/fusion/prompts.ts',
-      'src/core/fusion/evaluation.ts',
-      'src/core/fusion/pi-child.ts',
-      'src/core/fusion/child-protocol.ts',
-      'src/core/fusion/artifacts.ts',
-      'src/core/fusion/orchestrator.ts',
-      'src/core/fusion/budget.ts',
-      'src/core/fusion/output-contract.ts',
-      'src/core/fusion/web-fetch.ts',
-      'src/core/fusion/result-package.ts',
       'README.md',
       'BACKGROUND-TASKS-INSTRUCTIONS.md',
       'logo.png',
@@ -2263,10 +1525,22 @@ void describe('package', () => {
       files.some((f) => f.startsWith('dist/src/') && f.endsWith('.js')),
       'compiled runtime closure must ship',
     );
-    assert.ok(!files.some((f) => f.startsWith('tests/')), 'tests must not ship');
-    assert.ok(!files.some((f) => f.startsWith('scripts/')), 'release-only scripts must not ship');
-    assert.ok(!files.some((f) => f.includes('node_modules')), 'node_modules must not ship');
-    assert.ok(!files.some((f) => f.endsWith('.tgz')), 'nested tarballs must not ship');
+    assert.ok(
+      !files.some((f) => f.startsWith('tests/')),
+      'tests must not ship',
+    );
+    assert.ok(
+      !files.some((f) => f.startsWith('scripts/')),
+      'release-only scripts must not ship',
+    );
+    assert.ok(
+      !files.some((f) => f.includes('node_modules')),
+      'node_modules must not ship',
+    );
+    assert.ok(
+      !files.some((f) => f.endsWith('.tgz')),
+      'nested tarballs must not ship',
+    );
   });
 
   void it('isolates npm user, global, and project configuration without a hostile request', async () => {
@@ -2290,18 +1564,27 @@ void describe('package', () => {
         );
       }
       await writeFile(join(probeProject, '.npmrc'), '');
-      await writeFile(join(hostileProject, '.npmrc'), `@mixmark-io:registry=${hostileRegistry}\n`);
+      await writeFile(
+        join(hostileProject, '.npmrc'),
+        `@mixmark-io:registry=${hostileRegistry}\n`,
+      );
       await writeFile(safeUserConfig, '');
       await writeFile(safeGlobalConfig, '');
-      await writeFile(hostileGlobalConfig, `@mixmark-io:registry=${hostileRegistry}\n`);
+      await writeFile(
+        hostileGlobalConfig,
+        `@mixmark-io:registry=${hostileRegistry}\n`,
+      );
 
       const vulnerableEnv = localRegistryNpmEnv(envRoot, ownedRegistry);
       vulnerableEnv['NPM_CONFIG_GLOBALCONFIG'] = hostileGlobalConfig;
       vulnerableEnv['npm_config_globalconfig'] = hostileGlobalConfig;
-      const vulnerableGlobal = runNpm(['config', 'get', '@mixmark-io:registry'], {
-        cwd: probeProject,
-        env: vulnerableEnv,
-      });
+      const vulnerableGlobal = runNpm(
+        ['config', 'get', '@mixmark-io:registry'],
+        {
+          cwd: probeProject,
+          env: vulnerableEnv,
+        },
+      );
       assert.equal(vulnerableGlobal.status, 0, vulnerableGlobal.stderr);
       assert.equal(vulnerableGlobal.stdout.trim(), hostileRegistry);
 
@@ -2338,10 +1621,13 @@ void describe('package', () => {
       assert.equal(effectiveScope.status, 0, effectiveScope.stderr);
       assert.notEqual(effectiveScope.stdout.trim(), hostileRegistry);
 
-      const vulnerableProject = runNpm(['config', 'get', '@mixmark-io:registry'], {
-        cwd: hostileProject,
-        env: isolatedEnv,
-      });
+      const vulnerableProject = runNpm(
+        ['config', 'get', '@mixmark-io:registry'],
+        {
+          cwd: hostileProject,
+          env: isolatedEnv,
+        },
+      );
       assert.equal(vulnerableProject.status, 0, vulnerableProject.stderr);
       assert.equal(vulnerableProject.stdout.trim(), hostileRegistry);
     } finally {
@@ -2356,7 +1642,8 @@ void describe('package', () => {
       ['11.13.0', 0, '', []],
       ['10.10.0', 0, '', []],
     ];
-    for (const observation of accepted) assertNpmIgnoreScriptsObservation(...observation);
+    for (const observation of accepted)
+      assertNpmIgnoreScriptsObservation(...observation);
 
     const rejected: readonly NpmIgnoreScriptsObservation[] = [
       ['10.10.0', 1, prepareFailure, ['prepare']],
@@ -2386,7 +1673,11 @@ void describe('package', () => {
     const temp = await mkdtemp(join(tmpdir(), 'pi-bg-pack-script-denial-'));
     const envRoot = makeIsolatedEnvRoot('pi-bg-pack-script-env-');
     const packageRoot = join(temp, 'fixture-root');
-    const sentinelDirectory = join(packageRoot, 'node_modules', 'npm-pack-lifecycle-sentinel');
+    const sentinelDirectory = join(
+      packageRoot,
+      'node_modules',
+      'npm-pack-lifecycle-sentinel',
+    );
     const packProject = join(temp, 'pack-project');
     const markerDirectory = join(temp, 'markers');
     const sentinelScripts = {
@@ -2394,7 +1685,8 @@ void describe('package', () => {
       prepare: 'node lifecycle.cjs prepare',
       postpack: 'node lifecycle.cjs postpack',
     };
-    let registry: Awaited<ReturnType<typeof startInstalledDependencyRegistry>> | undefined;
+    let registry:
+      Awaited<ReturnType<typeof startInstalledDependencyRegistry>> | undefined;
 
     const resetMarkers = (): void => {
       rmSync(markerDirectory, { recursive: true, force: true });
@@ -2403,7 +1695,10 @@ void describe('package', () => {
     const markerEvents = (): string[] => {
       const markerPath = join(markerDirectory, 'attempts.log');
       if (!existsSync(markerPath)) return [];
-      return readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean);
+      return readFileSync(markerPath, 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean);
     };
     const sentinelEnv = (failEvent: string): NodeJS.ProcessEnv => ({
       ...isolatedNpmEnv(envRoot),
@@ -2426,7 +1721,10 @@ void describe('package', () => {
         2,
       )}\n`;
       writeFileSync(join(sentinelDirectory, 'package.json'), sentinelManifest);
-      writeFileSync(join(sentinelDirectory, 'payload.txt'), 'real sentinel payload\n');
+      writeFileSync(
+        join(sentinelDirectory, 'payload.txt'),
+        'real sentinel payload\n',
+      );
       writeFileSync(
         join(sentinelDirectory, 'lifecycle.cjs'),
         [
@@ -2455,10 +1753,20 @@ void describe('package', () => {
       const attemptedTarballs = join(temp, 'attempted-tarballs');
       mkdirSync(attemptedTarballs, { recursive: true });
       const lifecycleAttempt = runNpm(
-        ['pack', '--json', '--pack-destination', attemptedTarballs, sentinelDirectory],
+        [
+          'pack',
+          '--json',
+          '--pack-destination',
+          attemptedTarballs,
+          sentinelDirectory,
+        ],
         { cwd: packProject, env: sentinelEnv('postpack') },
       );
-      assert.notEqual(lifecycleAttempt.status, 0, 'the lifecycle control must fail loudly');
+      assert.notEqual(
+        lifecycleAttempt.status,
+        0,
+        'the lifecycle control must fail loudly',
+      );
       assert.match(
         `${lifecycleAttempt.stderr}\n${lifecycleAttempt.stdout}`,
         /sentinel lifecycle executed: postpack/u,
@@ -2507,8 +1815,14 @@ void describe('package', () => {
         packageRoot,
         scratchDir: join(temp, 'safe-registry'),
       });
-      assert.deepEqual(registry.packageVersions, ['npm-pack-lifecycle-sentinel@1.0.0']);
-      assert.deepEqual(markerEvents(), [], 'safe dependency packaging must execute no lifecycle');
+      assert.deepEqual(registry.packageVersions, [
+        'npm-pack-lifecycle-sentinel@1.0.0',
+      ]);
+      assert.deepEqual(
+        markerEvents(),
+        [],
+        'safe dependency packaging must execute no lifecycle',
+      );
       assert.equal(hashReadOnlyTree(sentinelDirectory), sourceHashBefore);
 
       const consumer = join(temp, 'consumer');
@@ -2527,7 +1841,13 @@ void describe('package', () => {
         )}\n`,
       );
       const install = await runNpmAsync(
-        ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false'],
+        [
+          'install',
+          '--ignore-scripts',
+          '--no-audit',
+          '--no-fund',
+          '--package-lock=false',
+        ],
         {
           cwd: consumer,
           env: {
@@ -2540,7 +1860,12 @@ void describe('package', () => {
       assert.equal(install.status, 0, install.stderr);
       assert.equal(
         await readFile(
-          join(consumer, 'node_modules', 'npm-pack-lifecycle-sentinel', 'package.json'),
+          join(
+            consumer,
+            'node_modules',
+            'npm-pack-lifecycle-sentinel',
+            'package.json',
+          ),
           'utf8',
         ),
         sentinelManifest,
@@ -2557,7 +1882,8 @@ void describe('package', () => {
 
   void it('local tarball installs with the expected package files', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'pi-bg-pack-'));
-    let registry: Awaited<ReturnType<typeof startInstalledDependencyRegistry>> | undefined;
+    let registry:
+      Awaited<ReturnType<typeof startInstalledDependencyRegistry>> | undefined;
     const packEnvRoot = makeIsolatedEnvRoot('pi-bg-pack-env-');
     const missingEnvRoot = makeIsolatedEnvRoot('pi-bg-missing-env-');
     const installEnvRoot = makeIsolatedEnvRoot('pi-bg-install-env-');
@@ -2568,7 +1894,8 @@ void describe('package', () => {
         fileURLToPath(new URL('node_modules/turndown/', root)),
         fileURLToPath(new URL('node_modules/@mixmark-io/domino/', root)),
       ];
-      const realDependencyHashesBefore = realDependencyDirectories.map(hashReadOnlyTree);
+      const realDependencyHashesBefore =
+        realDependencyDirectories.map(hashReadOnlyTree);
       const sourceTurndownManifest = await readFile(
         new URL('node_modules/turndown/package.json', root),
         'utf8',
@@ -2595,7 +1922,10 @@ void describe('package', () => {
       const firstEntry = parsePackEntries(pack.stdout)[0];
       assert.ok(firstEntry, 'npm pack must return one entry');
       const tarballPath = join(packageTarballs, firstEntry.filename);
-      assert.ok(existsSync(tarballPath), 'npm pack must write into the isolated destination');
+      assert.ok(
+        existsSync(tarballPath),
+        'npm pack must write into the isolated destination',
+      );
 
       const missingConsumer = join(temp, 'missing-consumer');
       const seedConsumer = join(temp, 'dependency-seed');
@@ -2628,10 +1958,23 @@ void describe('package', () => {
         ],
         { cwd: missingConsumer, env: isolatedNpmEnv(missingEnvRoot) },
       );
-      assert.notEqual(missingInstall.status, 0, 'an empty cache must not fake offline success');
-      assert.match(`${missingInstall.stderr}\n${missingInstall.stdout}`, /ENOTCACHED/u);
-      assert.match(`${missingInstall.stderr}\n${missingInstall.stdout}`, /turndown/u);
-      assert.equal(existsSync(join(missingConsumer, 'node_modules', 'turndown')), false);
+      assert.notEqual(
+        missingInstall.status,
+        0,
+        'an empty cache must not fake offline success',
+      );
+      assert.match(
+        `${missingInstall.stderr}\n${missingInstall.stdout}`,
+        /ENOTCACHED/u,
+      );
+      assert.match(
+        `${missingInstall.stderr}\n${missingInstall.stdout}`,
+        /turndown/u,
+      );
+      assert.equal(
+        existsSync(join(missingConsumer, 'node_modules', 'turndown')),
+        false,
+      );
 
       assert.deepEqual(await readdir(join(installEnvRoot, 'cache')), []);
       registry = await startInstalledDependencyRegistry({
@@ -2641,7 +1984,10 @@ void describe('package', () => {
         packageRoot: fileURLToPath(root),
         scratchDir: join(temp, 'dependency-registry'),
       });
-      assert.deepEqual(registry.packageVersions, ['@mixmark-io/domino@2.2.0', 'turndown@7.2.4']);
+      assert.deepEqual(registry.packageVersions, [
+        '@mixmark-io/domino@2.2.0',
+        'turndown@7.2.4',
+      ]);
       assert.deepEqual(
         realDependencyDirectories.map(hashReadOnlyTree),
         realDependencyHashesBefore,
@@ -2676,11 +2022,26 @@ void describe('package', () => {
         },
       );
       assert.equal(preparation.status, 0, preparation.stderr);
-      assert.ok(existsSync(join(seedConsumer, 'node_modules', 'turndown', 'package.json')));
       assert.ok(
-        existsSync(join(seedConsumer, 'node_modules', '@mixmark-io', 'domino', 'package.json')),
+        existsSync(
+          join(seedConsumer, 'node_modules', 'turndown', 'package.json'),
+        ),
       );
-      assert.ok(registry.requests.length >= 4, 'cache preparation must read registry inputs');
+      assert.ok(
+        existsSync(
+          join(
+            seedConsumer,
+            'node_modules',
+            '@mixmark-io',
+            'domino',
+            'package.json',
+          ),
+        ),
+      );
+      assert.ok(
+        registry.requests.length >= 4,
+        'cache preparation must read registry inputs',
+      );
       assert.deepEqual(
         registry.requests.filter((request) => request.status !== 200),
         [],
@@ -2721,7 +2082,14 @@ void describe('package', () => {
       );
       assert.equal(install.status, 0, install.stderr);
       assert.equal(
-        existsSync(join(installedConsumer, 'node_modules', '@ravshansbox', 'pi-anthropic-sps')),
+        existsSync(
+          join(
+            installedConsumer,
+            'node_modules',
+            '@ravshansbox',
+            'pi-anthropic-sps',
+          ),
+        ),
         false,
         'packed consumers must not install the retired URL-based sanitizer dependency',
       );
@@ -2738,7 +2106,13 @@ void describe('package', () => {
       const turndownManifest = parseJsonValue(installedTurndownManifest);
       const dominoManifest = parseJsonValue(
         await readFile(
-          join(installedConsumer, 'node_modules', '@mixmark-io', 'domino', 'package.json'),
+          join(
+            installedConsumer,
+            'node_modules',
+            '@mixmark-io',
+            'domino',
+            'package.json',
+          ),
           'utf8',
         ),
       );
@@ -2766,7 +2140,11 @@ void describe('package', () => {
             'process.stdout.write(markdown);',
           ].join('\n'),
         ],
-        { cwd: installedConsumer, encoding: 'utf8', env: isolatedNpmEnv(installEnvRoot) },
+        {
+          cwd: installedConsumer,
+          encoding: 'utf8',
+          env: isolatedNpmEnv(installEnvRoot),
+        },
       );
       assert.equal(load.status, 0, load.stderr);
       assert.match(load.stdout, /Offline/u);
@@ -2790,29 +2168,21 @@ void describe('package', () => {
         'docs/assets/architecture.svg',
         'docs/assets/footer-dock.svg',
         'docs/assets/logo.svg',
-        'extensions/anthropic-attribution-child.ts',
-        'extensions/anthropic-attribution.ts',
         'extensions/background-tasks.ts',
-        'extensions/fusion-child.ts',
         'src/extension.ts',
-        'src/fusion-extension.ts',
-        'src/fusion-child-extension.ts',
+        'src/core/common.ts',
         'src/core/registry.ts',
-        'src/core/anthropic-attribution.ts',
-        'src/core/anthropic-attribution-path.ts',
         'src/core/config.ts',
         'src/core/extension-api.ts',
-        'src/core/attested-pi-run.ts',
         'src/core/pi-launch.ts',
-        'src/core/fusion/orchestrator.ts',
-        'src/core/fusion/pi-child.ts',
-        'src/core/fusion/child-protocol.ts',
-        'src/core/fusion/output-contract.ts',
-        'src/core/fusion/result-package.ts',
         'src/ui/background-tasks-manager.ts',
-        'src/ui/fusion-model-selector.ts',
       ]) {
-        assert.ok(existsSync(join(installedConsumer, 'node_modules', 'pi-background-tasks', f)), f);
+        assert.ok(
+          existsSync(
+            join(installedConsumer, 'node_modules', 'pi-background-tasks', f),
+          ),
+          f,
+        );
       }
     } finally {
       if (registry !== undefined) await registry.close();

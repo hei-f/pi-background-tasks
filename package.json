@@ -1,7 +1,7 @@
 {
   "name": "pi-background-tasks",
   "version": "2.6.8",
-  "description": "Pi extension for durable background shell tasks, read-only delegated agents, local attested Pi runs, and fixed-purpose Fusion workflows through child Pi processes.",
+  "description": "Pi extension for durable background shell tasks and a correlated EventBus service.",
   "type": "module",
   "license": "ISC",
   "author": "Ismail <ismailsalikhodjaev@gmail.com>",
@@ -15,16 +15,7 @@
     "background-tasks",
     "coding-agent",
     "shell",
-    "tasks",
-    "delegate",
-    "attestation",
-    "fusion",
-    "reason",
-    "investigate",
-    "research",
-    "multi-model",
-    "task-manager",
-    "pi-dev"
+    "tasks"
   ],
   "homepage": "https://github.com/ismailsaleekh/pi-background-tasks#readme",
   "repository": {
@@ -57,19 +48,16 @@
     "test:rpc": "tsx --test tests/rpc/**/*.test.ts",
     "test:component": "tsx --test tests/component/**/*.test.ts",
     "test:package": "npm run build:runtime && tsx --test tests/package/**/*.test.ts",
-    "test": "npm run typecheck && npm run test:type-safety && npm run test:unit && npm run test:sdk && npm run test:rpc && npm run test:component && npm run test:package && npm run test:hook-contract",
+    "test": "npm run typecheck && npm run test:type-safety && npm run test:unit && npm run test:sdk && npm run test:rpc && npm run test:component && npm run test:package",
     "test:pty": "tsx --test tests/pty/**/*.test.ts",
     "test:windows": "tsx --test tests/windows/**/*.test.ts",
     "test:agent-loop": "tsx --test --test-concurrency=1 tests/scripted-provider/**/*.test.ts",
     "test:full": "npm run test && npm run test:pty && npm run test:agent-loop",
     "smoke": "npm run build:runtime && tsx scripts/smoke.ts",
-    "smoke:large-context": "tsx scripts/large-context-smoke.ts",
     "pack:dry-run": "npm pack --dry-run",
     "lint": "cd ../.. && npm run quality:ts:lint",
     "format:check": "cd ../.. && npm run quality:ts:format",
-    "test:compat": "npm run build:runtime && tsx scripts/test-compat.ts",
     "test:pnpm-pack": "npm run build:runtime && node scripts/test-pnpm-pack-install.mjs",
-    "test:hook-contract": "tsx --test --test-concurrency=1 tests/scripted-provider/pi-hook-contract.test.ts",
     "docs:generate": "node scripts/docs/generate.mjs",
     "docs:verify": "node scripts/docs/verify.mjs",
     "docs:verify:attestations": "node scripts/docs/verify.mjs --require-attestations",
@@ -83,7 +71,6 @@
   "pi": {
     "image": "https://raw.githubusercontent.com/ismailsaleekh/pi-background-tasks/main/logo.png",
     "extensions": [
-      "./dist/extensions/anthropic-attribution.js",
       "./dist/extensions/background-tasks.js"
     ]
   },

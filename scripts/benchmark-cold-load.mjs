@@ -8,14 +8,9 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WORKER = join(here, 'benchmark-cold-load-worker.mjs');
 const SCENARIOS = Object.freeze([
-  'delegate-facade-import',
-  'fusion-facade-import',
   'sdk-no-extension-load',
   'sdk-process-only-load',
   'sdk-default-load',
-  'delegate-first',
-  'fusion-first',
-  'model-selector-first',
 ]);
 
 function parseArgs(argv) {
@@ -174,14 +169,11 @@ async function main() {
       : 'authoritative TypeScript source loaded through Pi/Jiti',
     package_entrypoints: args.runtime === 'compiled'
       ? packageJson.pi?.extensions ?? []
-      : ['./extensions/anthropic-attribution.ts', './extensions/background-tasks.ts'],
+      : ['./extensions/background-tasks.ts'],
     features: {
       'sdk-no-extension-load': '(no package entrypoint)',
       'sdk-process-only-load': 'process',
-      'sdk-default-load': 'process,delegate,fusion,attested,attribution',
-      'delegate-first': 'process,delegate',
-      'fusion-first': 'process,fusion',
-      'model-selector-first': 'process,fusion',
+      'sdk-default-load': 'process',
     },
     cold_definition: 'fresh Node process and empty JS/Jiti module cache; host filesystem cache not flushed',
     node: await textCommand(args.node, ['--version'], args.root, env),
@@ -209,7 +201,7 @@ async function main() {
     const result = await run(
       args.node,
       ['--import', 'tsx', args.worker, '--root', args.root, '--scenario', scenario, '--sample-root', sampleRoot, '--runtime', args.runtime],
-      { cwd: args.root, env, timeoutMs: scenario === 'fusion-first' ? 180_000 : 120_000 },
+      { cwd: args.root, env, timeoutMs: 120_000 },
     );
     const lines = result.stdout.trim().split('\n').filter(Boolean);
     const parsed = JSON.parse(lines.at(-1) ?? '{}');

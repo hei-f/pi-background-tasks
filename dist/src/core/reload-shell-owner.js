@@ -2,14 +2,14 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { formatSize } from '@earendil-works/pi-coding-agent';
-import { isJsonObject, parseJsonText, snapshot, ReloadSurvivalError, } from './common.js';
+import { appendErrorText, boundedErrorMessage, deriveTerminalStatus, errorMessage, isEnospcError, snapshot, writeTaskOutputChunk, ReloadSurvivalError, } from './common.js';
+import { collectPosixDescendantPids as collectPosixDescendantPidsDefault, POSIX_DESCENDANT_COLLECT_DELAY_MS, } from './process-tree.js';
+import { parseTelemetryStream } from './telemetry.js';
 import { replaceFileDurable } from './durable-fs.js';
 import { runWindowsTaskkill, } from './windows-taskkill.js';
 export const RELOAD_SHELL_OWNER_PROTOCOL = 'pi-background-tasks.reload-shell-owner.v1';
 export const RELOAD_SHELL_OWNER_SYMBOL = Symbol.for(RELOAD_SHELL_OWNER_PROTOCOL);
 export const RELOAD_SHELL_HANDOFF_TIMEOUT_MS = 30_000;
-const TELEMETRY_BUFFER_CHARS = 512 * 1024;
 export { ReloadSurvivalError } from './common.js';
 const hubStates = new WeakMap();
 const OWNER_STATE_SYMBOL = Symbol.for(`${RELOAD_SHELL_OWNER_PROTOCOL}.test-state`);
@@ -86,10 +86,6 @@ function clearHandoffTimer(slot) {
         slot.handoffTimer = undefined;
     }
 }
-function boundedError(error) {
-    const text = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, ' ').trim();
-    return text.length <= 500 ? text : `${text.slice(0, 499)}…`;
-}
 export function createReloadShellOwnerHubForTests(dependencies = {}) {
     const now = dependencies.now ?? Date.now;
     const nextNonce = dependencies.randomNonce ?? randomNonce;
@@ -156,7 +152,7 @@ export function createReloadShellOwnerHubForTests(dependencies = {}) {
                 adapter.onTerminal(execution);
         }
         catch (error) {
-            logger.error(`[background-tasks] reload owner ${kind} adapter failed for ${execution.task.id}: ${boundedError(error)}`);
+            logger.error(`[background-tasks] reload owner ${kind} adapter failed for ${execution.task.id}: ${boundedErrorMessage(error, 500)}`);
             if (kind === 'changed')
                 slot.queuedChanged.add(execution.launchNonce);
             else
@@ -194,10 +190,10 @@ export function createReloadShellOwnerHubForTests(dependencies = {}) {
                 removeExecution(slot, execution);
             }
             catch (error) {
-                logger.error(`[background-tasks] retained reload shell execution cleanup failed for ${execution.task.id}: ${boundedError(error)}`);
+                logger.error(`[background-tasks] retained reload shell execution cleanup failed for ${execution.task.id}: ${boundedErrorMessage(error, 500)}`);
             }
         }, (error) => {
-            logger.error(`[background-tasks] retained reload shell execution terminal promise rejected for ${execution.task.id}; keeping its owner slot: ${boundedError(error)}`);
+            logger.error(`[background-tasks] retained reload shell execution terminal promise rejected for ${execution.task.id}; keeping its owner slot: ${boundedErrorMessage(error, 500)}`);
         });
         terminalReleaseContinuations.set(execution, continuation);
         return continuation;
@@ -232,7 +228,7 @@ export function createReloadShellOwnerHubForTests(dependencies = {}) {
                 }
             }
             catch (error) {
-                logger.error(`[background-tasks] reload handoff expiry could not settle ${execution.task.id}: ${boundedError(error)}`);
+                logger.error(`[background-tasks] reload handoff expiry could not settle ${execution.task.id}: ${boundedErrorMessage(error, 500)}`);
             }
             await terminalRelease;
         })).then(() => {
@@ -536,98 +532,6 @@ export function inspectReloadShellOwnerForTests(hub, identity) {
         executions: Object.freeze(slot === undefined ? [] : [...slot.executions.values()]),
     };
 }
-function nonNegativeInteger(value) {
-    return typeof value === 'number' && Number.isFinite(value) && value >= 0
-        ? Math.floor(value)
-        : 0;
-}
-function normalizeContextUsage(value) {
-    if (!isJsonObject(value))
-        return undefined;
-    const input = value;
-    const contextWindow = typeof input.contextWindow === 'number' &&
-        Number.isFinite(input.contextWindow) &&
-        input.contextWindow > 0
-        ? Math.floor(input.contextWindow)
-        : undefined;
-    if (contextWindow === undefined)
-        return undefined;
-    const tokens = input.tokens === null
-        ? null
-        : typeof input.tokens === 'number' && Number.isFinite(input.tokens) && input.tokens >= 0
-            ? Math.floor(input.tokens)
-            : null;
-    const percent = input.percent === null
-        ? null
-        : typeof input.percent === 'number' && Number.isFinite(input.percent) && input.percent >= 0
-            ? input.percent
-            : tokens === null
-                ? null
-                : (tokens / contextWindow) * 100;
-    return { tokens, contextWindow, percent };
-}
-function normalizeTokenUsage(value) {
-    if (!isJsonObject(value))
-        return undefined;
-    const input = value;
-    const usage = {
-        input: nonNegativeInteger(input.input),
-        output: nonNegativeInteger(input.output),
-        cacheRead: nonNegativeInteger(input.cacheRead),
-        cacheWrite: nonNegativeInteger(input.cacheWrite),
-        totalTokens: nonNegativeInteger(input.totalTokens),
-    };
-    if (usage.totalTokens <= 0) {
-        usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-    }
-    if (typeof input.costTotal === 'number' &&
-        Number.isFinite(input.costTotal) &&
-        input.costTotal >= 0) {
-        usage.costTotal = input.costTotal;
-    }
-    return usage.totalTokens > 0 ? usage : undefined;
-}
-function normalizeToolUsage(value) {
-    if (!isJsonObject(value))
-        return undefined;
-    const input = value;
-    const byName = {};
-    if (isJsonObject(input.byName)) {
-        for (const [name, count] of Object.entries(input.byName)) {
-            const normalized = nonNegativeInteger(count);
-            if (normalized > 0)
-                byName[name] = normalized;
-        }
-    }
-    const failed = nonNegativeInteger(input.failed);
-    const total = Math.max(nonNegativeInteger(input.total), failed, Object.values(byName).reduce((sum, count) => sum + count, 0));
-    return total > 0 || failed > 0 ? { total, failed, byName } : undefined;
-}
-function normalizeModel(value) {
-    if (typeof value !== 'string')
-        return undefined;
-    const trimmed = value.trim();
-    if (trimmed.length === 0)
-        return undefined;
-    return trimmed.length <= 120 ? trimmed : trimmed.slice(0, 120);
-}
-function parseContextUsageXml(xml) {
-    const number = (tag) => {
-        const match = new RegExp(`<${tag}>(.*?)</${tag}>`, 'iu').exec(xml);
-        if (match === null)
-            return undefined;
-        const raw = match[1]?.trim();
-        if (raw === 'null' || raw === '?')
-            return null;
-        const parsed = Number(raw);
-        return Number.isFinite(parsed) ? parsed : undefined;
-    };
-    return normalizeContextUsage({
-        tokens: number('tokens'),
-        contextWindow: number('context-window') ?? number('contextWindow'),
-        percent: number('percent'),
-    });
-}
 async function writeOwnerMetadata(path, value, signal) {
     await replaceFileDurable(path, `${JSON.stringify(value, null, 2)}\n`, signal === undefined ? {} : { signal });
 }
@@ -659,11 +563,6 @@ async function closeOwnerOutputStream(stream) {
         stream.end();
     });
 }
-function appendError(existing, next) {
-    if (existing === undefined || existing.length === 0)
-        return next;
-    return existing.includes(next) ? existing : `${existing}; ${next}`;
-}
 function taskkillDescription(outcome) {
     return [
         `exit=${String(outcome.exitCode)}`,
@@ -694,6 +593,8 @@ export function createReloadableShellExecutionV1(options) {
             const taskkillOptions = signal === undefined ? { env } : { env, signal };
             return runWindowsTaskkill(pid, phase, taskkillOptions);
         });
+    const collectPosixDescendantPids = options.collectPosixDescendantPids ??
+        ((rootPid) => collectPosixDescendantPidsDefault(rootPid));
     const outputStream = createWriteStream(task.outputAbsPath, { flags: 'a', encoding: 'utf8' });
     let child;
     try {
@@ -780,86 +681,47 @@ export function createReloadableShellExecutionV1(options) {
         sink?.onChanged(execution);
     };
     const writeBuffer = (buffer) => {
-        const stream = execution.outputStream;
-        if (stream === undefined || stream.destroyed || buffer.length === 0)
+        const capExceeded = writeTaskOutputChunk(task, buffer, {
+            softBytes: options.softOutputBytes,
+            hardBytes: execution.outputCapBytes,
+            onSoftCapWarned: changed,
+        });
+        if (!capExceeded)
             return;
-        const nextBytes = task.bytesWritten + buffer.length;
-        if (nextBytes <= execution.outputCapBytes) {
-            stream.write(buffer);
-            task.bytesWritten = nextBytes;
-            return;
-        }
-        const remaining = Math.max(0, execution.outputCapBytes - task.bytesWritten);
-        if (remaining > 0) {
-            stream.write(buffer.subarray(0, remaining));
-            task.bytesWritten += remaining;
-        }
-        if (task.capExceeded)
-            return;
-        task.capExceeded = true;
-        task.error = `Output exceeded cap of ${formatSize(execution.outputCapBytes)}; terminating task`;
-        const notice = Buffer.from(`\n\n[background task error: ${task.error}]\n`, 'utf8');
-        stream.write(notice);
-        task.bytesWritten += notice.length;
+        task.failedReason = 'output_limit';
         changed();
-        void execution.requestStop('output_cap', task.error).catch((error) => {
-            task.error = appendError(task.error, `kill failed: ${boundedError(error)}`);
+        void execution
+            .requestStop('output_cap', task.error)
+            .catch((error) => {
+            task.error = appendErrorText(task.error, `kill failed: ${boundedErrorMessage(error, 500)}`);
         });
     };
     const ingestTelemetry = (text) => {
         if (text.length === 0)
             return;
-        const telemetryText = `${task.contextUsageBuffer ?? ''}${text}`;
-        let context = task.contextUsage;
-        let tokens = task.tokenUsage;
-        let tools = task.toolUsage;
-        let model = task.model;
-        for (const line of telemetryText.split(/\r?\n/u)) {
-            if (!line.includes('background-task-'))
-                continue;
-            const trimmed = line.trim();
-            if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-                try {
-                    const parsed = parseJsonText(trimmed);
-                    if (!isJsonObject(parsed))
-                        continue;
-                    if (parsed['type'] === 'background-task-context-usage') {
-                        context = normalizeContextUsage(parsed) ?? context;
-                    }
-                    else if (parsed['type'] === 'background-task-telemetry') {
-                        context = normalizeContextUsage(parsed['contextUsage']) ?? context;
-                        tokens = normalizeTokenUsage(parsed['tokenUsage']) ?? tokens;
-                        tools = normalizeToolUsage(parsed['toolUsage']) ?? tools;
-                        model = normalizeModel(parsed['model']) ?? model;
-                    }
-                }
-                catch {
-                    // Optional telemetry never replaces raw output truth.
-                }
-            }
-        }
-        for (const match of telemetryText.matchAll(/<background-task-context-usage>[\s\S]*?<\/background-task-context-usage>/giu)) {
-            context = parseContextUsageXml(match[0]) ?? context;
-        }
-        const lastNewline = Math.max(telemetryText.lastIndexOf('\n'), telemetryText.lastIndexOf('\r'));
-        let retained = lastNewline >= 0 ? telemetryText.slice(lastNewline + 1) : telemetryText;
-        const lower = telemetryText.toLowerCase();
-        const open = lower.lastIndexOf('<background-task-context-usage');
-        const close = lower.lastIndexOf('</background-task-context-usage>');
-        if (open > close)
-            retained = telemetryText.slice(open);
-        task.contextUsageBuffer = retained.slice(-TELEMETRY_BUFFER_CHARS);
+        // 归一化解析收敛到共享 parseTelemetryStream(registry/reload 两套近逐行重复)
+        const parsed = parseTelemetryStream(text, task.contextUsageBuffer ?? '');
+        task.contextUsageBuffer = parsed.retained;
         const before = JSON.stringify({
             contextUsage: task.contextUsage,
             tokenUsage: task.tokenUsage,
             toolUsage: task.toolUsage,
             model: task.model,
         });
-        task.contextUsage = context;
-        task.tokenUsage = tokens;
-        task.toolUsage = tools;
-        task.model = model;
-        const after = JSON.stringify({ contextUsage: context, tokenUsage: tokens, toolUsage: tools, model });
+        if (parsed.latest.context !== undefined)
+            task.contextUsage = parsed.latest.context;
+        if (parsed.latest.tokens !== undefined)
+            task.tokenUsage = parsed.latest.tokens;
+        if (parsed.latest.tools !== undefined)
+            task.toolUsage = parsed.latest.tools;
+        if (parsed.latest.model !== undefined)
+            task.model = parsed.latest.model;
+        const after = JSON.stringify({
+            contextUsage: task.contextUsage,
+            tokenUsage: task.tokenUsage,
+            toolUsage: task.toolUsage,
+            model: task.model,
+        });
         if (before !== after) {
             changed();
             void writeMetadata().catch((error) => {
@@ -874,6 +736,7 @@ export function createReloadableShellExecutionV1(options) {
         state.failure = failure;
         if (state.verificationTimer !== undefined)
             clearTimeout(state.verificationTimer);
+        clearPosixDescendantCollectTimer(state);
         if (task.killEscalationTimer !== undefined)
             clearTimeout(task.killEscalationTimer);
         delete task.killEscalationTimer;
@@ -898,12 +761,13 @@ export function createReloadableShellExecutionV1(options) {
                 finishPosix(state);
                 return true;
             }
-            state.lastProbeError = error instanceof Error ? error : new Error(String(error));
+            state.lastProbeError =
+                error instanceof Error ? error : new Error(errorMessage(error));
             return false;
         }
     };
     const recordPosixFailure = (state, error) => {
-        task.error = appendError(task.error, error.message);
+        task.error = appendErrorText(task.error, error.message);
         writeBuffer(Buffer.from(`\n[background task POSIX termination: ${error.message}]\n`, 'utf8'));
         finishPosix(state, error);
         changed();
@@ -930,6 +794,7 @@ export function createReloadableShellExecutionV1(options) {
         if (task.killEscalationTimer !== undefined)
             clearTimeout(task.killEscalationTimer);
         delete task.killEscalationTimer;
+        clearPosixDescendantCollectTimer(state);
         if (probePosixGone(state))
             return;
         try {
@@ -943,8 +808,19 @@ export function createReloadableShellExecutionV1(options) {
                 finishPosix(state);
                 return;
             }
-            recordPosixFailure(state, new Error(`POSIX process-group SIGKILL failed for task ${task.id} group ${String(state.groupId)}: ${boundedError(error)}. Descendant processes may have leaked.`));
+            recordPosixFailure(state, new Error(`POSIX process-group SIGKILL failed for task ${task.id} group ${String(state.groupId)}: ${boundedErrorMessage(error, 500)}. Descendant processes may have leaked.`));
             return;
+        }
+        // M3 REVIEW:组信号后对窗口内收集到的后代逐个补杀(与普通路径一致):ESRCH
+        // 属自然死亡/组信号回收,非 ESRCH 失败仅追加 notice/error,不替代组存在的
+        // 证明性结论(组证明仍是权威终止证明)。
+        const descendantFailures = forceKillCollectedDescendants(state);
+        if (descendantFailures.length > 0) {
+            const message = `POSIX descendant SIGKILL failed for task ${task.id} group ${String(state.groupId)}: ` +
+                `${descendantFailures.join('; ')}. Descendant processes may have leaked.`;
+            task.error = appendErrorText(task.error, message);
+            writeBuffer(Buffer.from(`\n[background task POSIX termination: ${message}]\n`, 'utf8'));
+            changed();
         }
         if (!probePosixGone(state))
             verifyPosix(state);
@@ -963,9 +839,10 @@ export function createReloadableShellExecutionV1(options) {
             resolve = resolvePromise;
         });
         const reserve = Math.min(25, Math.max(1, Math.floor(options.stopWaitMs / 4)));
+        const ownershipMs = Math.max(1, options.stopWaitMs - reserve);
         const state = {
             groupId,
-            deadlineAt: now() + Math.max(1, options.stopWaitMs - reserve),
+            deadlineAt: now() + ownershipMs,
             completion,
             resolve,
             forceAttempted: false,
@@ -975,8 +852,62 @@ export function createReloadableShellExecutionV1(options) {
         task.killEscalationTimer = setTimeout(() => {
             delete task.killEscalationTimer;
             forcePosix(state);
-        }, Math.min(options.killGraceMs, Math.max(1, options.stopWaitMs - reserve)));
+        }, Math.min(options.killGraceMs, ownershipMs));
+        // M3 REVIEW:同在 grace 窗口内安排一次 ps 后代收集(与普通路径一致),供
+        // force 阶段对逃逸出组的孙进程逐个补杀;失败退化到组信号路径。
+        schedulePosixDescendantCollection(state, ownershipMs);
         return state;
+    };
+    /** M3 REVIEW:在 grace 窗口内(生产为 TERM 后 1500ms)安排一次 ps 后代收集。 */
+    const schedulePosixDescendantCollection = (state, ownershipMs) => {
+        if (state.settled || state.forceAttempted)
+            return;
+        const delayMs = Math.min(POSIX_DESCENDANT_COLLECT_DELAY_MS, Math.floor(options.killGraceMs / 2), ownershipMs);
+        state.descendantCollectTimer = setTimeout(() => {
+            state.descendantCollectTimer = undefined;
+            if (state.settled || state.forceAttempted)
+                return;
+            void collectPosixDescendantPids(state.groupId)
+                .then((pids) => {
+                if (state.settled || state.forceAttempted)
+                    return;
+                state.descendantPids = pids;
+            })
+                .catch(() => {
+                // 收集失败不改变终止流程,退化到组信号路径。
+            });
+        }, delayMs).unref();
+    };
+    const clearPosixDescendantCollectTimer = (state) => {
+        if (state.descendantCollectTimer !== undefined) {
+            clearTimeout(state.descendantCollectTimer);
+            state.descendantCollectTimer = undefined;
+        }
+    };
+    /**
+     * 对收集到的后代逐个 SIGKILL;返回非 ESRCH 失败明细。ESRCH(后代已自然退出
+     * 或已被组信号回收)属正常路径,不加失败。
+     */
+    const forceKillCollectedDescendants = (state) => {
+        const descendants = state.descendantPids;
+        if (descendants === undefined || descendants.size === 0)
+            return [];
+        const failures = [];
+        for (const pid of descendants) {
+            try {
+                const forced = killProcess(pid, 'SIGKILL');
+                if (!forced)
+                    failures.push(`pid ${String(pid)} SIGKILL returned false`);
+            }
+            catch (error) {
+                if (typeof error === 'object' &&
+                    error !== null &&
+                    Reflect.get(error, 'code') === 'ESRCH')
+                    continue;
+                failures.push(`pid ${String(pid)} ${boundedErrorMessage(error, 500)}`);
+            }
+        }
+        return failures;
     };
     const requestPosixStop = () => {
         const state = beginPosixStop();
@@ -995,7 +926,7 @@ export function createReloadableShellExecutionV1(options) {
                 finishPosix(state);
             }
             else {
-                failures.push(`process-group SIGTERM failed: ${boundedError(error)}`);
+                failures.push(`process-group SIGTERM failed: ${boundedErrorMessage(error, 500)}`);
             }
         }
         if (!sent && !state.settled) {
@@ -1005,7 +936,7 @@ export function createReloadableShellExecutionV1(options) {
                     failures.push('child SIGTERM returned false');
             }
             catch (error) {
-                failures.push(`child SIGTERM failed: ${boundedError(error)}`);
+                failures.push(`child SIGTERM failed: ${boundedErrorMessage(error, 500)}`);
             }
         }
         if (!sent && !state.settled) {
@@ -1042,14 +973,14 @@ export function createReloadableShellExecutionV1(options) {
         state.forcePromise = launched.then((outcome) => {
             const failure = evaluateTaskkill(state, 'force', outcome);
             if (failure !== undefined) {
-                task.error = appendError(task.error, failure.message);
+                task.error = appendErrorText(task.error, failure.message);
                 finishWindows(state, failure);
                 throw failure;
             }
             finishWindows(state);
         }, (error) => {
-            const failure = new Error(`Windows taskkill /T /F force termination failed for task ${task.id} pid ${String(state.pid)}: ${boundedError(error)}. Descendant processes may have leaked.`);
-            task.error = appendError(task.error, failure.message);
+            const failure = new Error(`Windows taskkill /T /F force termination failed for task ${task.id} pid ${String(state.pid)}: ${boundedErrorMessage(error, 500)}. Descendant processes may have leaked.`);
+            task.error = appendErrorText(task.error, failure.message);
             finishWindows(state, failure);
             throw failure;
         });
@@ -1113,27 +1044,9 @@ export function createReloadableShellExecutionV1(options) {
         return posixTree.failure;
     };
     const terminalStatus = (code, signal) => {
-        if (stopKind === 'user' || stopKind === 'shutdown')
-            return { status: 'killed' };
-        if (stopKind === 'timeout') {
-            return { status: 'failed', error: task.error ?? `Timed out after ${String(task.timeoutSeconds)}s` };
-        }
-        if (stopKind === 'output_cap') {
-            return { status: 'failed', error: task.error ?? `Output exceeded cap of ${formatSize(execution.outputCapBytes)}` };
-        }
-        if (stopKind === 'handoff_expired') {
-            return {
-                status: 'failed',
-                error: task.error ??
-                    'pi_bg_reload_handoff_expired: reload shell execution was not claimed before its handoff deadline',
-            };
-        }
-        if ((code ?? 0) === 0)
-            return { status: 'completed' };
-        return {
-            status: 'failed',
-            error: `Exited with code ${code === null ? 'null' : String(code)}${signal ? ` (${signal})` : ''}`,
-        };
+        // M2 状态迁移表(六态迁移表共享判定):user/model 停止 → cancelled;system 关闭 →
+        // killed;timeout / output_limit / disk_full / handoff_expired / 退出码非 0 → failed
+        return deriveTerminalStatus(task, stopKind, code, signal, execution.outputCapBytes);
     };
     const finalize = (code, signal) => {
         if (finalization !== undefined)
@@ -1148,12 +1061,12 @@ export function createReloadableShellExecutionV1(options) {
             catch (error) {
                 result = {
                     status: 'failed',
-                    error: appendError(result.error, `Initial metadata write failed: ${boundedError(error)}`),
+                    error: appendErrorText(result.error, `Initial metadata write failed: ${boundedErrorMessage(error, 500)}`),
                 };
             }
             const treeFailure = await awaitTreeBeforeTerminal();
             if (treeFailure !== undefined) {
-                result = { status: 'failed', error: appendError(result.error, treeFailure.message) };
+                result = { status: 'failed', error: appendErrorText(result.error, treeFailure.message) };
             }
             try {
                 await closeOwnerOutputStream(execution.outputStream);
@@ -1161,7 +1074,7 @@ export function createReloadableShellExecutionV1(options) {
             catch (error) {
                 result = {
                     status: 'failed',
-                    error: appendError(result.error, `Final output durability failed: ${boundedError(error)}`),
+                    error: appendErrorText(result.error, `Final output durability failed: ${boundedErrorMessage(error, 500)}`),
                 };
             }
             task.exitCode = code;
@@ -1175,7 +1088,7 @@ export function createReloadableShellExecutionV1(options) {
             }
             catch (error) {
                 task.status = 'failed';
-                task.error = `Terminal metadata write failed: ${boundedError(error)}`;
+                task.error = `Terminal metadata write failed: ${boundedErrorMessage(error, 500)}`;
                 logger.error(`[background-tasks] failed to write survivor metadata for ${task.id}:`, error);
                 await writeMetadata().catch(() => undefined);
             }
@@ -1294,7 +1207,7 @@ export function createReloadableShellExecutionV1(options) {
                 task.terminalPublished = false;
             }
             if (task.status === 'running') {
-                task.error = appendError(task.error, 'pi_bg_reload_handoff_expired: no compatible reload activation claimed this execution');
+                task.error = appendErrorText(task.error, 'pi_bg_reload_handoff_expired: no compatible reload activation claimed this execution');
             }
             void writeMetadata().catch((error) => {
                 logger.error(`[background-tasks] failed to persist handoff expiry for ${task.id}:`, error);
@@ -1328,6 +1241,8 @@ export function createReloadableShellExecutionV1(options) {
                 clearTimeout(task.killEscalationTimer);
             if (posixTree?.verificationTimer !== undefined)
                 clearTimeout(posixTree.verificationTimer);
+            if (posixTree !== undefined)
+                clearPosixDescendantCollectTimer(posixTree);
             windowsTree?.softController?.abort();
             execution.child?.stdout?.off?.('data', stdoutListener);
             execution.child?.stderr?.off?.('data', stderrListener);
@@ -1350,7 +1265,12 @@ export function createReloadableShellExecutionV1(options) {
         task.error = `Output file write failed: ${error.message}`;
         changed();
         if (task.status === 'running') {
-            void execution.requestStop('output_cap', task.error).catch((stopError) => {
+            const diskFull = isEnospcError(error);
+            if (diskFull)
+                task.failedReason = 'disk_full';
+            void execution
+                .requestStop(diskFull ? 'disk_full' : 'output_cap', task.error)
+                .catch((stopError) => {
                 logger.error(`[background-tasks] failed to stop survivor after stream error ${task.id}:`, stopError);
             });
         }
@@ -1366,7 +1286,7 @@ export function createReloadableShellExecutionV1(options) {
         writeBuffer(buffer);
     };
     childErrorListener = (error) => {
-        task.error = appendError(task.error, `Background task spawn error: ${error.message}`);
+        task.error = appendErrorText(task.error, `Background task spawn error: ${error.message}`);
         writeBuffer(Buffer.from(`\n[background task spawn error: ${error.message}]\n`, 'utf8'));
         changed();
     };

@@ -7,6 +7,7 @@ stability: stable
 covers_surfaces: []
 covers_sources: []
 ---
+
 # Docs freshness gate
 
 This authored section defines the boundary: documentation facts are extracted from package metadata and TypeScript ASTs, then generated into docs and the manifest. Unsupported syntax fails the gate rather than falling back to regex or stale hand-maintained inventories. Public registrations must remain unconditional top-level direct calls, use the one validated local tool-wrapper shape, use the closed finite-variant grammar below, or occur in a direct inline `session_start` activation callback whose containing statement already has validated availability. Host/method aliases, computed access, nested/dynamic conditions, loops, wrapper chaining/passing, constructor helpers, ambiguous public metadata, destructured Pi parameters, and repeated imported registrars are rejected.
@@ -17,16 +18,16 @@ Every registration-owning function, imported registrar, and supported activation
 
 <!-- pi-docs:begin name="docs-freshness-gate" generator="scripts/docs/generate.mjs" -->
 - Canonical package version: `2.6.8`
-- Governed markdown docs: 42
-- Public surfaces extracted: 32
-- Public surfaces available by default: 31
-- Finite feature values: `process`, `delegate`, `fusion`, `attested`, `attribution`
+- Governed markdown docs: 24
+- Public surfaces extracted: 13
+- Public surfaces available by default: 12
+- Finite feature values: `process`
 - Finite dock shortcut values: `shift+down`, `ctrl+alt+b`, `off`
-- Governed production sources: 60
-- Tool contracts extracted: 11
-- Schema IDs extracted: 48
-- Environment variable references extracted: 54
-- Behavioral attestation receipts not passing: 9
+- Governed production sources: 18
+- Tool contracts extracted: 4
+- Schema IDs extracted: 5
+- Environment variable references extracted: 18
+- Behavioral attestation receipts not passing: 0
 - Receipt store: `docs/attestations.json`
 
 `npm run docs:verify` is read-only: it renders generated files twice in memory and compares them with committed bytes. `npm run docs:generate` is the only docs writer.

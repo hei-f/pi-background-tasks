@@ -7,18 +7,18 @@ stability: stable
 covers_surfaces: [command:bg-clear]
 covers_sources: []
 ---
+
 # `/bg-clear`
 
 <!-- pi-docs:begin name="command-contract-bg-clear" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-clear` | `always` | yes | Clear finished background task footer notices | `src/extension.ts:793` |
+| `/bg-clear` | `always` | yes | Clear finished background task footer notices | `src/extension.ts:666` |
 <!-- pi-docs:end name="command-contract-bg-clear" -->
 
 Clear finished background task footer notices.
 
 ## Synopsis
-
 
 `/bg-clear`
 
@@ -62,7 +62,6 @@ No task files are deleted. Output and metadata under `.pi/tasks/...` remain inta
 ## Related docs
 
 - [Shortcuts and dock](../reference/shortcuts-and-dock.md)
-- [`/tasks` and `/bg-tasks`](task-manager.md)
 - [Host UI and telemetry](../subsystems/host-ui-and-telemetry.md)
 
 ## Source ownership/reference

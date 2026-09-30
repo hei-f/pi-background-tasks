@@ -7,11 +7,12 @@ stability: stable
 covers_surfaces: [tool:bg_kill]
 covers_sources: []
 ---
+
 # `bg_kill`
 
 <!-- pi-docs:begin name="tool-contract-bg_kill" generator="scripts/docs/generate.mjs" -->
 - Label: **Background Kill**
-- Source: `src/extension.ts:1181`
+- Source: `src/extension.ts:898`
 - Availability: `always`
 - Available by default: **yes**
 - Description: Stop a running background task by ID. Fails loudly if the task is unknown or already finished.
@@ -47,14 +48,13 @@ Stop a running background task by id.
 
 ## Schema
 
-
 Required fields:
 
 - `taskId: string` — exact task id or unambiguous prefix.
 
 ## When to use
 
-Use when the user asks to stop a background task or when a `bg_run` command is no longer needed.
+Use when the user asks to stop a background task or when a background command launched via covered `bash` `run_in_background:true` (or the dock「转后台」entry) is no longer needed.
 
 ## Defaults
 
@@ -62,16 +62,16 @@ No defaults. The task must be running.
 
 ## Lifecycle
 
-A successful kill sets the task terminal status to `killed`. Killing a completed, failed, or already killed task rejects loudly.
+A successful kill records stop initiator `model` and sets the task terminal status to `cancelled`. Killing a terminal (`completed`, `failed`, `cancelled`, `killed`, or `lost`) task rejects loudly.
 
 ## Examples
 
 ```json
-{"taskId":"b12345678"}
+{ "taskId": "b12345678" }
 ```
 
 ```json
-{"taskId":"b1234"}
+{ "taskId": "b1234" }
 ```
 
 ## Output/result
@@ -106,7 +106,7 @@ Task control only. POSIX and Windows process-tree semantics differ; Windows forc
 
 ## Related docs
 
-- [`/kill`](../commands/kill.md)
+- [`/bg-kill`](../commands/bg-kill.md)
 - [`bg_status`](bg_status.md)
 - [`bg_logs`](bg_logs.md)
 - [Background task runtime](../subsystems/background-task-runtime.md)

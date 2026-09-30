@@ -85,7 +85,13 @@ function fakeExecution(
     requestStop: async (kind) => {
       onStop?.(kind);
       execution.phase = 'terminal';
-      task.status = kind === 'handoff_expired' ? 'failed' : 'killed';
+      // M2 迁移表:handoff_expired → failed;user/model 停止 → cancelled;system 关闭 → killed
+      task.status =
+        kind === 'handoff_expired'
+          ? 'failed'
+          : kind === 'user'
+            ? 'cancelled'
+            : 'killed';
       task.error = kind === 'handoff_expired' ? 'pi_bg_reload_handoff_expired' : task.error;
       resolveTerminal?.(task);
       sink?.onTerminal(execution);

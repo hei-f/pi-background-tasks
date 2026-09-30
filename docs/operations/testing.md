@@ -7,6 +7,7 @@ stability: evolving
 covers_surfaces: []
 covers_sources: []
 ---
+
 # Testing operations
 
 Package entry docs: `TESTING.md` and `TEST_PLAN.md`. This page explains how to choose gates without losing the detailed coverage matrix.
@@ -36,45 +37,40 @@ Package source guards are compiler-driven rather than text-only:
 
 From current `package.json`:
 
-| Lane | Script | Meaning |
-|---|---|---|
-| Runtime build | `npm run build:runtime` | Compile authoritative extension/runtime TypeScript into the shipped `dist/` JavaScript closure. |
-| Typecheck | `npm run typecheck` | `tsc --noEmit`. |
-| Type safety package tests | `npm run test:type-safety` | Package/type-safety tests. |
-| Unit | `npm run test:unit` | Pure/unit coverage, including durable fs, budgets, projection, Fusion/delegate core. |
-| SDK | `npm run test:sdk` | Real package entrypoint through SDK-style harnesses. |
-| RPC | `npm run test:rpc` | RPC command/tool surface. |
-| Component | `npm run test:component` | TUI component rendering/key behavior. |
-| Package | `npm run test:package` | Manifest/payload/mutation/package guards. |
-| Hook contract | `npm run test:hook-contract` | Real Pi hook characterization evidence comparison. |
-| Default | `npm run test` | Typecheck + type-safety + unit + SDK + RPC + component + package + hook-contract. |
-| PTY | `npm run test:pty` | Real expect/TUI scenarios; full gate only. |
-| Agent loop | `npm run test:agent-loop` | Scripted-provider real agent-loop behavior; full gate only. |
-| Full | `npm run test:full` | Default + PTY + agent-loop. |
-| Smoke | `npm run smoke` | Isolated load-only `/jobs`. |
-| Large context smoke | `npm run smoke:large-context` | Offline Fusion context/budget reproduction; no inference/child spawn. |
-| Compatibility | `npm run test:compat` | Release-only exact Pi version install/compat plus current-host witness. |
-| Pack | `npm run pack:dry-run` | Release payload preview. |
-| Docs generate | `npm run docs:generate` | Regenerates generated docs regions/index/manifest. |
-| Docs verify | `npm run docs:verify` | Offline, read-only deterministic docs freshness verification; renders generated files twice in memory and reports semantic receipt freshness without requiring it. |
-| Strict docs attestation verify | `npm run docs:verify:attestations` | Optional strict mode that additionally requires every behavioral receipt to match current prose and sources. |
-| Docs attestation | `npm run docs:attest/record -- <doc_id> --reviewer <identity-after-semantic-review> --verdict PASS --notes <review-notes>` | Computes hashes and records an explicit semantic PASS receipt after review; `npm run docs:attest` is an alias and still needs args. |
-| Docs unit/package gate | `npm run test:docs` | Docs-gate unit/package tests. |
-| Payload check | `npm run payload:check` | Package payload policy check. |
-| Cold-load benchmark | `node scripts/benchmark-cold-load.mjs --root "$PWD" --runtime <source|compiled> --label <label> --output <owned.json> --samples 30 --scratch <owned-dir>` | Fresh-process source or compiled-distribution load and first-use distributions; evidence only, never a CI timing threshold. |
-| Release version check | `npm run release:check-version` | Tag-only version sanity; requires explicit `GITHUB_REF_TYPE=tag`/`GITHUB_REF_NAME=v$VERSION` and never publishes. |
+| Lane                           | Script                                                                                                                     | Meaning                                                                                                                                                            |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Runtime build                  | `npm run build:runtime`                                                                                                    | Compile authoritative extension/runtime TypeScript into the shipped `dist/` JavaScript closure.                                                                    |
+| Typecheck                      | `npm run typecheck`                                                                                                        | `tsc --noEmit`.                                                                                                                                                    |
+| Type safety package tests      | `npm run test:type-safety`                                                                                                 | Package/type-safety tests.                                                                                                                                         |
+| Unit                           | `npm run test:unit`                                                                                                        | Pure/unit coverage, including durable fs and bounded log reading.                                                                                                  |
+| SDK                            | `npm run test:sdk`                                                                                                         | Real package entrypoint through SDK-style harnesses.                                                                                                               |
+| RPC                            | `npm run test:rpc`                                                                                                         | RPC command/tool surface.                                                                                                                                          |
+| Component                      | `npm run test:component`                                                                                                   | TUI component rendering/key behavior.                                                                                                                              |
+| Package                        | `npm run test:package`                                                                                                     | Manifest/payload/mutation/package guards.                                                                                                                          |
+| Default                        | `npm run test`                                                                                                             | Typecheck + type-safety + unit + SDK + RPC + component + package.                                                                                                  |
+| PTY                            | `npm run test:pty`                                                                                                         | Real expect/TUI scenarios; full gate only.                                                                                                                         |
+| Agent loop                     | `npm run test:agent-loop`                                                                                                  | Scripted-provider real agent-loop behavior; full gate only.                                                                                                        |
+| Full                           | `npm run test:full`                                                                                                        | Default + PTY + agent-loop.                                                                                                                                        |
+| Smoke                          | `npm run smoke`                                                                                                            | Isolated load-only `/bg-jobs`.                                                                                                                                     |
+| Pack                           | `npm run pack:dry-run`                                                                                                     | Release payload preview.                                                                                                                                           |
+| Docs generate                  | `npm run docs:generate`                                                                                                    | Regenerates generated docs regions/index/manifest.                                                                                                                 |
+| Docs verify                    | `npm run docs:verify`                                                                                                      | Offline, read-only deterministic docs freshness verification; renders generated files twice in memory and reports semantic receipt freshness without requiring it. |
+| Strict docs attestation verify | `npm run docs:verify:attestations`                                                                                         | Optional strict mode that additionally requires every behavioral receipt to match current prose and sources.                                                       |
+| Docs attestation               | `npm run docs:attest/record -- <doc_id> --reviewer <identity-after-semantic-review> --verdict PASS --notes <review-notes>` | Computes hashes and records an explicit semantic PASS receipt after review; `npm run docs:attest` is an alias and still needs args.                                |
+| Docs unit/package gate         | `npm run test:docs`                                                                                                        | Docs-gate unit/package tests.                                                                                                                                      |
+| Payload check                  | `npm run payload:check`                                                                                                    | Package payload policy check.                                                                                                                                      |
+| Cold-load benchmark            | `node scripts/benchmark-cold-load.mjs --root "$PWD" --runtime <source                                                      | compiled> --label <label> --output <owned.json> --samples 30 --scratch <owned-dir>`                                                                                | Fresh-process source or compiled-distribution load and first-use distributions; evidence only, never a CI timing threshold. |
+| Release version check          | `npm run release:check-version`                                                                                            | Tag-only version sanity; requires explicit `GITHUB_REF_TYPE=tag`/`GITHUB_REF_NAME=v$VERSION` and never publishes.                                                  |
 
 ### Cold-load measurement discipline
 
-The cold-load driver starts a new Node process for every sample and gives each worker isolated project, agent, session, HOME, and temporary roots with offline/telemetry suppression. It records raw samples plus median, p90, median absolute deviation, minimum, and maximum for direct delegate/Fusion facade imports; no-extension, process-only, and default-full real SDK loading; first delegate/Fusion launch and subtype result verification with deterministic fake children; and first model-selector invocation with mocked UI. One warm-up is excluded and at least 30 measured samples are expected for comparative evidence.
+The cold-load driver starts a new Node process for every sample and gives each worker isolated project, agent, session, HOME, and temporary roots with offline/telemetry suppression. It records raw samples plus median, p90, median absolute deviation, minimum, and maximum for process-only real SDK loading. One warm-up is excluded and at least 30 measured samples are expected for comparative evidence.
 
 Here, **cold** means a fresh process and empty JavaScript/Jiti module cache. It does not mean a flushed filesystem cache. Baseline and candidate must use the same driver and worker bytes, Node/Pi/dependency tree, host, features, and root conditions. If worktree limits force sequential baseline-then-candidate collection rather than simultaneous AB/BA, record that host-drift risk; do not fabricate interleaving. There is no machine-specific pass threshold.
 
-The benchmark requires an explicit `--runtime source|compiled` choice. Published package entrypoints select the compiled JavaScript distribution, while source mode remains an authoritative development control. Process-only startup no longer statically imports delegate/Fusion facades, dock UI, the attribution transport, or attested execution; enabled registrations still load their lightweight facade before the extension factory resolves. Neither mode supports a native-Windows or vendor compiled-Bun timing claim without separate runs.
+The benchmark requires an explicit `--runtime source|compiled` choice. Published package entrypoints select the compiled JavaScript distribution, while source mode remains an authoritative development control. The packaging gate separately walks literal deferred imports, verifies every source target, builds its compiled counterpart, and requires the complete `dist/` closure in the tarball. Neither mode supports a native-Windows or vendor compiled-Bun timing claim without separate runs.
 
-The package gate separately walks literal deferred imports, verifies every source target, builds its compiled counterpart, and requires the complete `dist/` closure in the tarball. A packed-copy regression installs only the real production Turndown/Domino closure, proves all Pi SDK packages and TypeBox are absent beneath the package, and loads both compiled entrypoints through Pi's real SDK loader with default capabilities. Before damage injection it invokes `bg_delegate`, `bg_run_pi_attested`, `fusion_reason`, the task manager, and the Fusion selector; each must pass module loading and reach its expected post-import semantic boundary. It then removes one delegate producer module: startup and immediate inventory still work, the first producer invocation fails with the bounded module-specific error, and no delegate artifact is created. A source-graph guard also pins the host import on every internal dynamic-import issuer. This distinguishes supported package entrypoint traversal from unsupported direct Node imports of private `dist/src/**` chunks, without borrowing development dependencies or weakening the real payload-closure check.
-
-Lazy lifecycle SDK coverage deliberately blocks Fusion cleanup while asserting the shared synchronous fence has already closed delegate, result, command/UI, and both Fusion lanes. A real `AgentSession.reload()` control lets production delegate preparation finish a complete artifact tree before returning, then proves the unregistered transaction is rolled back with no starter or residual run bytes. A separate claim race proves shutdown cannot consume Fusion usage without a successful retrieval, and a registered-task control proves rollback never deletes registry-owned artifacts.
+A packed-copy regression installs only the real production Turndown/Domino closure, proves all Pi SDK packages and TypeBox are absent beneath the package, and loads the package entrypoint through Pi's real SDK loader with default capabilities. It then removes one background module: startup and immediate inventory still work, the first invocation fails with the bounded module-specific error, and no task artifact is created. A source-graph guard also pins the host import on every internal dynamic-import issuer. This distinguishes supported package entrypoint traversal from unsupported direct Node imports of private `dist/src/**` chunks, without borrowing development dependencies or weakening the real payload-closure check.
 
 Do not run full/default/root suites for documentation-only edits unless the operator explicitly asks. If the operator restricts verification to focused checks, report that `docs:verify`/attestation were not run.
 
@@ -84,9 +80,6 @@ Do not run full/default/root suites for documentation-only edits unless the oper
 
 Preserve especially:
 
-- Pi hook contract evidence and byte-identical shipped copy behavior;
-- Fusion golden-byte and independent oracle coverage;
-- delegate seed/budget/artifact/result/guard/mutation coverage;
 - scripted-provider no-poll/no-sleep follow-up behavior;
 - PTY keyboard-protocol negotiation notes;
 - compatibility TypeBox peer/payload checks;
@@ -120,5 +113,5 @@ These checks are not substitutes for code gates when source behavior changes.
 - **EventBus docs vs API changes:** EventBus unit/SDK targeted tests if code changed; otherwise focused docs checks.
 - **Context projection/budget changes:** unit tests for projection/budget/golden/oracle; do not update goldens casually.
 - **Durability/launch changes:** durable-fs, pi-launch, Windows argv targeted units.
-- **Delegate guard changes:** hook contract, delegate unit/SDK/scripted-provider targeted gates.
+
 - **Release candidate:** ordinary release checks in `docs/operations/releasing.md`; live subscription evidence only when explicitly certifying release behavior.

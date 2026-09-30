@@ -7,6 +7,7 @@ stability: evolving
 covers_surfaces: []
 covers_sources: [src/core/canonical-json.ts, src/core/durable-fs.ts, src/core/pi-launch.ts, src/core/task-durable.ts]
 ---
+
 # Child launch, durability, and safety
 
 Primary sources: `src/core/pi-launch.ts`, `src/core/durable-fs.ts`, `src/core/task-durable.ts`, and `src/core/canonical-json.ts`.
@@ -41,8 +42,6 @@ Malformed, unreadable, non-object, or malformed-name manifests are hard package-
 
 `assertWindowsCommandLineWithinLimit()` renders the exact Windows command line with Windows quoting rules, measures UTF-16 length plus the terminating NUL, and throws `PiCommandLineLimitError` (`pi_command_line_too_long`) if it exceeds 32,767 characters. The check is used before child launches that construct `pi` argv.
 
-Delegate seed bytes are delivered over stdin, not argv, so large seeds do not rely on command-line quoting or shell length limits.
-
 ## Durable write invariant
 
 `durable-fs.ts` provides two public operations:
@@ -56,7 +55,7 @@ Cancellation is cooperative between filesystem phases, not a claim that Node can
 
 Temp ownership matters: if exclusive temp creation collides, the caller does not delete the other writer's file. A successful rename is the commit point; if a post-rename directory sync fails, the error marks `renameCompleted: true` because the replacement may already be visible.
 
-`task-durable.ts` is the lightweight task-facing wrapper for durable files, atomic JSON, and output-stream closure. Keeping it separate prevents ordinary process startup from importing the opt-in attested producer. `canonical-json.ts` owns stable key ordering and SHA-256 byte labels shared by delegate, Fusion, and attested artifacts; the attested module re-exports those helpers for API compatibility.
+`task-durable.ts` is the lightweight task-facing wrapper for durable files, atomic JSON, and output-stream closure. `canonical-json.ts` owns stable key ordering and SHA-256 byte labels shared by task artifact consumers.
 
 ## POSIX directory sync limitation
 
@@ -64,13 +63,10 @@ After atomic replace, POSIX-like platforms open and sync the parent directory to
 
 ## Process trust boundaries
 
-- Background shell tasks run the operator-provided shell command in the project cwd and are not sandboxed.
-- Delegate children are direct `pi` spawns, not shell commands. They use a task-owned session id and session dir, stripped parent session environment, disabled discovery, and an explicit child guard extension; Anthropic delegates first load the package attribution extension.
-- Fusion children are direct `pi --mode text` spawns with private metadata/tool-call audit extensions and workflow-specific tool policy; Anthropic children first load the package attribution extension.
-- Attested Pi tasks are direct `pi --mode json` spawns and produce evidence sidecars after successful parsing and durability; Anthropic tasks receive the package attribution extension explicitly.
+- Background shell tasks run the operator-provided shell command in the project cwd and are not sandboxed. Agent-flagged commands may be wrapped for Pi-agent telemetry when the resolved shell supports POSIX function syntax.
 
 Never blur parent and child authority: parent tools can start/inspect/kill tasks, but child tools must stay within their explicit argv tool set.
 
 ## Terminal integrity
 
-Task terminal status is not published until output streams are ended and observed finished/closed and terminal metadata is written. Ordinary task `.output` streams are not explicitly fsynced; attested event/stderr buffers and atomic metadata/artifact paths use the durable helpers described above. If stream close or terminal metadata fails, the task is marked failed; terminal truth is not guessed from the process exit alone.
+Task terminal status is not published until output streams are ended and observed finished/closed and terminal metadata is written. Ordinary task `.output` streams are not explicitly fsynced; atomic metadata paths use the durable helpers described above. If stream close or terminal metadata fails, the task is marked failed; terminal truth is not guessed from the process exit alone.

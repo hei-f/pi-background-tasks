@@ -1,9 +1,22 @@
-import { accessSync, constants, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, statSync } from 'node:fs';
 import { open } from 'node:fs/promises';
-import { basename, delimiter, extname, isAbsolute, join, resolve, win32 } from 'node:path';
-import { DEFAULT_MAX_BYTES } from '@earendil-works/pi-coding-agent';
-export const TASK_STATUS_VALUES = ['running', 'completed', 'failed', 'killed'];
-export const TERMINAL_TASK_STATUS_VALUES = ['completed', 'failed', 'killed'];
+import { basename, delimiter, extname, isAbsolute, join, resolve, win32, } from 'node:path';
+import { DEFAULT_MAX_BYTES, formatSize } from '@earendil-works/pi-coding-agent';
+export const TASK_STATUS_VALUES = [
+    'running',
+    'completed',
+    'failed',
+    'cancelled',
+    'killed',
+    'lost',
+];
+export const TERMINAL_TASK_STATUS_VALUES = [
+    'completed',
+    'failed',
+    'cancelled',
+    'killed',
+    'lost',
+];
 export class ReloadSurvivalError extends Error {
     code;
     constructor(code, message) {
@@ -12,13 +25,9 @@ export class ReloadSurvivalError extends Error {
         this.name = 'ReloadSurvivalError';
     }
 }
-export function rejectSurvivalForTaskKind(value, kind) {
-    if (!Object.prototype.hasOwnProperty.call(value, 'surviveReload'))
-        return;
-    throw new ReloadSurvivalError('pi_bg_survive_reload_unsupported_task_kind', `${kind} does not support surviveReload; only ordinary isAgent:false shell tasks may survive reload`);
-}
 /**
- * Describe the actual parent-agent completion path for one bg_run launch.
+ * Describe the actual parent-agent completion path for one background launch
+ * (覆盖版 bash `run_in_background:true` 或 dock「转后台」)。
  * A wake request cannot take effect without the notification that carries it.
  */
 export function deriveCompletionDeliveryGuidance(notifyOnCompletion, triggerOnCompletion) {
@@ -59,18 +68,32 @@ export function deriveCompletionDeliveryGuidance(notifyOnCompletion, triggerOnCo
         ].join('\n'),
     };
 }
-export const DEFAULT_LOG_BYTES = Math.min(DEFAULT_MAX_BYTES, 50 * 1024);
-export const MAX_LOG_BYTES = Math.min(DEFAULT_MAX_BYTES, 50 * 1024);
+/** 模型视图 64KiB 有界上限:模型可见日志读取默认与上限取宿主导入的
+ * `DEFAULT_MAX_BYTES` 与 64KiB 目标值二者中的较小者——宿主值小于 64KiB 时
+ * 以宿主为准(当前宿主为 50KiB,实际生效值即 50KiB);宿主值超过 64KiB 时
+ * 本插件按 64KiB 封顶,防止模型视图无界膨胀。
+ */
+export const MODEL_VIEW_BYTES_CAP = 64 * 1024;
+export const DEFAULT_LOG_BYTES = Math.min(DEFAULT_MAX_BYTES, MODEL_VIEW_BYTES_CAP);
+export const MAX_LOG_BYTES = Math.min(DEFAULT_MAX_BYTES, MODEL_VIEW_BYTES_CAP);
 export const COMMAND_PREVIEW_CHARS = 90;
 const parseJsonValue = globalThis.JSON.parse;
 export function isJsonObject(value) {
     return typeof value === 'object' && value !== null;
 }
+/** 判别输出流错误是否由磁盘空间耗尽(ENOSPC)引发,用于终止分支选择。 */
+export function isEnospcError(error) {
+    return (typeof error === 'object' &&
+        error !== null &&
+        Reflect.get(error, 'code') === 'ENOSPC');
+}
 export function parseJsonText(text) {
     return parseJsonValue(text);
 }
 export function sanitizePathSegment(value) {
-    const sanitized = value.replace(/[^a-zA-Z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
+    const sanitized = value
+        .replace(/[^a-zA-Z0-9_.-]+/g, '-')
+        .replace(/^-+|-+$/g, '');
     return sanitized || 'session';
 }
 export function stripMatchingQuotes(value) {
@@ -115,129 +138,14 @@ export function deriveTaskNameFromCommand(command) {
     return truncateChars(words.length > 0 ? words : normalized, 48);
 }
 export function taskDisplayName(task) {
-    const commandName = task.command && task.command.length > 0 ? deriveTaskNameFromCommand(task.command) : undefined;
+    const commandName = task.command && task.command.length > 0
+        ? deriveTaskNameFromCommand(task.command)
+        : undefined;
     return (normalizeTaskName(task.name) ??
         normalizeTaskName(task.description) ??
         commandName ??
         task.id ??
         'Background task');
-}
-function parseNameValueAndRest(valueAndRest) {
-    const input = valueAndRest.trimStart();
-    if (!input)
-        return undefined;
-    const quote = input[0];
-    if (quote === '"' || quote === "'") {
-        let escaped = false;
-        let value = '';
-        for (let i = 1; i < input.length; i++) {
-            const char = input.charAt(i);
-            if (escaped) {
-                value += char;
-                escaped = false;
-                continue;
-            }
-            if (char === '\\') {
-                escaped = true;
-                continue;
-            }
-            if (char === quote) {
-                return { value, rest: input.slice(i + 1).trimStart() };
-            }
-            value += char;
-        }
-        return undefined;
-    }
-    const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(input);
-    if (!match)
-        return undefined;
-    const parsedValue = match[1];
-    if (parsedValue === undefined)
-        return undefined;
-    return { value: parsedValue, rest: match[2]?.trimStart() ?? '' };
-}
-export function parseBgCommandArgs(args) {
-    let input = args.trim();
-    let name;
-    let isAgent = false;
-    let surviveReload = false;
-    while (input) {
-        let consumed = false;
-        for (const prefix of ['--name=', '-n=']) {
-            if (input.startsWith(prefix)) {
-                const parsed = parseNameValueAndRest(input.slice(prefix.length));
-                if (!parsed)
-                    throw new Error(`${prefix.slice(0, -1)} requires a task name`);
-                name = normalizeTaskName(parsed.value);
-                input = parsed.rest;
-                consumed = true;
-                break;
-            }
-        }
-        if (consumed)
-            continue;
-        for (const prefix of ['--name', '-n']) {
-            if (input === prefix || input.startsWith(`${prefix} `) || input.startsWith(`${prefix}\t`)) {
-                const parsed = parseNameValueAndRest(input.slice(prefix.length));
-                if (!parsed)
-                    throw new Error(`${prefix} requires a task name`);
-                name = normalizeTaskName(parsed.value);
-                input = parsed.rest;
-                consumed = true;
-                break;
-            }
-        }
-        if (consumed)
-            continue;
-        for (const flag of ['--agent', '--llm-agent']) {
-            if (input === flag || input.startsWith(`${flag} `) || input.startsWith(`${flag}\t`)) {
-                isAgent = true;
-                input = input.slice(flag.length).trimStart();
-                consumed = true;
-                break;
-            }
-        }
-        if (consumed)
-            continue;
-        for (const flag of ['--script', '--no-agent']) {
-            if (input === flag || input.startsWith(`${flag} `) || input.startsWith(`${flag}\t`)) {
-                isAgent = false;
-                input = input.slice(flag.length).trimStart();
-                consumed = true;
-                break;
-            }
-        }
-        if (consumed)
-            continue;
-        if (input === '--survive-reload' ||
-            input.startsWith('--survive-reload ') ||
-            input.startsWith('--survive-reload\t')) {
-            if (surviveReload) {
-                throw new ReloadSurvivalError('pi_bg_survive_reload_invalid', '/bg accepts --survive-reload at most once');
-            }
-            surviveReload = true;
-            input = input.slice('--survive-reload'.length).trimStart();
-            continue;
-        }
-        if (input.startsWith('--survive-reload=')) {
-            throw new ReloadSurvivalError('pi_bg_survive_reload_invalid', '/bg accepts only the bare --survive-reload flag');
-        }
-        if (input === '--') {
-            input = '';
-            break;
-        }
-        if (input.startsWith('-- ')) {
-            input = input.slice(3).trimStart();
-            break;
-        }
-        break;
-    }
-    if (surviveReload && isAgent) {
-        throw new ReloadSurvivalError('pi_bg_survive_reload_requires_non_agent', 'surviveReload requires isAgent:false');
-    }
-    return name
-        ? { name, command: input, isAgent, surviveReload }
-        : { command: input, isAgent, surviveReload };
 }
 export function formatDuration(ms) {
     if (ms < 1000)
@@ -322,13 +230,21 @@ export function parseAgentActivity(payload) {
         const tool = readActivityString(record, 'tool');
         if (!tool)
             return undefined;
-        return { kind, tool, argsSummary: readActivityString(record, 'argsSummary') ?? '' };
+        return {
+            kind,
+            tool,
+            argsSummary: readActivityString(record, 'argsSummary') ?? '',
+        };
     }
     if (kind === 'tool_end') {
         const tool = readActivityString(record, 'tool');
         if (!tool)
             return undefined;
-        const activity = { kind, tool, isError: record.isError === true };
+        const activity = {
+            kind,
+            tool,
+            isError: record.isError === true,
+        };
         const error = readActivityString(record, 'error');
         if (error !== undefined && error.trim().length > 0)
             activity.error = error;
@@ -353,7 +269,9 @@ export function formatAgentActivityLine(activity) {
     }
     if (activity.kind === 'tool_start') {
         const summary = compactWhitespace(activity.argsSummary);
-        const suffix = summary.length > 0 ? ` ${truncateChars(summary, AGENT_ACTIVITY_DETAIL_MAX)}` : '';
+        const suffix = summary.length > 0
+            ? ` ${truncateChars(summary, AGENT_ACTIVITY_DETAIL_MAX)}`
+            : '';
         return `\u2192 ${activity.tool}${suffix}`;
     }
     if (!activity.isError)
@@ -611,9 +529,217 @@ export function shellInvocationForPolicy(command, policy) {
 export function shellInvocation(command, platform = process.platform, env = process.env) {
     return shellInvocationForPolicy(command, resolveShellPolicy(platform, env));
 }
+/** Windows `.cmd`/`.bat` shim 扩展名集合(shell:false 不能直接 spawn shim)。 */
+const WINDOWS_COMMAND_SHIM_EXTENSIONS = new Set([
+    '.cmd',
+    '.bat',
+]);
+const DEFAULT_WINDOWS_PATHEXT = [
+    '.COM',
+    '.EXE',
+    '.BAT',
+    '.CMD',
+];
+/** Windows 环境变量键存在大小写变体(例如 PATH/Path/path);docs 门禁要求 env
+ * 键为字面量,因此显式枚举候选键而不是运行期循环匹配。
+ */
+function windowsPathextValue(env) {
+    const value = env['PATHEXT'] ?? env['PathExt'] ?? env['pathext'];
+    return typeof value === 'string' ? value : undefined;
+}
+function windowsComSpecValue(env) {
+    const value = env['ComSpec'] ?? env['COMSPEC'] ?? env['comspec'];
+    return typeof value === 'string' ? value : undefined;
+}
+function windowsExtensionCandidates(file, pathExts) {
+    if (extname(file))
+        return [file];
+    return [file, ...pathExts.map((extension) => `${file}${extension.toLowerCase()}`)];
+}
+function isWindowsCommandShim(path) {
+    return WINDOWS_COMMAND_SHIM_EXTENSIONS.has(extname(path).toLowerCase());
+}
+function resolveWindowsDirectExecutionFile(file, options) {
+    const raw = windowsPathextValue(options.env);
+    const pathExts = raw && raw.length > 0
+        ? raw
+            .split(';')
+            .map((extension) => extension.trim())
+            .filter((extension) => extension.length > 0)
+        : [...DEFAULT_WINDOWS_PATHEXT];
+    const fileCandidates = windowsExtensionCandidates(file, pathExts);
+    let candidates;
+    if (file.includes('\\') || file.includes('/') || win32.isAbsolute(file)) {
+        const basePath = !win32.isAbsolute(file) && options.cwd
+            ? win32.resolve(options.cwd, file)
+            : win32.normalize(file);
+        candidates = windowsExtensionCandidates(basePath, pathExts);
+    }
+    else {
+        const pathValue = windowsPathValue(options.env);
+        candidates = pathValue
+            .split(win32.delimiter)
+            .filter((entry) => entry.length > 0)
+            .flatMap((dir) => fileCandidates.map((candidate) => win32.join(dir, candidate)));
+    }
+    return candidates.find((candidate) => options.exists(candidate)) ?? file;
+}
+function quoteCmdArgument(value) {
+    if (value.length === 0)
+        return '""';
+    if (!/[\s"%&()<>^|]/.test(value))
+        return value;
+    return `"${value.replace(/(["%&()<>^|])/g, '^$1')}"`;
+}
+/**
+ * 直执行解析(M4,逐行仿 ZCode `execution-command.ts:118-139`):argv[0] 直达
+ * 可执行文件、无 shell 中介;Windows 下按 PATHEXT/PATH 解析实际文件,
+ * `.cmd`/`.bat` shim 自动路由 `cmd.exe /d /s /c`(shell:false 不能直接
+ * spawn shim),普通 `.exe` 保持 shell-free argv 执行。POSIX 保持裸名,
+ * 由 libuv 按 PATH 解析。
+ */
+export function resolveDirectExecution(argv, options = {}) {
+    const platform = options.platform ?? process.platform;
+    const env = options.env ?? process.env;
+    const file = argv[0];
+    if (typeof file !== 'string' || file.trim().length === 0) {
+        throw new Error('Direct execution argv[0] must be a non-empty executable name');
+    }
+    const args = argv.slice(1);
+    if (platform !== 'win32') {
+        return { file, args, windowsVerbatimArguments: false };
+    }
+    const resolvedFile = resolveWindowsDirectExecutionFile(file, {
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        env,
+        exists: options.exists ?? existsSync,
+    });
+    if (!isWindowsCommandShim(resolvedFile)) {
+        return { file: resolvedFile, args, windowsVerbatimArguments: false };
+    }
+    const commandLine = [resolvedFile, ...args].map(quoteCmdArgument).join(' ');
+    const comSpec = windowsComSpecValue(env);
+    return {
+        file: comSpec && comSpec.length > 0 ? comSpec : 'cmd.exe',
+        args: ['/d', '/s', '/c', commandLine],
+        windowsVerbatimArguments: true,
+    };
+}
 export function normalizeMaxBytes(value, fallback = DEFAULT_LOG_BYTES) {
-    const raw = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
+    const raw = typeof value === 'number' && Number.isFinite(value)
+        ? Math.floor(value)
+        : fallback;
     return Math.max(1, Math.min(MAX_LOG_BYTES, raw));
+}
+/** 错误对象 → 文案(不裁剪、不复写空白;与 registry/reload 既有 errorMessage 语义一致)。 */
+export function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
+}
+/** 追加错误文案:空已有/已含 next 时不重复追加,以 `; ` 连接(registry/reload 两处
+ * appendError 语义一致)。 */
+export function appendErrorText(existing, next) {
+    if (existing === undefined || existing.length === 0)
+        return next;
+    if (existing.includes(next))
+        return existing;
+    return `${existing}; ${next}`;
+}
+/** 有界错误文案:折叠空白并裁剪到 maxChars 字符内,以省略号收尾(extension-api
+ * 的 boundedBackgroundTaskError 与 reload 的 boundedError、registry 的
+ * terminalPublicationError 三处收敛的统一实现)。 */
+export function boundedErrorMessage(error, maxChars) {
+    const text = errorMessage(error).replace(/\s+/gu, ' ').trim();
+    if (text.length <= maxChars)
+        return text;
+    return `${text.slice(0, maxChars - 1)}…`;
+}
+/**
+ * 六态迁移表统一判定(registry close 路径与 reload-shell-owner terminalStatus
+ * 两套重复收敛):user/model 停止 → cancelled;system 关闭 → killed;timeout/
+ * output_cap/disk_full/handoff_expired/退出码非 0 → failed(带细分 reason);
+ * 终止后退出码 0 → completed。`handoff_expired` 为 reload 幸存路径独有分支。
+ * 行为与两处既有实现逐分支等价;failedReason 副作用与既有实现一致。
+ */
+export function deriveTerminalStatus(task, killKind, exitCode, signal, maxOutputBytes) {
+    if (killKind === 'user')
+        return { status: 'cancelled' };
+    if (killKind === 'shutdown')
+        return { status: 'killed' };
+    if (killKind === 'timeout') {
+        task.failedReason = 'timed_out';
+        return {
+            status: 'failed',
+            error: task.error ?? `Timed out after ${String(task.timeoutSeconds)}s`,
+        };
+    }
+    if (killKind === 'output_cap') {
+        task.failedReason = 'output_limit';
+        return {
+            status: 'failed',
+            error: task.error ?? `Output exceeded cap of ${formatSize(maxOutputBytes)}`,
+        };
+    }
+    if (killKind === 'disk_full') {
+        // 磁盘满终止:已写输出文件保留,便于审计
+        task.failedReason = 'disk_full';
+        return {
+            status: 'failed',
+            error: task.error ??
+                `Output file write failed because the disk is full (ENOSPC); partial output is retained at ${task.outputPath}`,
+        };
+    }
+    if (killKind === 'handoff_expired') {
+        return {
+            status: 'failed',
+            error: task.error ??
+                'pi_bg_reload_handoff_expired: reload shell execution was not claimed before its handoff deadline',
+        };
+    }
+    if ((exitCode ?? 0) === 0)
+        return { status: 'completed' };
+    task.failedReason = 'exit_error';
+    return {
+        status: 'failed',
+        error: `Exited with code ${exitCode === null ? 'null' : String(exitCode)}${signal ? ` (${signal})` : ''}`,
+    };
+}
+/**
+ * 软/硬输出阈值写块助手(registry 输出写入段与 reload-shell-owner 写缓冲段
+ * 两套重复收敛):跨软阈值写入一次软告警(不杀任务、不改状态、不计入累计字节,
+ * 避免提示文本自身触发硬阈值);按硬阈值截断写入累计;首次跨硬阈值时置位
+ * capExceeded、写终止 notice 后返回 true,由调用方执行终止动作并给出细分原因。
+ */
+export function writeTaskOutputChunk(task, buffer, options) {
+    if (!task.stream || task.stream.destroyed)
+        return false;
+    if (buffer.length === 0)
+        return false;
+    const nextBytes = task.bytesWritten + buffer.length;
+    if (nextBytes > options.softBytes && !task.softCapWarned) {
+        task.softCapWarned = true;
+        const warning = `\n\n[background task warning: output exceeded soft limit of ` +
+            `${formatSize(options.softBytes)}; task continues running]\n`;
+        task.stream.write(warning);
+        options.onSoftCapWarned();
+    }
+    if (nextBytes <= options.hardBytes) {
+        task.stream.write(buffer);
+        task.bytesWritten = nextBytes;
+        return false;
+    }
+    const remaining = Math.max(0, options.hardBytes - task.bytesWritten);
+    if (remaining > 0) {
+        task.stream.write(buffer.subarray(0, remaining));
+        task.bytesWritten += remaining;
+    }
+    if (task.capExceeded)
+        return false;
+    task.capExceeded = true;
+    task.error = `Output exceeded cap of ${formatSize(options.hardBytes)}; terminating task`;
+    const notice = `\n\n[background task error: ${task.error}]\n`;
+    task.stream.write(notice);
+    task.bytesWritten += Buffer.byteLength(notice, 'utf8');
+    return true;
 }
 export function snapshot(task) {
     return {
@@ -643,10 +769,10 @@ export function snapshot(task) {
         toolUsage: task.toolUsage,
         model: task.model,
         telemetryUnavailableReason: task.telemetryUnavailableReason,
+        stopInitiator: task.stopInitiator,
+        branchGeneration: task.branchGeneration,
+        failedReason: task.failedReason,
         shellPolicy: task.shellPolicy,
-        attestationPath: task.attestationPath,
-        delegate: task.delegate,
-        fusion: task.fusion,
     };
 }
 export function formatSnapshotList(tasks, now = Date.now()) {
@@ -658,7 +784,7 @@ export function formatSnapshotList(tasks, now = Date.now()) {
             ? '▶'
             : task.status === 'completed'
                 ? '✓'
-                : task.status === 'killed'
+                : task.status === 'killed' || task.status === 'cancelled'
                     ? '■'
                     : '✗';
         const age = formatDuration((task.endTime ?? now) - task.startTime);
@@ -701,87 +827,9 @@ export async function boundedRead(filePath, maxBytes, tail) {
     }
 }
 export function escapeXml(value) {
-    return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-export const UPDATE_COMMAND = '/bg-update';
-const SEMVER_PATTERN = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
-export function parseSemver(value) {
-    if (typeof value !== 'string')
-        return undefined;
-    const match = SEMVER_PATTERN.exec(value.trim());
-    if (!match)
-        return undefined;
-    const majorRaw = match[1];
-    const minorRaw = match[2];
-    const patchRaw = match[3];
-    if (majorRaw === undefined || minorRaw === undefined || patchRaw === undefined)
-        return undefined;
-    const major = Number(majorRaw);
-    const minor = Number(minorRaw);
-    const patch = Number(patchRaw);
-    if (!Number.isInteger(major) || !Number.isInteger(minor) || !Number.isInteger(patch))
-        return undefined;
-    const prerelease = match[4] !== undefined ? match[4].split('.') : [];
-    return { major, minor, patch, prerelease };
-}
-function comparePrerelease(a, b) {
-    if (a.length === 0 && b.length === 0)
-        return 0;
-    // A version without prerelease identifiers outranks the same core with prerelease identifiers.
-    if (a.length === 0)
-        return 1;
-    if (b.length === 0)
-        return -1;
-    const shared = Math.min(a.length, b.length);
-    for (let i = 0; i < shared; i++) {
-        const idA = a[i];
-        const idB = b[i];
-        if (idA === undefined || idB === undefined)
-            break;
-        if (idA === idB)
-            continue;
-        const numericA = /^\d+$/.test(idA);
-        const numericB = /^\d+$/.test(idB);
-        if (numericA && numericB) {
-            const diff = Number(idA) - Number(idB);
-            if (diff !== 0)
-                return diff < 0 ? -1 : 1;
-            continue;
-        }
-        // Numeric identifiers always have lower precedence than non-numeric identifiers.
-        if (numericA)
-            return -1;
-        if (numericB)
-            return 1;
-        return idA < idB ? -1 : 1;
-    }
-    if (a.length === b.length)
-        return 0;
-    return a.length < b.length ? -1 : 1;
-}
-/** Compare two semver strings. Returns -1/0/1, or undefined when either side is not valid semver. */
-export function compareSemver(a, b) {
-    const left = parseSemver(a);
-    const right = parseSemver(b);
-    if (!left || !right)
-        return undefined;
-    if (left.major !== right.major)
-        return left.major < right.major ? -1 : 1;
-    if (left.minor !== right.minor)
-        return left.minor < right.minor ? -1 : 1;
-    if (left.patch !== right.patch)
-        return left.patch < right.patch ? -1 : 1;
-    return comparePrerelease(left.prerelease, right.prerelease);
-}
-export function isNewerVersion(latest, current) {
-    return compareSemver(latest, current) === 1;
-}
-/** Footer segment shown only when a newer published version exists; undefined otherwise. */
-export function formatUpdateSegment(latest, current) {
-    if (!latest)
-        return undefined;
-    if (!isNewerVersion(latest, current))
-        return undefined;
-    return `\u2b06 v${latest} ${UPDATE_COMMAND}`;
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 }
 //# sourceMappingURL=common.js.map

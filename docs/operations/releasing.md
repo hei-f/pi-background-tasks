@@ -7,6 +7,7 @@ stability: evolving
 covers_surfaces: []
 covers_sources: []
 ---
+
 # Releasing operations
 
 Package maintenance entrypoint: `PUBLISHING.md`. Source version is always `package.json`; never hard-code a release version in commands.
@@ -46,14 +47,12 @@ npm view pi-background-tasks name version --json
 
 `npm run test:full` additionally runs PTY and scripted-provider agent-loop gates. Treat it as a full interactive gate; do not run it for routine docs edits.
 
-Live evidence (`npx tsx scripts/delegate-live-run.ts`) is release-time and performs real subscription-OAuth inference. It must never use API-key/metered frontier channels.
-
 ## Payload verification
 
 Use `npm pack --dry-run --json` output as the payload source of truth. Verify at minimum:
 
-- `dist/extensions/anthropic-attribution.js` and `dist/extensions/background-tasks.js` are the ordered Pi entrypoints;
-- the complete compiled `dist/` runtime closure, source maps, copied hook-contract evidence, and minimal `dist/package.json` are included;
+- `dist/extensions/background-tasks.js` is the single ordered Pi entrypoint;
+- the complete compiled `dist/` runtime closure, source maps, and minimal `dist/package.json` are included;
 - authoritative `extensions/` and runtime `src/` sources remain included for public source/API compatibility;
 - `docs/`, `README.md`, `TESTING.md`, `TEST_PLAN.md`, `PUBLISHING.md`, `BACKGROUND-TASKS-INSTRUCTIONS.md`, `THIRD_PARTY_NOTICES.md`, root `logo.png`, and `LICENSE` are included per current `package.json.files`;
 - tests, scripts, node_modules, local `.pi/` artifacts, generated evidence not meant for runtime, and nested tarballs are excluded;

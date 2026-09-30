@@ -1,11 +1,15 @@
 import type { EventBus } from '@earendil-works/pi-coding-agent';
 import {
+  boundedErrorMessage,
   DEFAULT_LOG_BYTES,
   normalizeMaxBytes,
   type BgLogsDetails,
   type BgTaskSnapshot,
+  type FailedReason,
   type JsonObject,
   type StartTaskOptions,
+  type StopInitiator,
+  type TerminalTaskStatus,
 } from './common.js';
 import type { BackgroundTaskContext, BackgroundTaskRegistry } from './registry.js';
 
@@ -30,6 +34,8 @@ export class BackgroundTaskExtensionServiceClosedError extends Error {
 
 const MAX_ERROR_CHARS = 240;
 const MAX_REQUEST_ID_CHARS = 200;
+/** REVIEW:EventBus 去重账本容量上限,防止请求 id 账本跨 session 激活无界增长。 */
+const MAX_SEEN_REQUEST_IDS = 4096;
 
 export type BackgroundTaskExtensionOperation = 'capabilities' | 'run' | 'status' | 'logs' | 'kill';
 
@@ -115,14 +121,59 @@ export type BackgroundTaskExtensionResponse =
       error: string;
     };
 
+/** terminal 帧的来源元信息(与 ZCode `BackgroundResultOriginMeta` 结构同构,本插件固定 bash 后台源)。 */
+export interface BackgroundTaskExtensionOriginMeta {
+  backgroundSource: 'bash';
+}
+
+/** terminal 帧 usage 快照的模型用量分片(与 ZCode `ModelUsage` 的 token 字段名同构)。 */
+export interface BackgroundTaskTerminalModelUsage {
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+  cacheReadTokens?: number | undefined;
+  cacheWriteTokens?: number | undefined;
+  totalTokens?: number | undefined;
+}
+
+/** terminal 帧 usage 快照统一形状(与 ZCode `RuntimeTaskUsageSnapshot`/dock 遥测同构;
+ * 缺失报 unavailable 不伪造 0)。 */
+export interface BackgroundTaskTerminalUsageSnapshot {
+  durationMs?: number | undefined;
+  modelUsage?: BackgroundTaskTerminalModelUsage | undefined;
+  toolUseCount?: number | undefined;
+  totalTokens?: number | undefined;
+}
+
+/** EventBus 服务发布的 terminal 帧负载:任务快照 + 服务侧补充的完成摘要。 */
+export interface BackgroundTaskTerminalPublication {
+  task: BgTaskSnapshot;
+  summaryTail?: string | undefined;
+}
+
+/**
+ * v1 terminal 帧,M5 向后兼容扩展。全部新字段可选、旧字段语义不变;
+ * 新增 status 值(`cancelled`/`lost`)旧消费方按 failed/killed 降级,运行时不强校验旧消费方。
+ */
 export interface BackgroundTaskExtensionTerminal {
   schema_version: typeof BG_TERMINAL_SCHEMA;
   task: BgTaskSnapshot;
+  /** 终态全集(镜像 task.status;仅终态任务携带)。 */
+  status?: TerminalTaskStatus | undefined;
+  /** status=failed 时的细分原因(五值全集,镜像 task.failedReason)。 */
+  failedReason?: FailedReason | undefined;
+  /** 停止发起者(镜像 task.stopInitiator;user/model 停止 → cancelled,system 关闭 → killed)。 */
+  initiator?: StopInitiator | undefined;
+  /** 来源元信息:固定 `{ backgroundSource: 'bash' }`(M4 覆盖版 bash 与 dock「转后台」同源)。 */
+  originMeta?: BackgroundTaskExtensionOriginMeta | undefined;
+  /** 完成帧带的有界 tail 摘要(64KiB 内;完整日志不自动回传,帧内已附输出路径)。 */
+  summaryTail?: string | undefined;
+  /** usage 快照(与 dock 遥测同构;缺失报 unavailable 不伪造 0)。 */
+  usage?: BackgroundTaskTerminalUsageSnapshot | undefined;
 }
 
 export interface BackgroundTaskExtensionService {
   readonly state: BackgroundTaskExtensionServiceState;
-  publishTerminal(task: BgTaskSnapshot): void;
+  publishTerminal(publication: BackgroundTaskTerminalPublication): void;
   close(): void;
 }
 
@@ -360,10 +411,71 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** terminal 帧的终态值映射:仅终态任务携带 status(防御性,框架侧只发布终态任务)。 */
+function terminalStatusOf(task: BgTaskSnapshot): TerminalTaskStatus | undefined {
+  const status = task.status;
+  if (
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'cancelled' ||
+    status === 'killed' ||
+    status === 'lost'
+  ) {
+    return status;
+  }
+  return undefined;
+}
+
+/** usage 快照的模型用量投影:task.tokenUsage 缺失或无 total 时缺省(unavailable 不伪造 0)。 */
+function terminalModelUsageOf(
+  task: BgTaskSnapshot,
+): BackgroundTaskTerminalModelUsage | undefined {
+  const usage = task.tokenUsage;
+  if (usage === undefined || usage.totalTokens <= 0) return undefined;
+  const out: BackgroundTaskTerminalModelUsage = {
+    inputTokens: usage.input,
+    outputTokens: usage.output,
+    cacheReadTokens: usage.cacheRead,
+    cacheWriteTokens: usage.cacheWrite,
+    totalTokens: usage.totalTokens,
+  };
+  return out;
+}
+
+/** terminal 帧 usage 快照:从任务快照聚合,至少一个字段在场才携带。 */
+function terminalUsageOf(
+  task: BgTaskSnapshot,
+): BackgroundTaskTerminalUsageSnapshot | undefined {
+  const durationMs =
+    task.endTime !== undefined &&
+    Number.isFinite(task.startTime) &&
+    Number.isFinite(task.endTime) &&
+    task.endTime >= task.startTime
+      ? task.endTime - task.startTime
+      : undefined;
+  const modelUsage = terminalModelUsageOf(task);
+  const toolUseCount =
+    task.toolUsage !== undefined && task.toolUsage.total > 0
+      ? task.toolUsage.total
+      : undefined;
+  const usage: BackgroundTaskTerminalUsageSnapshot = {};
+  if (durationMs !== undefined) usage.durationMs = durationMs;
+  if (modelUsage !== undefined) {
+    usage.modelUsage = modelUsage;
+    usage.totalTokens = modelUsage.totalTokens;
+  }
+  if (toolUseCount !== undefined) usage.toolUseCount = toolUseCount;
+  const hasAny =
+    usage.durationMs !== undefined ||
+    usage.modelUsage !== undefined ||
+    usage.toolUseCount !== undefined ||
+    usage.totalTokens !== undefined;
+  return hasAny ? usage : undefined;
+}
+
 export function boundedBackgroundTaskError(error: unknown): string {
-  const text = errorText(error).replace(/\s+/gu, ' ').trim();
-  if (text.length <= MAX_ERROR_CHARS) return text;
-  return `${text.slice(0, MAX_ERROR_CHARS - 1)}…`;
+  // REVIEW:有界错误文案三处重复收敛到共享 boundedErrorMessage
+  return boundedErrorMessage(error, MAX_ERROR_CHARS);
 }
 
 function errorResponse(
@@ -436,16 +548,37 @@ class InstalledBackgroundTaskExtensionService implements BackgroundTaskExtension
     return this.serviceState;
   }
 
+  /** REVIEW:去重账本按容量上限裁剪,达到上限时清理最旧的 request_id(Set 按插入序迭代)。 */
+  private recordSeenRequestId(requestId: string): void {
+    this.seenRequestIds.add(requestId);
+    if (this.seenRequestIds.size > MAX_SEEN_REQUEST_IDS) {
+      const oldest = this.seenRequestIds.values().next().value;
+      if (oldest !== undefined) this.seenRequestIds.delete(oldest);
+    }
+  }
+
   private isClosed(): boolean {
     return this.serviceState === 'closed';
   }
 
-  publishTerminal(task: BgTaskSnapshot): void {
+  publishTerminal(publication: BackgroundTaskTerminalPublication): void {
     if (this.serviceState === 'closed') throw new BackgroundTaskExtensionServiceClosedError();
+    const task = publication.task;
+    const status = terminalStatusOf(task);
+    const usage = terminalUsageOf(task);
     const terminal: BackgroundTaskExtensionTerminal = {
       schema_version: BG_TERMINAL_SCHEMA,
       task,
+      originMeta: { backgroundSource: 'bash' },
     };
+    if (status !== undefined) terminal.status = status;
+    if (task.failedReason !== undefined)
+      terminal.failedReason = task.failedReason;
+    if (task.stopInitiator !== undefined)
+      terminal.initiator = task.stopInitiator;
+    if (publication.summaryTail !== undefined)
+      terminal.summaryTail = publication.summaryTail;
+    if (usage !== undefined) terminal.usage = usage;
     this.events.emit(BG_TERMINAL_CHANNEL, terminal);
   }
 
@@ -475,7 +608,7 @@ class InstalledBackgroundTaskExtensionService implements BackgroundTaskExtension
       );
       return;
     }
-    this.seenRequestIds.add(request.request_id);
+    this.recordSeenRequestId(request.request_id);
     const terminalGate =
       request.operation === 'run' || request.operation === 'kill'
         ? createTerminalPublicationGate()
@@ -550,7 +683,8 @@ class InstalledBackgroundTaskExtensionService implements BackgroundTaskExtension
           task.terminalPublicationGate,
           terminalPublicationGate,
         );
-        await this.registry.stopTask(task, 'user');
+        // EventBus kill 属程序化请求(其他扩展/编排器),按模型入口分派
+        await this.registry.stopTask(task, 'user', undefined, 'model');
         const snapshot = this.registry.snapshot(task);
         return {
           task: snapshot,
