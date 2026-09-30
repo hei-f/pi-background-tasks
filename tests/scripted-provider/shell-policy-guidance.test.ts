@@ -196,7 +196,7 @@ void describe('scripted-provider shell policy guidance and execution', { concurr
           await h.session.prompt('Use the documented background shell policy witness.');
           await h.session.agent.waitForIdle();
           const events = await providerEvents(h.eventsPath);
-          assert.equal(events.length, 2);
+          assert.equal(events.length, 3);
           const first = object(events[0], 'first provider event');
           const guidance = object(first['guidance'], 'provider-observed shell guidance');
           assert.equal(first['peerGuidance'], true);
@@ -205,17 +205,19 @@ void describe('scripted-provider shell policy guidance and execution', { concurr
           assert.equal(guidance['dialect'], 'user-non-posix');
           assert.deepEqual(guidance['args'], ['-c', '<command>']);
 
-          const second = object(events[1], 'second provider event');
-          assert.equal(second['peerGuidance'], true);
-          const taskPolicy = object(second['taskShellPolicy'], 'agent-visible launch policy');
+          // M4 形态:模型经覆盖版 bash 启动后台任务,再经 bg_status 点检取回
+          // 快照观测实际执行采用的 shell policy。
+          const third = object(events[2], 'third provider event');
+          assert.equal(third['peerGuidance'], true);
+          const taskPolicy = object(third['taskShellPolicy'], 'agent-visible launch policy');
           assert.deepEqual(taskPolicy, {
             policy: 'inherit',
             executable: fakeNu,
             argvPrefix: ['-c'],
             dialect: 'user-non-posix',
           });
-          const taskId = String(second['taskId']);
-          const outputPath = String(second['taskOutputPath']);
+          const taskId = String(third['taskId']);
+          const outputPath = String(third['taskOutputPath']);
           assert.ok(taskId.startsWith('b'));
           const metadata = await terminalMetadata(
             join(h.cwd, outputPath.replace(/\.output$/u, '.json')),
@@ -255,21 +257,21 @@ void describe('scripted-provider shell policy guidance and execution', { concurr
       await h.session.prompt('Run the explicit Bash shell-policy proof.');
       await h.session.agent.waitForIdle();
       const events = await providerEvents(h.eventsPath);
-      assert.equal(events.length, 2);
+      assert.equal(events.length, 3);
       const guidance = object(events[0]?.['guidance'], 'Bash guidance');
       assert.equal(events[0]?.['peerGuidance'], true);
       assert.equal(guidance['policy'], 'bash');
       assert.equal(guidance['executable'], '/bin/bash');
       assert.equal(guidance['dialect'], 'bash');
       assert.deepEqual(guidance['args'], ['-c', '<command>']);
-      const receipt = object(events[1]?.['taskShellPolicy'], 'Bash task policy receipt');
+      const receipt = object(events[2]?.['taskShellPolicy'], 'Bash task policy receipt');
       assert.deepEqual(receipt, {
         policy: 'bash',
         executable: '/bin/bash',
         argvPrefix: ['-c'],
         dialect: 'bash',
       });
-      const outputPath = String(events[1]?.['taskOutputPath']);
+      const outputPath = String(events[2]?.['taskOutputPath']);
       const metadata = await terminalMetadata(join(h.cwd, outputPath.replace(/\.output$/u, '.json')));
       assert.equal(metadata['status'], 'completed');
       assert.deepEqual(metadata['shellPolicy'], receipt);

@@ -3,13 +3,20 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
-import { basename, delimiter, dirname, join } from 'node:path';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { parseJsonText, shellQuote, type StartDelegateTaskOptions } from '../../src/core/common.js';
+import { parseJsonText, shellQuote } from '../../src/core/common.js';
 import {
   BackgroundTaskRegistry,
+  TERMINAL_SUMMARY_TAIL_BYTES,
   WIN32_CMD_PI_TELEMETRY_UNAVAILABLE_REASON,
   commandMayLaunchPiAgent,
   type BackgroundTaskContext,
@@ -17,7 +24,6 @@ import {
   type CompletionNotificationMessage,
   type CompletionNotificationOptions,
 } from '../../src/core/registry.js';
-import type { Api, Model } from '@earendil-works/pi-ai';
 import type {
   BgTask,
   BgTaskSnapshot,
@@ -29,19 +35,14 @@ import {
   inspectReloadShellOwnerForTests,
   makeReloadShellIdentity,
 } from '../../src/core/reload-shell-owner.js';
-import type { TaskkillOutcome, WindowsKillPhase } from '../../src/core/windows-taskkill.js';
-import type { AttestedGitSpawn } from '../../src/core/attested-pi-run.js';
-import { BackgroundTaskExtensionServiceClosedError } from '../../src/core/extension-api.js';
-import { SynchronousActivationCloseFence } from '../../src/core/lazy-module.js';
-import { registerBackgroundResultExtension } from '../../src/delegate-extension.js';
-import { FusionArtifactStore } from '../../src/core/fusion/artifacts.js';
-import { defaultFusionModelConfig } from '../../src/core/fusion/config.js';
+import type {
+  TaskkillOutcome,
+  WindowsKillPhase,
+} from '../../src/core/windows-taskkill.js';
 import {
-  FUSION_RESULT_SCHEMA_VERSION,
-  type FusionResultDetails,
-  type ResolvedFusionModel,
-  type ResolvedFusionModels,
-} from '../../src/core/fusion/types.js';
+  BackgroundTaskExtensionServiceClosedError,
+  type BackgroundTaskTerminalPublication,
+} from '../../src/core/extension-api.js';
 
 type JsonObject = Record<PropertyKey, unknown>;
 
@@ -106,12 +107,13 @@ interface HarnessOptions {
   platform?: NodeJS.Platform;
   maxRecentTasks?: number;
   maxOutputBytes?: number;
+  softOutputBytes?: number;
   killGraceMs?: number;
   stopWaitMs?: number;
   taskAdmissionTimeoutMs?: number;
-  attestedGitKillGraceMs?: number;
-  attestedGitSpawn?: AttestedGitSpawn;
   killProcess?: (pid: number, signal?: NodeJS.Signals | number) => boolean;
+  /** M3 ps 后代收集注入:单测以 fixture 取代真实 ps,缺省空集(退化组信号路径)。 */
+  collectPosixDescendantPids?: (rootPid: number) => Promise<Set<number>>;
   killTree?: (
     pid: number,
     phase: WindowsKillPhase,
@@ -121,7 +123,8 @@ interface HarnessOptions {
     message: CompletionNotificationMessage,
     options: CompletionNotificationOptions,
   ) => void;
-  publishTerminal?: (task: BgTaskSnapshot) => void;
+  /** M5:终态帧发布负载(任务快照 + 完成摘要)。 */
+  publishTerminal?: (publication: BackgroundTaskTerminalPublication) => void;
   logger?: Pick<Console, 'error'>;
   makeTaskId?: () => string;
   now?: () => number;
@@ -145,13 +148,16 @@ async function createHarness(options: HarnessOptions = {}) {
   }> = [];
   const errors: unknown[][] = [];
   let changes = 0;
-  const registryOptions: ConstructorParameters<typeof BackgroundTaskRegistry>[0] = {
+  const registryOptions: ConstructorParameters<
+    typeof BackgroundTaskRegistry
+  >[0] = {
     logger: options.logger ?? {
       error: (...args: unknown[]) => {
         errors.push(args);
       },
     },
-    makeTaskId: options.makeTaskId ?? (() => `bunit${String(++idSeq).padStart(3, '0')}`),
+    makeTaskId:
+      options.makeTaskId ?? (() => `bunit${String(++idSeq).padStart(3, '0')}`),
     sendCompletionNotification:
       options.sendCompletionNotification ??
       ((message, opts) => {
@@ -170,24 +176,31 @@ async function createHarness(options: HarnessOptions = {}) {
         children.push({ child, shell, args: [...args], options: spawnOptions });
         return child;
       }),
+    collectPosixDescendantPids:
+      options.collectPosixDescendantPids ?? (async () => new Set()),
   };
   if (options.publishTerminal !== undefined)
     registryOptions.publishTerminal = options.publishTerminal;
-  if (options.platform !== undefined) registryOptions.platform = options.platform;
+  if (options.platform !== undefined)
+    registryOptions.platform = options.platform;
   if (options.env !== undefined) registryOptions.env = options.env;
-  if (options.maxRecentTasks !== undefined) registryOptions.maxRecentTasks = options.maxRecentTasks;
-  if (options.maxOutputBytes !== undefined) registryOptions.maxOutputBytes = options.maxOutputBytes;
-  if (options.killGraceMs !== undefined) registryOptions.killGraceMs = options.killGraceMs;
-  if (options.stopWaitMs !== undefined) registryOptions.stopWaitMs = options.stopWaitMs;
+  if (options.maxRecentTasks !== undefined)
+    registryOptions.maxRecentTasks = options.maxRecentTasks;
+  if (options.maxOutputBytes !== undefined)
+    registryOptions.maxOutputBytes = options.maxOutputBytes;
+  if (options.softOutputBytes !== undefined)
+    registryOptions.softOutputBytes = options.softOutputBytes;
+  if (options.killGraceMs !== undefined)
+    registryOptions.killGraceMs = options.killGraceMs;
+  if (options.stopWaitMs !== undefined)
+    registryOptions.stopWaitMs = options.stopWaitMs;
   if (options.taskAdmissionTimeoutMs !== undefined)
     registryOptions.taskAdmissionTimeoutMs = options.taskAdmissionTimeoutMs;
-  if (options.attestedGitKillGraceMs !== undefined)
-    registryOptions.attestedGitKillGraceMs = options.attestedGitKillGraceMs;
-  if (options.attestedGitSpawn !== undefined)
-    registryOptions.attestedGitSpawn = options.attestedGitSpawn;
   if (options.now !== undefined) registryOptions.now = options.now;
-  if (options.killProcess !== undefined) registryOptions.killProcess = options.killProcess;
-  if (options.killTree !== undefined) registryOptions.killTree = options.killTree;
+  if (options.killProcess !== undefined)
+    registryOptions.killProcess = options.killProcess;
+  if (options.killTree !== undefined)
+    registryOptions.killTree = options.killTree;
   const registry = new BackgroundTaskRegistry(registryOptions);
   const ctx: BackgroundTaskContext = {
     cwd,
@@ -209,88 +222,17 @@ async function createHarness(options: HarnessOptions = {}) {
   };
 }
 
-function git(cwd: string, args: string[]): void {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
-  assert.equal(result.status, 0, result.stderr || result.stdout);
-}
-
-async function initCleanGit(cwd: string): Promise<void> {
-  git(cwd, ['init']);
-  git(cwd, ['config', 'user.email', 'pi-bg@example.invalid']);
-  git(cwd, ['config', 'user.name', 'Pi BG Tests']);
-  await writeFile(join(cwd, 'README.md'), 'clean\n', 'utf8');
-  await writeFile(join(cwd, '.gitignore'), '.pi/\nreport.md\n', 'utf8');
-  git(cwd, ['add', 'README.md', '.gitignore']);
-  git(cwd, ['commit', '-m', 'init']);
-}
-
-function oauthModel(provider = 'openai-codex', modelId = 'gpt-5.5'): Model<Api> {
-  return {
-    id: modelId,
-    name: modelId,
-    api: provider === 'anthropic' ? 'anthropic-messages' : 'openai-codex-responses',
-    provider,
-    baseUrl: 'https://example.invalid',
-    reasoning: false,
-    input: ['text'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 100000,
-    maxTokens: 4096,
-  };
-}
-
-function oauthRegistry(model = oauthModel()): BackgroundTaskContext['modelRegistry'] {
-  return {
-    getAll: () => [model],
-    find: (provider, modelId) =>
-      provider === model.provider && modelId === model.id ? model : undefined,
-    isUsingOAuth: () => true,
-  };
-}
-
-function piJsonEvents(provider = 'openai-codex', model = 'gpt-5.5'): string {
-  return (
-    [
-      {
-        type: 'session',
-        version: 3,
-        id: 'pi-session-unit',
-        timestamp: '2026-01-01T00:00:00.000Z',
-        cwd: '/unit',
-      },
-      { type: 'agent_start' },
-      {
-        type: 'message_end',
-        message: {
-          role: 'assistant',
-          provider,
-          model,
-          usage: {
-            input: 10,
-            output: 4,
-            cacheRead: 0,
-            cacheWrite: 1,
-            totalTokens: 15,
-            cost: { total: 0.12 },
-          },
-          content: [{ type: 'text', text: 'attested done' }],
-          stopReason: 'stop',
-        },
-      },
-      { type: 'agent_end', messages: [] },
-    ]
-      .map((event) => JSON.stringify(event))
-      .join('\n') + '\n'
-  );
-}
-
 async function cleanup(root: string) {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       await rm(root, { recursive: true, force: true });
       return;
     } catch (error) {
-      if (!(error instanceof Error) || !/ENOTEMPTY/.test(error.message) || attempt === 4)
+      if (
+        !(error instanceof Error) ||
+        !/ENOTEMPTY/.test(error.message) ||
+        attempt === 4
+      )
         throw error;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -310,41 +252,23 @@ async function waitFor(
   throw new Error(`Timed out waiting for ${message}`);
 }
 
-async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  return Promise.race([
-    promise.then(
-      () => true,
-      () => true,
-    ),
-    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
-  ]);
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timeout: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeout !== undefined) clearTimeout(timeout);
-  }
-}
-
 function pidExists(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return !(typeof error === 'object' && error !== null && Reflect.get(error, 'code') === 'ESRCH');
+    return !(
+      typeof error === 'object' &&
+      error !== null &&
+      Reflect.get(error, 'code') === 'ESRCH'
+    );
   }
 }
 
 function pgidFor(pid: number): number | undefined {
-  const result = spawnSync('/bin/ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' });
+  const result = spawnSync('/bin/ps', ['-o', 'pgid=', '-p', String(pid)], {
+    encoding: 'utf8',
+  });
   if (result.status !== 0) return undefined;
   const pgid = Number(result.stdout.trim());
   return Number.isSafeInteger(pgid) && pgid > 0 ? pgid : undefined;
@@ -354,8 +278,16 @@ function errnoError(code: string, message: string): Error & { code: string } {
   return Object.assign(new Error(message), { code });
 }
 
-async function waitForPidExit(pid: number, label: string, timeoutMs = 1000): Promise<void> {
-  await waitFor(() => !pidExists(pid), `${label} pid ${String(pid)} exit`, timeoutMs);
+async function waitForPidExit(
+  pid: number,
+  label: string,
+  timeoutMs = 1000,
+): Promise<void> {
+  await waitFor(
+    () => !pidExists(pid),
+    `${label} pid ${String(pid)} exit`,
+    timeoutMs,
+  );
 }
 
 async function filesBelow(path: string): Promise<string[]> {
@@ -372,13 +304,17 @@ async function filesBelow(path: string): Promise<string[]> {
   return files;
 }
 
-async function readJsonEventually(path: string, timeoutMs = 1000): Promise<JsonObject> {
+async function readJsonEventually(
+  path: string,
+  timeoutMs = 1000,
+): Promise<JsonObject> {
   const start = Date.now();
   let last = '';
   while (Date.now() - start < timeoutMs) {
     last = await readFile(path, 'utf8').catch(() => '');
     try {
-      if (last.trim()) return parseJsonObject(last, 'metadata JSON must be an object');
+      if (last.trim())
+        return parseJsonObject(last, 'metadata JSON must be an object');
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
     }
@@ -393,7 +329,10 @@ function lastSpawn(h: Awaited<ReturnType<typeof createHarness>>): SpawnRecord {
   return spawn;
 }
 
-function taskkillOutcome(exitCode: number | null, stderr = ''): TaskkillOutcome {
+function taskkillOutcome(
+  exitCode: number | null,
+  stderr = '',
+): TaskkillOutcome {
   return {
     exitCode,
     signal: null,
@@ -422,7 +361,9 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve: resolveFn, reject: rejectFn };
 }
 
-function isKillRequester(value: unknown): value is (task: BgTask, signal?: NodeJS.Signals) => void {
+function isKillRequester(
+  value: unknown,
+): value is (task: BgTask, signal?: NodeJS.Signals) => void {
   return typeof value === 'function';
 }
 
@@ -449,88 +390,14 @@ async function startFakeTask(
   return { task, child: lastSpawn(h).child };
 }
 
-function resolvedFusionModel(qualifiedId: string): ResolvedFusionModel {
-  const slash = qualifiedId.indexOf('/');
-  return {
-    selection: '$current',
-    source: 'current',
-    provider: qualifiedId.slice(0, slash),
-    model: qualifiedId.slice(slash + 1),
-    qualifiedId,
-    thinkingLevel: 'medium',
-    contextWindow: 1000,
-    maxOutputTokens: 128,
-  };
-}
-
-function resolvedFusionModels(): ResolvedFusionModels {
-  return {
-    candidates: [
-      resolvedFusionModel('test/candidate-a'),
-      resolvedFusionModel('test/candidate-b'),
-      resolvedFusionModel('test/candidate-c'),
-    ],
-    evaluator: resolvedFusionModel('test/evaluator'),
-    merger: resolvedFusionModel('test/merger'),
-  };
-}
-
-async function createCommittedFusionResult(
-  cwd: string,
-  runId: string,
-): Promise<{ store: FusionArtifactStore; details: FusionResultDetails }> {
-  const store = await FusionArtifactStore.create({
-    cwd,
-    runId,
-    source: 'tool',
-    config: defaultFusionModelConfig(),
-    models: resolvedFusionModels(),
-  });
-  await store.transition('candidates_running');
-  await store.transition('candidates_complete');
-  await store.transition('evaluating');
-  await store.transition('evaluation_complete');
-  await store.transition('merging');
-  const merged = await store.writeMerged('retained fusion answer');
-  const details: FusionResultDetails = {
-    schema_version: FUSION_RESULT_SCHEMA_VERSION,
-    run_id: runId,
-    workflow: 'reason',
-    source: 'tool',
-    status: 'completed',
-    context: { kind: 'session_projection', policy_id: 'retention-test' },
-    tool_policy: { candidate_tools: [], evaluation_tools: [], merge_tools: [] },
-    artifact_dir: store.artifactDir,
-    models: store.snapshot().models,
-    evaluator_attempts: 1,
-    usage: {
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 2,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    budget: {
-      policy_id: 'retention-test',
-      calibration_version: 'test',
-      route_table: [],
-      rate_sources: [],
-      unknown_provider_warnings: [],
-      calibration_warnings: [],
-    },
-  };
-  await store.writeCommittedResult(merged, details);
-  await store.transition('completed');
-  return { store, details };
-}
-
 void describe('BackgroundTaskRegistry', () => {
   void it('validates reload survival before admission, filesystem, insertion, wrapper, or spawn', async () => {
     const hub = createReloadShellOwnerHubForTests();
     const h = await createHarness({ reloadShellOwner: hub });
     let ensureCalls = 0;
-    const originalEnsureRuntimeDir = h.registry.ensureRuntimeDir.bind(h.registry);
+    const originalEnsureRuntimeDir = h.registry.ensureRuntimeDir.bind(
+      h.registry,
+    );
     h.registry.ensureRuntimeDir = async (ctx) => {
       ensureCalls += 1;
       return originalEnsureRuntimeDir(ctx);
@@ -578,7 +445,10 @@ void describe('BackgroundTaskRegistry', () => {
       stopWaitMs: 200,
       killProcess: () => true,
     });
-    const identity = makeReloadShellIdentity(h.ctx.sessionId ?? '', realpathSync(h.cwd));
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
     const claim = hub.beginActivation(identity, 'startup', 'a'.repeat(32));
     const adapter = await h.registry.stageReloadActivation(claim);
     const lease = hub.commitActivation(claim, adapter);
@@ -614,7 +484,10 @@ void describe('BackgroundTaskRegistry', () => {
 
       child.writeStdout('owner-output\n');
       child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'owner-backed completion');
+      await waitFor(
+        () => task.status === 'completed',
+        'owner-backed completion',
+      );
       assert.equal(task.exitCode, 0);
       assert.equal(execution.closeObservation?.code, 0);
       await waitFor(
@@ -660,10 +533,17 @@ void describe('BackgroundTaskRegistry', () => {
       },
     });
     projectCwd = h.cwd;
-    const identity = makeReloadShellIdentity(h.ctx.sessionId ?? '', realpathSync(h.cwd));
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
     const claim = hub.beginActivation(identity, 'startup', '1'.repeat(32));
-    const lease = hub.commitActivation(claim, await h.registry.stageReloadActivation(claim));
-    let execution = inspectReloadShellOwnerForTests(hub, identity).executions[0];
+    const lease = hub.commitActivation(
+      claim,
+      await h.registry.stageReloadActivation(claim),
+    );
+    let execution = inspectReloadShellOwnerForTests(hub, identity)
+      .executions[0];
     let passingAssertionsCompleted = false;
     try {
       const launch = h.registry.startTask(
@@ -678,20 +558,43 @@ void describe('BackgroundTaskRegistry', () => {
         },
       );
       await waitFor(() => {
-        execution = inspectReloadShellOwnerForTests(hub, identity).executions[0];
+        execution = inspectReloadShellOwnerForTests(hub, identity)
+          .executions[0];
         return execution !== undefined;
       }, 'failed-admission execution registration');
-      await assert.rejects(launch, /cleanup also failed|Failed to start background task/u);
+      await assert.rejects(
+        launch,
+        /cleanup also failed|Failed to start background task/u,
+      );
 
       const pid = child?.pid;
       assert.equal(typeof pid, 'number');
       assert.ok(execution);
-      assert.equal(pidExists(pid as number), true, 'real child must still be live at rejection');
-      assert.equal(h.registry.allTasks().length, 0, 'rejected launch must leave no registry task');
-      assert.equal(inspectReloadShellOwnerForTests(hub, identity).executions.length, 1);
-      assert.equal(execution.child, child, 'owner must retain the only live child handle');
+      assert.equal(
+        pidExists(pid as number),
+        true,
+        'real child must still be live at rejection',
+      );
+      assert.equal(
+        h.registry.allTasks().length,
+        0,
+        'rejected launch must leave no registry task',
+      );
+      assert.equal(
+        inspectReloadShellOwnerForTests(hub, identity).executions.length,
+        1,
+      );
+      assert.equal(
+        execution.child,
+        child,
+        'owner must retain the only live child handle',
+      );
       assert.notEqual(execution.phase, 'released');
-      assert.notEqual(execution.task.status, 'completed', 'admission failure cannot fake success');
+      assert.notEqual(
+        execution.task.status,
+        'completed',
+        'admission failure cannot fake success',
+      );
       assert.ok(signals.includes('SIGTERM'));
       assert.ok(signals.includes('SIGKILL'));
 
@@ -699,12 +602,22 @@ void describe('BackgroundTaskRegistry', () => {
       const hostless = inspectReloadShellOwnerForTests(hub, identity);
       assert.equal(hostless.phase, 'releasing');
       assert.equal(hostless.hasAdapter, false);
-      assert.equal(hostless.executions[0], execution, 'cleanup must not require a host adapter');
+      assert.equal(
+        hostless.executions[0],
+        execution,
+        'cleanup must not require a host adapter',
+      );
       assert.equal(execution.child, child);
 
-      await waitFor(() => !pidExists(pid as number), 'failed-admission child natural exit', 2000);
       await waitFor(
-        () => inspectReloadShellOwnerForTests(hub, identity).executions.length === 0,
+        () => !pidExists(pid as number),
+        'failed-admission child natural exit',
+        2000,
+      );
+      await waitFor(
+        () =>
+          inspectReloadShellOwnerForTests(hub, identity).executions.length ===
+          0,
         'failed-admission owner terminal release',
         2000,
       );
@@ -724,9 +637,11 @@ void describe('BackgroundTaskRegistry', () => {
             // Failure-only rescue; passing assertions require natural settlement.
           }
         }
-        await waitFor(() => !pidExists(pid), 'failed-admission failure-only cleanup', 2000).catch(
-          () => undefined,
-        );
+        await waitFor(
+          () => !pidExists(pid),
+          'failed-admission failure-only cleanup',
+          2000,
+        ).catch(() => undefined);
       }
       h.registry.releaseReloadActivation(lease);
       h.registry.setShuttingDown(true);
@@ -744,24 +659,33 @@ void describe('BackgroundTaskRegistry', () => {
         throw new Error('old activation listener failure');
       },
     });
-    const identity = makeReloadShellIdentity(h.ctx.sessionId ?? '', realpathSync(h.cwd));
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
     const firstClaim = hub.beginActivation(identity, 'startup', '9'.repeat(32));
     const firstAdapter = await h.registry.stageReloadActivation(firstClaim);
     const firstLease = hub.commitActivation(firstClaim, firstAdapter);
     let freshLease: ReloadShellActivationLeaseV1 | undefined;
     let fresh: BackgroundTaskRegistry | undefined;
     try {
-      const task = await h.registry.startTask(h.ctx, 'node publication-owner.js', {
-        name: 'Publication owner',
-        isAgent: false,
-        surviveReload: true,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
+      const task = await h.registry.startTask(
+        h.ctx,
+        'node publication-owner.js',
+        {
+          name: 'Publication owner',
+          isAgent: false,
+          surviveReload: true,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        },
+      );
       const child = lastSpawn(h).child;
       child.close(0, null);
       await waitFor(
-        () => task.terminalPublishAttempts === 1 && task.terminalPublishRetryHandle !== undefined,
+        () =>
+          task.terminalPublishAttempts === 1 &&
+          task.terminalPublishRetryHandle !== undefined,
         'first owner publication retry',
       );
       assert.equal(task.terminalPublicationState, 'pending');
@@ -772,20 +696,33 @@ void describe('BackgroundTaskRegistry', () => {
       fresh = new BackgroundTaskRegistry({
         reloadShellOwner: hub,
         sendCompletionNotification() {},
-        publishTerminal: (terminal) => freshPublications.push(terminal),
+        publishTerminal: (publication) => freshPublications.push(publication.task),
         spawn: () => {
           throw new Error('fresh registry must not respawn terminal execution');
         },
       });
-      const claim = hub.beginActivation(identity, 'reload', 'a'.repeat(31) + 'b');
+      const claim = hub.beginActivation(
+        identity,
+        'reload',
+        'a'.repeat(31) + 'b',
+      );
       const adapter = await fresh.stageReloadActivation(claim);
       freshLease = hub.commitActivation(claim, adapter);
-      await waitFor(() => task.terminalPublicationState === 'delivered', 'fresh publication');
+      await waitFor(
+        () => task.terminalPublicationState === 'delivered',
+        'fresh publication',
+      );
       assert.equal(oldAttempts, 1);
       assert.equal(task.terminalPublishAttempts, 2);
       assert.equal(task.terminalPublished, true);
-      assert.equal(freshPublications.filter((entry) => entry.id === task.id).length, 1);
-      await waitFor(() => task.reloadExecution === undefined, 'published owner release');
+      assert.equal(
+        freshPublications.filter((entry) => entry.id === task.id).length,
+        1,
+      );
+      await waitFor(
+        () => task.reloadExecution === undefined,
+        'published owner release',
+      );
     } finally {
       if (fresh !== undefined && freshLease !== undefined) {
         fresh.releaseReloadActivation(freshLease);
@@ -806,31 +743,47 @@ void describe('BackgroundTaskRegistry', () => {
       publishTerminal: () => {
         oldAttempts += 1;
         const lease = oldLease;
-        if (lease === undefined) throw new Error('old lease was not initialized');
+        if (lease === undefined)
+          throw new Error('old lease was not initialized');
         if (!detached) {
           detached = true;
           h.registry.prepareReloadHandoff(lease);
           h.registry.closeTerminalPublication('publisher_closed');
         }
-        throw new Error('synthetic listener failure after reentrant reload detach');
+        throw new Error(
+          'synthetic listener failure after reentrant reload detach',
+        );
       },
     });
-    const identity = makeReloadShellIdentity(h.ctx.sessionId ?? '', realpathSync(h.cwd));
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
     const firstClaim = hub.beginActivation(identity, 'startup', '2'.repeat(32));
-    oldLease = hub.commitActivation(firstClaim, await h.registry.stageReloadActivation(firstClaim));
+    oldLease = hub.commitActivation(
+      firstClaim,
+      await h.registry.stageReloadActivation(firstClaim),
+    );
     let fresh: BackgroundTaskRegistry | undefined;
     let freshLease: ReloadShellActivationLeaseV1 | undefined;
     try {
-      const task = await h.registry.startTask(h.ctx, 'node reentrant-publication.js', {
-        name: 'Reentrant publication handoff',
-        isAgent: false,
-        surviveReload: true,
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
+      const task = await h.registry.startTask(
+        h.ctx,
+        'node reentrant-publication.js',
+        {
+          name: 'Reentrant publication handoff',
+          isAgent: false,
+          surviveReload: true,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        },
+      );
       lastSpawn(h).child.close(0, null);
       await waitFor(() => detached, 'reentrant publication detach');
-      await waitFor(() => task.status === 'completed', 'reentrant publication terminal');
+      await waitFor(
+        () => task.status === 'completed',
+        'reentrant publication terminal',
+      );
 
       const stateAfterThrow = task.terminalPublicationState;
       const reasonAfterThrow = task.terminalPublicationAbandonReason;
@@ -842,26 +795,48 @@ void describe('BackgroundTaskRegistry', () => {
       fresh = new BackgroundTaskRegistry({
         reloadShellOwner: hub,
         sendCompletionNotification() {},
-        publishTerminal: (terminal) => freshPublications.push(terminal),
+        publishTerminal: (publication) => freshPublications.push(publication.task),
         spawn: () => {
-          throw new Error('fresh registry must not respawn a terminal execution');
+          throw new Error(
+            'fresh registry must not respawn a terminal execution',
+          );
         },
       });
       const claim = hub.beginActivation(identity, 'reload', '3'.repeat(32));
-      freshLease = hub.commitActivation(claim, await fresh.stageReloadActivation(claim));
-      await waitFor(() => task.reloadExecution === undefined, 'reentrant owner release');
+      freshLease = hub.commitActivation(
+        claim,
+        await fresh.stageReloadActivation(claim),
+      );
+      await waitFor(
+        () => task.reloadExecution === undefined,
+        'reentrant owner release',
+      );
 
       assert.equal(stateAfterThrow, 'pending');
       assert.equal(reasonAfterThrow, undefined);
       assert.equal(attemptsAfterThrow, 1);
-      assert.equal(retryAfterThrow, undefined, 'old registry must not schedule a retry');
-      assert.equal(oldErrorCount, 0, 'transferred throw must not log old-host abandonment');
+      assert.equal(
+        retryAfterThrow,
+        undefined,
+        'old registry must not schedule a retry',
+      );
+      assert.equal(
+        oldErrorCount,
+        0,
+        'transferred throw must not log old-host abandonment',
+      );
       assert.equal(oldAttempts, 1);
       assert.equal(task.terminalPublicationState, 'delivered');
       assert.equal(task.terminalPublicationAbandonReason, undefined);
       assert.equal(task.terminalPublishAttempts, 2);
-      assert.equal(freshPublications.filter((entry) => entry.id === task.id).length, 1);
-      assert.deepEqual(inspectReloadShellOwnerForTests(hub, identity).executions, []);
+      assert.equal(
+        freshPublications.filter((entry) => entry.id === task.id).length,
+        1,
+      );
+      assert.deepEqual(
+        inspectReloadShellOwnerForTests(hub, identity).executions,
+        [],
+      );
     } finally {
       if (fresh !== undefined && freshLease !== undefined) {
         fresh.releaseReloadActivation(freshLease);
@@ -876,7 +851,10 @@ void describe('BackgroundTaskRegistry', () => {
     const hub = createReloadShellOwnerHubForTests({ handoffTimeoutMs: 1000 });
     let child: FakeChild | undefined;
     let groupPresent = true;
-    const killProcess = (_pid: number, signal?: NodeJS.Signals | number): boolean => {
+    const killProcess = (
+      _pid: number,
+      signal?: NodeJS.Signals | number,
+    ): boolean => {
       if (signal === 0) {
         if (groupPresent) return true;
         throw errnoError('ESRCH', 'group gone');
@@ -895,8 +873,15 @@ void describe('BackgroundTaskRegistry', () => {
       stopWaitMs: 200,
       killProcess,
     });
-    const identity = makeReloadShellIdentity(h.ctx.sessionId ?? '', realpathSync(h.cwd));
-    const initialClaim = hub.beginActivation(identity, 'startup', 'c'.repeat(32));
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
+    const initialClaim = hub.beginActivation(
+      identity,
+      'startup',
+      'c'.repeat(32),
+    );
     const initialAdapter = await h.registry.stageReloadActivation(initialClaim);
     const initialLease = hub.commitActivation(initialClaim, initialAdapter);
     let freshLease: ReloadShellActivationLeaseV1 | undefined;
@@ -926,9 +911,11 @@ void describe('BackgroundTaskRegistry', () => {
         platform: process.platform,
         env: process.env,
         sendCompletionNotification() {},
-        publishTerminal: (terminal) => published.push(terminal),
+        publishTerminal: (publication) => published.push(publication.task),
         spawn: () => {
-          throw new Error('fresh registry must not respawn a claimed execution');
+          throw new Error(
+            'fresh registry must not respawn a claimed execution',
+          );
         },
       });
       const claim = hub.beginActivation(identity, 'reload', 'd'.repeat(32));
@@ -944,11 +931,19 @@ void describe('BackgroundTaskRegistry', () => {
       assert.match(task.error ?? '', /Output exceeded cap of 10B/u);
       assert.equal(task.reloadSurvival?.outputCapBytes, 10);
       assert.equal(task.reloadSurvival?.handoffCount, 1);
+      // REVIEW 时序修复:终态发布在 await 关口之后,须等待发布落地再断言内容
+      await waitFor(
+        () => published.filter((entry) => entry.id === task.id).length === 1,
+        'cumulative cap terminal publication',
+      );
       assert.equal(published.filter((entry) => entry.id === task.id).length, 1);
       const logs = await fresh.getTaskLogs(task, 1024, true);
       assert.match(logs.text, /1234567890/u);
       assert.doesNotMatch(logs.text, /123456789012/u);
-      await waitFor(() => task.reloadExecution === undefined, 'cap owner release');
+      await waitFor(
+        () => task.reloadExecution === undefined,
+        'cap owner release',
+      );
     } finally {
       if (fresh !== undefined && freshLease !== undefined) {
         fresh.releaseReloadActivation(freshLease);
@@ -994,7 +989,10 @@ void describe('BackgroundTaskRegistry', () => {
       killGraceMs: 10,
       stopWaitMs: 300,
     });
-    const identity = makeReloadShellIdentity(h.ctx.sessionId ?? '', realpathSync(h.cwd));
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
     const firstClaim = hub.beginActivation(identity, 'startup', 'e'.repeat(32));
     const firstAdapter = await h.registry.stageReloadActivation(firstClaim);
     const firstLease = hub.commitActivation(firstClaim, firstAdapter);
@@ -1031,7 +1029,8 @@ void describe('BackgroundTaskRegistry', () => {
       assert.equal(task.reloadExecution?.child, child);
 
       await fresh.stopTask(task, 'user');
-      assert.equal(task.status, 'killed');
+      // user 发起停止 → cancelled(M2 迁移表)
+      assert.equal(task.status, 'cancelled');
       assert.deepEqual(phases, ['terminate', 'force']);
       assert.equal(softAborted, 1);
       assert.deepEqual(
@@ -1039,7 +1038,10 @@ void describe('BackgroundTaskRegistry', () => {
         [],
         'Windows owner must never fall back to root-only child.kill',
       );
-      await waitFor(() => task.reloadExecution === undefined, 'Windows owner release');
+      await waitFor(
+        () => task.reloadExecution === undefined,
+        'Windows owner release',
+      );
     } finally {
       if (fresh !== undefined && freshLease !== undefined) {
         fresh.releaseReloadActivation(freshLease);
@@ -1063,7 +1065,10 @@ void describe('BackgroundTaskRegistry', () => {
       killGraceMs: 20,
       stopWaitMs: 500,
     });
-    const identity = makeReloadShellIdentity(h.ctx.sessionId ?? '', realpathSync(h.cwd));
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
     const claim = hub.beginActivation(identity, 'startup', 'b'.repeat(32));
     const adapter = await h.registry.stageReloadActivation(claim);
     const lease = hub.commitActivation(claim, adapter);
@@ -1085,13 +1090,23 @@ void describe('BackgroundTaskRegistry', () => {
       const execution = task.reloadExecution;
       assert.ok(execution);
       h.registry.prepareReloadHandoff(lease);
-      await waitFor(() => execution.phase === 'released', 'orphan owner release', 2000);
+      await waitFor(
+        () => execution.phase === 'released',
+        'orphan owner release',
+        2000,
+      );
       assert.equal(task.status, 'failed');
       assert.match(task.error ?? '', /pi_bg_reload_handoff_expired/u);
       assert.equal(task.terminalPublicationState, 'abandoned');
-      assert.equal(task.terminalPublicationAbandonReason, 'reload_handoff_expired');
+      assert.equal(
+        task.terminalPublicationAbandonReason,
+        'reload_handoff_expired',
+      );
       if (pid !== undefined) assert.equal(pidExists(pid), false);
-      assert.deepEqual(inspectReloadShellOwnerForTests(hub, identity).executions, []);
+      assert.deepEqual(
+        inspectReloadShellOwnerForTests(hub, identity).executions,
+        [],
+      );
     } finally {
       if (pid !== undefined && pidExists(pid)) {
         try {
@@ -1110,7 +1125,9 @@ void describe('BackgroundTaskRegistry', () => {
     const logs: string[] = [];
     const hub = createReloadShellOwnerHubForTests({
       handoffTimeoutMs: 20,
-      logger: { error: (...args: unknown[]) => logs.push(args.map(String).join(' ')) },
+      logger: {
+        error: (...args: unknown[]) => logs.push(args.map(String).join(' ')),
+      },
     });
     let child: ReturnType<typeof spawn> | undefined;
     const h = await createHarness({
@@ -1123,9 +1140,15 @@ void describe('BackgroundTaskRegistry', () => {
       },
       killProcess: () => true,
     });
-    const identity = makeReloadShellIdentity(h.ctx.sessionId ?? '', realpathSync(h.cwd));
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
     const claim = hub.beginActivation(identity, 'startup', '4'.repeat(32));
-    const lease = hub.commitActivation(claim, await h.registry.stageReloadActivation(claim));
+    const lease = hub.commitActivation(
+      claim,
+      await h.registry.stageReloadActivation(claim),
+    );
     let replacementLease: ReloadShellActivationLeaseV1 | undefined;
     let passingAssertionsCompleted = false;
     try {
@@ -1153,10 +1176,17 @@ void describe('BackgroundTaskRegistry', () => {
       assert.match(task.error ?? '', /pi_bg_reload_handoff_expired/u);
       assert.equal(execution.phase, 'released');
       assert.equal(execution.child, undefined);
-      assert.deepEqual(inspectReloadShellOwnerForTests(hub, identity).executions, []);
+      assert.deepEqual(
+        inspectReloadShellOwnerForTests(hub, identity).executions,
+        [],
+      );
       assert.match(logs.join('\n'), /reload handoff expiry could not settle/u);
 
-      const replacement = hub.beginActivation(identity, 'startup', '5'.repeat(32));
+      const replacement = hub.beginActivation(
+        identity,
+        'startup',
+        '5'.repeat(32),
+      );
       replacementLease = hub.commitActivation(
         replacement,
         await h.registry.stageReloadActivation(replacement),
@@ -1181,402 +1211,12 @@ void describe('BackgroundTaskRegistry', () => {
           2000,
         ).catch(() => undefined);
       }
-      if (replacementLease !== undefined) h.registry.releaseReloadActivation(replacementLease);
+      if (replacementLease !== undefined)
+        h.registry.releaseReloadActivation(replacementLease);
       h.registry.setShuttingDown(true);
       await cleanup(h.root);
     }
   });
-
-  void it('rejects survival-shaped managed, delegate, and attested registry requests', async () => {
-    const h = await createHarness();
-    const managedCompletion = Promise.resolve();
-    try {
-      await assert.rejects(
-        () =>
-          h.registry.startManagedTask(
-            h.ctx,
-            Object.assign(
-              {
-                id: 'reason-survival-refusal00000000000000',
-                name: 'managed refusal',
-                command: 'fusion_reason',
-                isAgent: true,
-                completion: managedCompletion,
-                cancel() {},
-                notifyOnCompletion: false,
-                triggerOnCompletion: false,
-                fusion: {
-                  runId: 'reason-survival-refusal00000000000000',
-                  workflow: 'reason' as const,
-                  artifactDir: '.pi/fusion/refusal',
-                  artifactDirAbs: join(h.cwd, '.pi', 'fusion', 'refusal'),
-                  state: 'initializing',
-                  usageDelivered: false,
-                },
-              },
-              { surviveReload: true },
-            ),
-          ),
-        /pi_bg_survive_reload_unsupported_task_kind/u,
-      );
-      await assert.rejects(
-        () =>
-          h.registry.startDelegateTask(
-            h.ctx,
-            Object.assign(
-              {
-                name: 'delegate refusal',
-                argv: [],
-                stdinBytes: Buffer.from('seed'),
-                env: {},
-                facts: {
-                  taskId: 'delegate-survival-refusal',
-                  launchNonce: 'f'.repeat(32),
-                  artifactDir: '.pi/delegate/refusal',
-                  artifactDirAbs: join(h.cwd, '.pi', 'delegate', 'refusal'),
-                  seedSha256: '0'.repeat(64),
-                  childSessionId: 'child-refusal',
-                  route: { provider: 'test', model: 'test', qualifiedId: 'test/test' },
-                  budget: Object.create(null),
-                  extensionMode: 'isolated' as const,
-                  autoDeliver: 'never' as const,
-                },
-                notifyOnCompletion: false,
-                triggerOnCompletion: false,
-              },
-              { surviveReload: true },
-            ),
-          ),
-        /pi_bg_survive_reload_unsupported_task_kind/u,
-      );
-      await assert.rejects(
-        () =>
-          h.registry.startAttestedPiTask(
-            h.ctx,
-            Object.assign(
-              {
-                name: 'attested refusal',
-                provider: 'openai-codex',
-                model: 'gpt-test',
-                prompt: 'no launch',
-                reportPath: 'report.md',
-              },
-              { surviveReload: true },
-            ),
-          ),
-        /pi_bg_survive_reload_unsupported_task_kind/u,
-      );
-      assert.equal(h.children.length, 0);
-      assert.deepEqual(await filesBelow(join(h.cwd, '.pi')), []);
-    } finally {
-      h.registry.setShuttingDown(true);
-      await cleanup(h.root);
-    }
-  });
-
-  void it('closes and drains every starter admission before late insertion or spawn', async () => {
-    const h = await createHarness({ modelRegistry: oauthRegistry() });
-    const releaseEnsure = deferred<void>();
-    const allEnteredEnsure = deferred<void>();
-    const managedCompletion = deferred<void>();
-    const originalEnsureRuntimeDir = h.registry.ensureRuntimeDir.bind(h.registry);
-    let ensureEntries = 0;
-    let managedCancels = 0;
-    h.registry.ensureRuntimeDir = async (ctx) => {
-      ensureEntries += 1;
-      if (ensureEntries === 4) allEnteredEnsure.resolve(undefined);
-      await releaseEnsure.promise;
-      return originalEnsureRuntimeDir(ctx);
-    };
-    try {
-      await initCleanGit(h.cwd);
-      const delegateRequest: StartDelegateTaskOptions = Object.assign(Object.create(null), {
-        name: 'admission delegate',
-        argv: [],
-        stdinBytes: Buffer.from('seed', 'utf8'),
-        env: {},
-        facts: {
-          taskId: 'delegate-admission-test',
-          route: { qualifiedId: 'test/delegate-model' },
-        },
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const starts = [
-        h.registry.startTask(h.ctx, 'node ordinary-admission.js', {
-          name: 'ordinary admission',
-          notifyOnCompletion: false,
-        }),
-        h.registry.startManagedTask(h.ctx, {
-          id: 'reason-admissionmanaged0000000000000000',
-          name: 'managed admission',
-          command: 'fusion_reason',
-          isAgent: true,
-          completion: managedCompletion.promise,
-          cancel: () => {
-            managedCancels += 1;
-            managedCompletion.resolve(undefined);
-          },
-          notifyOnCompletion: false,
-          triggerOnCompletion: false,
-          fusion: {
-            runId: 'reason-admissionmanaged0000000000000000',
-            workflow: 'reason',
-            artifactDir: '.pi/fusion/admission-managed',
-            artifactDirAbs: join(h.cwd, '.pi', 'fusion', 'admission-managed'),
-            state: 'initializing',
-            usageDelivered: false,
-          },
-        }),
-        h.registry.startDelegateTask(h.ctx, delegateRequest),
-        h.registry.startAttestedPiTask(h.ctx, {
-          name: 'attested admission',
-          provider: 'openai-codex',
-          model: 'gpt-5.5',
-          prompt: 'write report.md',
-          reportPath: 'report.md',
-        }),
-      ];
-      await allEnteredEnsure.promise;
-
-      h.registry.setShuttingDown(true);
-      const waitForAdmissions = Reflect.get(h.registry, 'waitForTaskAdmissions');
-      const admissionsDrained =
-        typeof waitForAdmissions === 'function'
-          ? Promise.resolve(Reflect.apply(waitForAdmissions, h.registry, []))
-          : Promise.resolve();
-      releaseEnsure.resolve(undefined);
-      const results = await Promise.allSettled(starts);
-      await admissionsDrained;
-
-      assert.deepEqual(
-        results.map((result) => result.status),
-        ['rejected', 'rejected', 'rejected', 'rejected'],
-        'ordinary, managed, delegate, and attested starters must all reject after closure',
-      );
-      assert.equal(h.children.length, 0, 'no starter may spawn after admission closure');
-      assert.equal(h.registry.allTasks().length, 0, 'late preflight must not insert tasks');
-      assert.equal(managedCancels, 1, 'managed preflight cancellation must not leak its workflow');
-    } finally {
-      releaseEnsure.resolve(undefined);
-      managedCompletion.resolve(undefined);
-      h.registry.ensureRuntimeDir = originalEnsureRuntimeDir;
-      h.registry.setShuttingDown(true);
-      for (const { child } of h.children) child.close(null, 'SIGTERM');
-      await cleanup(h.root);
-    }
-  });
-
-  void it('waits for cancelled pre-insertion managed work to settle before releasing admission', async () => {
-    const h = await createHarness();
-    const enteredEnsure = deferred<void>();
-    const releaseEnsure = deferred<void>();
-    const completion = deferred<void>();
-    const originalEnsureRuntimeDir = h.registry.ensureRuntimeDir.bind(h.registry);
-    let cancels = 0;
-    h.registry.ensureRuntimeDir = async (ctx) => {
-      enteredEnsure.resolve(undefined);
-      await releaseEnsure.promise;
-      return originalEnsureRuntimeDir(ctx);
-    };
-    try {
-      const start = h.registry.startManagedTask(h.ctx, {
-        id: 'reason-managedcleanup000000000000000000',
-        name: 'managed cleanup admission',
-        command: 'fusion_reason',
-        isAgent: true,
-        completion: completion.promise,
-        cancel: () => {
-          cancels += 1;
-        },
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-        fusion: {
-          runId: 'reason-managedcleanup000000000000000000',
-          workflow: 'reason',
-          artifactDir: '.pi/fusion/managed-cleanup',
-          artifactDirAbs: join(h.cwd, '.pi', 'fusion', 'managed-cleanup'),
-          state: 'initializing',
-          usageDelivered: false,
-        },
-      });
-      await enteredEnsure.promise;
-
-      h.registry.setShuttingDown(true);
-      const drain = h.registry.waitForTaskAdmissions();
-      releaseEnsure.resolve(undefined);
-      await waitFor(() => cancels === 1, 'managed preflight cancellation');
-      assert.equal(
-        await settlesWithin(drain, 30),
-        false,
-        'admission must remain owned until managed cleanup completion settles',
-      );
-      assert.equal(
-        await settlesWithin(start, 30),
-        false,
-        'starter must remain unsettled until managed cleanup completion settles',
-      );
-
-      completion.resolve(undefined);
-      await assert.rejects(start, /admission|closed/i);
-      await drain;
-      assert.equal(h.registry.allTasks().length, 0);
-      assert.equal(h.children.length, 0);
-    } finally {
-      releaseEnsure.resolve(undefined);
-      completion.resolve(undefined);
-      h.registry.ensureRuntimeDir = originalEnsureRuntimeDir;
-      h.registry.setShuttingDown(true);
-      await cleanup(h.root);
-    }
-  });
-
-  void it('enforces the admission-owned deadline while Git is running', async () => {
-    if (process.platform === 'win32') return;
-    const gitChild = new FakeChild(9101);
-    const gitSignals: NodeJS.Signals[] = [];
-    let gitSpawns = 0;
-    const h = await createHarness({
-      modelRegistry: oauthRegistry(),
-      taskAdmissionTimeoutMs: 20,
-      attestedGitKillGraceMs: 5,
-      attestedGitSpawn: (_command, _args, options) => {
-        gitSpawns += 1;
-        assert.equal(options.detached, process.platform !== 'win32');
-        return gitChild;
-      },
-      killProcess: (_pid, signal) => {
-        if (typeof signal === 'string') gitSignals.push(signal);
-        if (signal === 'SIGKILL') queueMicrotask(() => gitChild.close(null, 'SIGKILL'));
-        return true;
-      },
-    });
-    try {
-      const start = h.registry.startAttestedPiTask(h.ctx, {
-        name: 'deadline Git admission',
-        provider: 'openai-codex',
-        model: 'gpt-5.5',
-        prompt: 'write report.md',
-        reportPath: 'report.md',
-      });
-      await assert.rejects(start, (error: unknown) => {
-        if (typeof error !== 'object' || error === null) return false;
-        const code = Reflect.get(error, 'code');
-        return code === 'pi_background_tasks_admission_timeout' || code === 'attested_git_timeout';
-      });
-      await h.registry.waitForTaskAdmissions();
-      assert.equal(gitSpawns, 1);
-      assert.deepEqual(gitSignals, ['SIGTERM', 'SIGKILL']);
-      assert.equal(h.registry.allTasks().length, 0);
-      assert.equal(h.children.length, 0, 'deadline preflight must not spawn Pi');
-      assert.deepEqual(await filesBelow(join(h.cwd, '.pi', 'tasks')), []);
-    } finally {
-      h.registry.setShuttingDown(true);
-      await cleanup(h.root);
-    }
-  });
-
-  void it(
-    'cancels and reaps a real hanging attested Git preflight tree before admission drain',
-    { timeout: 5000 },
-    async () => {
-      if (process.platform === 'win32') return;
-      const h = await createHarness({
-        modelRegistry: oauthRegistry(),
-        taskAdmissionTimeoutMs: 2000,
-        attestedGitKillGraceMs: 25,
-      });
-      const bin = join(h.root, 'bin');
-      const gitPidPath = join(h.root, 'git.pid');
-      const descendantPidPath = join(h.root, 'git-descendant.pid');
-      await mkdir(bin, { recursive: true });
-      const fakeGit = join(bin, 'git');
-      await writeFile(
-        fakeGit,
-        `#!/usr/bin/env node
-const { spawn } = require('node:child_process');
-const { writeFileSync } = require('node:fs');
-writeFileSync(process.env.PI_BG_TEST_GIT_PID_FILE, String(process.pid));
-const child = spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
-writeFileSync(process.env.PI_BG_TEST_GIT_DESCENDANT_PID_FILE, String(child.pid));
-setInterval(() => {}, 1000);
-`,
-        'utf8',
-      );
-      await chmod(fakeGit, 0o755);
-
-      const oldPath = process.env['PATH'];
-      const oldGitPidPath = process.env['PI_BG_TEST_GIT_PID_FILE'];
-      const oldDescendantPidPath = process.env['PI_BG_TEST_GIT_DESCENDANT_PID_FILE'];
-      process.env['PATH'] = `${bin}:${oldPath ?? ''}`;
-      process.env['PI_BG_TEST_GIT_PID_FILE'] = gitPidPath;
-      process.env['PI_BG_TEST_GIT_DESCENDANT_PID_FILE'] = descendantPidPath;
-      let gitPid: number | undefined;
-      let descendantPid: number | undefined;
-      let assertionsComplete = false;
-      try {
-        const start = h.registry.startAttestedPiTask(h.ctx, {
-          name: 'real hanging Git admission',
-          provider: 'openai-codex',
-          model: 'gpt-5.5',
-          prompt: 'write report.md',
-          reportPath: 'report.md',
-        });
-        await waitFor(
-          () => existsSync(gitPidPath) && existsSync(descendantPidPath),
-          'fake Git process tree pid files',
-          1500,
-        );
-        gitPid = Number((await readFile(gitPidPath, 'utf8')).trim());
-        descendantPid = Number((await readFile(descendantPidPath, 'utf8')).trim());
-        assert.ok(Number.isSafeInteger(gitPid) && gitPid > 0);
-        assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 0);
-
-        const shutdownStarted = Date.now();
-        h.registry.setShuttingDown(true);
-        const drain = h.registry.waitForTaskAdmissions();
-        const [startResult] = await withTimeout(
-          Promise.all([Promise.allSettled([start]), drain]),
-          1500,
-          'attested start/admission drain exceeded 1500ms',
-        );
-        assert.equal(startResult[0]?.status, 'rejected');
-        assert.ok(Date.now() - shutdownStarted < 1500);
-        await waitForPidExit(gitPid, 'fake Git root');
-        await waitForPidExit(descendantPid, 'fake Git descendant');
-        assert.equal(h.registry.allTasks().length, 0, 'preflight must not register a task');
-        assert.equal(h.children.length, 0, 'preflight must not spawn Pi');
-        assert.deepEqual(
-          await filesBelow(join(h.cwd, '.pi', 'tasks')),
-          [],
-          'cancelled preflight must leave no task artifacts',
-        );
-        assertionsComplete = true;
-      } finally {
-        // Rescue is failure-only. A passing regression must prove production
-        // cancellation reaped both processes without help from the test.
-        if (!assertionsComplete) {
-          for (const pid of [descendantPid, gitPid]) {
-            if (pid === undefined || !pidExists(pid)) continue;
-            try {
-              process.kill(pid, 'SIGKILL');
-            } catch {
-              // Already exited.
-            }
-          }
-        }
-        if (oldPath === undefined) delete process.env['PATH'];
-        else process.env['PATH'] = oldPath;
-        if (oldGitPidPath === undefined) delete process.env['PI_BG_TEST_GIT_PID_FILE'];
-        else process.env['PI_BG_TEST_GIT_PID_FILE'] = oldGitPidPath;
-        if (oldDescendantPidPath === undefined)
-          delete process.env['PI_BG_TEST_GIT_DESCENDANT_PID_FILE'];
-        else process.env['PI_BG_TEST_GIT_DESCENDANT_PID_FILE'] = oldDescendantPidPath;
-        h.registry.setShuttingDown(true);
-        await cleanup(h.root);
-      }
-    },
-  );
 
   void it('preserves full shell command bytes except surrounding whitespace', async () => {
     const h = await createHarness({ platform: 'linux' });
@@ -1590,7 +1230,10 @@ setInterval(() => {}, 1000);
       const spawn = lastSpawn(h);
       assert.equal(task.command, command);
       assert.equal(spawn.args.at(-1), command);
-      assert.equal(JSON.parse(readFileSync(task.metadataAbsPath, 'utf8')).command, command);
+      assert.equal(
+        JSON.parse(readFileSync(task.metadataAbsPath, 'utf8')).command,
+        command,
+      );
     } finally {
       await cleanup(h.root);
     }
@@ -1630,17 +1273,29 @@ setInterval(() => {}, 1000);
       );
       const wrapperSource = await readFile(wrapperPath, 'utf8');
       assert.match(wrapperSource, /const launch = /);
-      assert.match(wrapperSource, /spawn\(launch\.executable, childArgs, \{[^}]*shell: false/);
+      assert.match(
+        wrapperSource,
+        /spawn\(launch\.executable, childArgs, \{[^}]*shell: false/,
+      );
       assert.doesNotMatch(wrapperSource, /spawn\("pi"/);
       assert.doesNotThrow(
-        () => new Function('require', 'process', wrapperSource.replace(/^#!.*\n/, '')),
+        () =>
+          new Function(
+            'require',
+            'process',
+            wrapperSource.replace(/^#!.*\n/, ''),
+          ),
       );
 
-      const pathQualifiedPi = await h.registry.startTask(h.ctx, '/usr/local/bin/pi -p hello', {
-        name: 'Path Pi',
-        isAgent: true,
-        notifyOnCompletion: false,
-      });
+      const pathQualifiedPi = await h.registry.startTask(
+        h.ctx,
+        '/usr/local/bin/pi -p hello',
+        {
+          name: 'Path Pi',
+          isAgent: true,
+          notifyOnCompletion: false,
+        },
+      );
       assert.equal(pathQualifiedPi.isAgent, true);
       assert.doesNotMatch(lastSpawn(h).args.join('\n'), /pi-telemetry-wrapper/);
     } finally {
@@ -1656,7 +1311,10 @@ setInterval(() => {}, 1000);
         isAgent: true,
         notifyOnCompletion: false,
       });
-      assert.doesNotMatch(lastSpawn(disabled).args.join('\n'), /pi-telemetry-wrapper/);
+      assert.doesNotMatch(
+        lastSpawn(disabled).args.join('\n'),
+        /pi-telemetry-wrapper/,
+      );
     } finally {
       await cleanup(disabled.root);
     }
@@ -1681,7 +1339,10 @@ setInterval(() => {}, 1000);
       assert.equal(spawn.options.shell, undefined);
       assert.equal(spawn.options.windowsVerbatimArguments, true);
       assert.equal(task.telemetryWrapped, undefined);
-      assert.equal(task.telemetryUnavailableReason, WIN32_CMD_PI_TELEMETRY_UNAVAILABLE_REASON);
+      assert.equal(
+        task.telemetryUnavailableReason,
+        WIN32_CMD_PI_TELEMETRY_UNAVAILABLE_REASON,
+      );
       const files = await readdir(dirname(task.outputAbsPath));
       assert.equal(
         files.some((file) => file.includes('pi-telemetry-wrapper')),
@@ -1696,7 +1357,10 @@ setInterval(() => {}, 1000);
         WIN32_CMD_PI_TELEMETRY_UNAVAILABLE_REASON,
       );
       spawn.child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'cmd telemetry task completion');
+      await waitFor(
+        () => task.status === 'completed',
+        'cmd telemetry task completion',
+      );
       assert.equal(await readFile(task.outputAbsPath, 'utf8'), '');
     } finally {
       await cleanup(h.root);
@@ -1704,10 +1368,16 @@ setInterval(() => {}, 1000);
   });
 
   void it('rejects unresolved Windows bash before creating a task', async () => {
-    const h = await createHarness({ platform: 'win32', env: { PI_BG_SHELL: 'bash', PATH: '' } });
+    const h = await createHarness({
+      platform: 'win32',
+      env: { PI_BG_SHELL: 'bash', PATH: '' },
+    });
     try {
       await assert.rejects(
-        h.registry.startTask(h.ctx, 'echo ok', { name: 'Bad Bash', notifyOnCompletion: false }),
+        h.registry.startTask(h.ctx, 'echo ok', {
+          name: 'Bad Bash',
+          notifyOnCompletion: false,
+        }),
         /could not resolve bash/,
       );
       assert.equal(h.children.length, 0);
@@ -1758,7 +1428,10 @@ setInterval(() => {}, 1000);
       const releaseMetadata = deferred<void>();
       const terminalSnapshots: BgTaskSnapshot[] = [];
       const notifications: CompletionNotificationMessage[] = [];
-      const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
+      const killCalls: Array<{
+        pid: number;
+        signal?: NodeJS.Signals | number;
+      }> = [];
       const registry = new BackgroundTaskRegistry({
         killGraceMs: 250,
         stopWaitMs: 800,
@@ -1769,12 +1442,14 @@ setInterval(() => {}, 1000);
           PI_BG_TREE_DESCENDANT_SCRIPT: descendantScript,
         },
         killProcess: (pid, signal) => {
-          const call: { pid: number; signal?: NodeJS.Signals | number } = { pid };
+          const call: { pid: number; signal?: NodeJS.Signals | number } = {
+            pid,
+          };
           if (signal !== undefined) call.signal = signal;
           killCalls.push(call);
           return process.kill(pid, signal);
         },
-        publishTerminal: (task) => terminalSnapshots.push(task),
+        publishTerminal: (publication) => terminalSnapshots.push(publication.task),
         sendCompletionNotification: (message) => notifications.push(message),
       });
       const ctx: BackgroundTaskContext = {
@@ -1789,7 +1464,11 @@ setInterval(() => {}, 1000);
       Reflect.set(
         registry,
         'writeMetadata',
-        async function (this: BackgroundTaskRegistry, task: BgTask, signal?: AbortSignal) {
+        async function (
+          this: BackgroundTaskRegistry,
+          task: BgTask,
+          signal?: AbortSignal,
+        ) {
           metadataCalls += 1;
           if (metadataCalls === 1) {
             enteredMetadata.resolve(undefined);
@@ -1816,19 +1495,36 @@ setInterval(() => {}, 1000);
           1500,
         );
         rootPid = Number((await readFile(rootPidPath, 'utf8')).trim());
-        descendantPid = Number((await readFile(descendantPidPath, 'utf8')).trim());
+        descendantPid = Number(
+          (await readFile(descendantPidPath, 'utf8')).trim(),
+        );
         assert.ok(Number.isSafeInteger(rootPid) && rootPid > 0);
         assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 0);
-        assert.equal(pgidFor(descendantPid), rootPid, 'descendant must remain in the owned group');
+        assert.equal(
+          pgidFor(descendantPid),
+          rootPid,
+          'descendant must remain in the owned group',
+        );
 
         registry.setShuttingDown(true);
         const drain = registry.waitForTaskAdmissions();
         await waitForPidExit(rootPid, 'inserted task leader', 750);
         const task = registry.allTasks()[0];
         assert.ok(task, 'inserted task must remain registry-owned');
-        assert.equal(pidExists(descendantPid), true, 'fixture descendant must survive group TERM');
-        assert.equal(task.status, 'running', 'leader close cannot publish terminal tree cleanup');
-        assert.ok(task.killEscalationTimer, 'leader close must retain the force owner');
+        assert.equal(
+          pidExists(descendantPid),
+          true,
+          'fixture descendant must survive group TERM',
+        );
+        assert.equal(
+          task.status,
+          'running',
+          'leader close cannot publish terminal tree cleanup',
+        );
+        assert.ok(
+          task.killEscalationTimer,
+          'leader close must retain the force owner',
+        );
         assert.equal(terminalSnapshots.length, 0);
         assert.equal(notifications.length, 0);
 
@@ -1848,14 +1544,26 @@ setInterval(() => {}, 1000);
         assert.equal(pidExists(rootPid), false);
         assert.equal(pidExists(descendantPid), false);
         assert.equal(task.status, 'killed');
-        assert.equal(task.killEscalationTimer, undefined, 'tree owner must disarm after ESRCH');
+        assert.equal(
+          task.killEscalationTimer,
+          undefined,
+          'tree owner must disarm after ESRCH',
+        );
         assert.equal(
           killCalls.filter((call) => call.signal === 'SIGKILL').length,
           1,
           'the owned process group must receive exactly one force signal',
         );
-        assert.equal(terminalSnapshots.length, 0, 'shutdown publication remains suppressed');
-        assert.equal(notifications.length, 0, 'shutdown notification remains suppressed');
+        assert.equal(
+          terminalSnapshots.length,
+          0,
+          'shutdown publication remains suppressed',
+        );
+        assert.equal(
+          notifications.length,
+          0,
+          'shutdown notification remains suppressed',
+        );
         assertionsComplete = true;
       } finally {
         releaseMetadata.resolve(undefined);
@@ -1870,7 +1578,11 @@ setInterval(() => {}, 1000);
             // The owned process group may already be gone.
           }
         }
-        if (!assertionsComplete && descendantPid !== undefined && pidExists(descendantPid)) {
+        if (
+          !assertionsComplete &&
+          descendantPid !== undefined &&
+          pidExists(descendantPid)
+        ) {
           try {
             process.kill(descendantPid, 'SIGKILL');
           } catch {
@@ -1878,16 +1590,26 @@ setInterval(() => {}, 1000);
           }
         }
         if (descendantPid !== undefined && pidExists(descendantPid)) {
-          await waitForPidExit(descendantPid, 'failure-only rescued descendant', 1500);
+          await waitForPidExit(
+            descendantPid,
+            'failure-only rescued descendant',
+            1500,
+          );
         }
         const cleanupTask = registry.allTasks()[0];
         if (cleanupTask?.status === 'running') {
           await registry
-            .stopAllRunning('shutdown', 'Failure-only process-tree test cleanup')
+            .stopAllRunning(
+              'shutdown',
+              'Failure-only process-tree test cleanup',
+            )
             .catch(() => undefined);
         }
         if (cleanupTask !== undefined) {
-          await waitFor(() => cleanupTask.status !== 'running', 'process-tree test finalization');
+          await waitFor(
+            () => cleanupTask.status !== 'running',
+            'process-tree test finalization',
+          );
           await cleanupTask.metadataWriteChain?.catch(() => undefined);
         }
         await cleanup(root);
@@ -1925,8 +1647,16 @@ setInterval(() => {}, 1000);
     Reflect.set(
       h.registry,
       'spawn',
-      (command: string, args: string[], options: Parameters<BackgroundTaskSpawn>[2]) => {
-        const child = Reflect.apply(originalSpawn, h.registry, [command, args, options]);
+      (
+        command: string,
+        args: string[],
+        options: Parameters<BackgroundTaskSpawn>[2],
+      ) => {
+        const child = Reflect.apply(originalSpawn, h.registry, [
+          command,
+          args,
+          options,
+        ]);
         h.registry.setShuttingDown(true);
         return child;
       },
@@ -1942,7 +1672,10 @@ setInterval(() => {}, 1000);
       await h.registry.waitForTaskAdmissions();
       const task = h.registry.allTasks()[0];
       assert.ok(task, 'spawned task must remain registry-owned');
-      await waitFor(() => task.status === 'killed', 'reentrant admission close finalization');
+      await waitFor(
+        () => task.status === 'killed',
+        'reentrant admission close finalization',
+      );
       assert.equal(signals.filter((signal) => signal === 'SIGTERM').length, 1);
       assert.equal(signals.filter((signal) => signal === 'SIGKILL').length, 0);
       assert.ok(signals.some((signal) => signal === 0));
@@ -1963,7 +1696,7 @@ setInterval(() => {}, 1000);
       platform: 'linux',
       killGraceMs: 25,
       stopWaitMs: 300,
-      publishTerminal: (task) => terminals.push(task),
+      publishTerminal: (publication) => terminals.push(publication.task),
       killProcess: (_pid, signal) => {
         signals.push(signal);
         if (signal === 0) {
@@ -1993,7 +1726,11 @@ setInterval(() => {}, 1000);
         h.registry.stopTask(task, 'user'),
       ];
       assert.equal(task.status, 'running');
-      assert.equal(terminals.length, 0, 'direct close must not publish before group force');
+      assert.equal(
+        terminals.length,
+        0,
+        'direct close must not publish before group force',
+      );
       await Promise.all(stops);
       assert.equal(signals.filter((signal) => signal === 'SIGTERM').length, 1);
       assert.equal(signals.filter((signal) => signal === 'SIGKILL').length, 1);
@@ -2001,10 +1738,10 @@ setInterval(() => {}, 1000);
         signals.some((signal) => signal === 0),
         'group disappearance must be observed',
       );
-      assert.equal(task.status, 'killed');
+      assert.equal(task.status, 'cancelled');
       assert.equal(task.killEscalationTimer, undefined);
       assert.equal(terminals.length, 1);
-      assert.equal(terminals[0]?.status, 'killed');
+      assert.equal(terminals[0]?.status, 'cancelled');
       assert.equal(h.notifications.length, 1);
     } finally {
       groupAlive = false;
@@ -2023,7 +1760,10 @@ setInterval(() => {}, 1000);
       },
     });
     try {
-      const { task, child } = await startFakeTask(h, 'POSIX Natural Close Race');
+      const { task, child } = await startFakeTask(
+        h,
+        'POSIX Natural Close Race',
+      );
       child.close(0, null);
       const stopped = await h.registry.stopTask(task, 'shutdown');
       assert.equal(stopped, task);
@@ -2066,7 +1806,7 @@ setInterval(() => {}, 1000);
       await h.registry.stopTask(task, 'user');
       assert.equal(signals.filter((signal) => signal === 'SIGKILL').length, 0);
       assert.ok(signals.some((signal) => signal === 0));
-      assert.equal(task.status, 'killed');
+      assert.equal(task.status, 'cancelled');
       assert.equal(task.killEscalationTimer, undefined);
       await new Promise((resolve) => setTimeout(resolve, 75));
       assert.equal(signals.filter((signal) => signal === 'SIGKILL').length, 0);
@@ -2084,7 +1824,7 @@ setInterval(() => {}, 1000);
       platform: 'linux',
       killGraceMs: 20,
       stopWaitMs: 250,
-      publishTerminal: (task) => terminals.push(task),
+      publishTerminal: (publication) => terminals.push(publication.task),
       killProcess: (_pid, signal) => {
         if (signal === 0) return groupAlive;
         if (signal === 'SIGTERM') {
@@ -2105,122 +1845,18 @@ setInterval(() => {}, 1000);
         h.registry.stopTask(task, 'user'),
         /SIGKILL[\s\S]*force denied[\s\S]*Descendant processes may have leaked/i,
       );
-      await waitFor(() => task.status === 'failed', 'loud POSIX force-failure finalization');
+      await waitFor(
+        () => task.status === 'failed',
+        'loud POSIX force-failure finalization',
+      );
       assert.match(task.error ?? '', /Descendant processes may have leaked/i);
       assert.equal(task.killEscalationTimer, undefined);
-      assert.equal(terminals.length, 1);
+      // REVIEW 时序修复:终态发布在 await 关口之后,须等待发布落地再断言内容
+      await waitFor(
+        () => terminals.length === 1,
+        'POSIX force-failure terminal publication',
+      );
       assert.equal(terminals[0]?.status, 'failed');
-    } finally {
-      groupAlive = false;
-      await cleanup(h.root);
-    }
-  });
-
-  void it('applies the POSIX group barrier to direct delegate finalization', async () => {
-    let childRef: FakeChild | undefined;
-    let groupAlive = true;
-    const signals: Array<NodeJS.Signals | number | undefined> = [];
-    const h = await createHarness({
-      platform: 'linux',
-      killGraceMs: 20,
-      stopWaitMs: 250,
-      killProcess: (_pid, signal) => {
-        signals.push(signal);
-        if (signal === 0) {
-          if (groupAlive) return true;
-          throw errnoError('ESRCH', 'owned group is gone');
-        }
-        if (signal === 'SIGTERM') {
-          childRef?.close(null, 'SIGTERM');
-          return true;
-        }
-        if (signal === 'SIGKILL') {
-          groupAlive = false;
-          return true;
-        }
-        return true;
-      },
-      childFactory: (pid) => {
-        childRef = Object.assign(new FakeChild(pid), {
-          stdin: {
-            once: () => undefined,
-            write: (_data: Buffer, callback: (error?: Error | null) => void) => {
-              callback();
-              return true;
-            },
-            end: () => undefined,
-          },
-        });
-        return childRef;
-      },
-    });
-    try {
-      const request: StartDelegateTaskOptions = Object.assign(Object.create(null), {
-        name: 'delegate process-tree barrier',
-        argv: [],
-        stdinBytes: Buffer.from('seed', 'utf8'),
-        env: {},
-        facts: {
-          taskId: 'delegate-process-tree-barrier',
-          route: { qualifiedId: 'test/delegate-model' },
-        },
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-      });
-      const task = await h.registry.startDelegateTask(h.ctx, request);
-      await h.registry.stopTask(task, 'user');
-      assert.equal(signals.filter((signal) => signal === 'SIGKILL').length, 1);
-      assert.equal(task.status, 'killed');
-      assert.equal(task.killEscalationTimer, undefined);
-    } finally {
-      groupAlive = false;
-      await cleanup(h.root);
-    }
-  });
-
-  void it('applies the POSIX group barrier to direct attested finalization', async () => {
-    let childRef: FakeChild | undefined;
-    let groupAlive = true;
-    const signals: Array<NodeJS.Signals | number | undefined> = [];
-    const h = await createHarness({
-      platform: 'linux',
-      modelRegistry: oauthRegistry(),
-      killGraceMs: 20,
-      stopWaitMs: 300,
-      killProcess: (_pid, signal) => {
-        signals.push(signal);
-        if (signal === 0) {
-          if (groupAlive) return true;
-          throw errnoError('ESRCH', 'owned group is gone');
-        }
-        if (signal === 'SIGTERM') {
-          childRef?.close(null, 'SIGTERM');
-          return true;
-        }
-        if (signal === 'SIGKILL') {
-          groupAlive = false;
-          return true;
-        }
-        return true;
-      },
-      childFactory: (pid) => {
-        childRef = new FakeChild(pid);
-        return childRef;
-      },
-    });
-    try {
-      await initCleanGit(h.cwd);
-      const task = await h.registry.startAttestedPiTask(h.ctx, {
-        name: 'attested process-tree barrier',
-        provider: 'openai-codex',
-        model: 'gpt-5.5',
-        prompt: 'write report.md',
-        reportPath: 'report.md',
-      });
-      await h.registry.stopTask(task, 'user');
-      assert.equal(signals.filter((signal) => signal === 'SIGKILL').length, 1);
-      assert.equal(task.status, 'killed');
-      assert.equal(task.killEscalationTimer, undefined);
     } finally {
       groupAlive = false;
       await cleanup(h.root);
@@ -2230,7 +1866,8 @@ setInterval(() => {}, 1000);
   void it('uses POSIX process-group kill before child fallback', async () => {
     let childRef: FakeChild | undefined;
     let groupAlive = true;
-    const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
+    const killCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> =
+      [];
     const h = await createHarness({
       platform: 'darwin',
       killProcess: (pid, signal) => {
@@ -2256,13 +1893,439 @@ setInterval(() => {}, 1000);
       const { task, child } = await startFakeTask(h);
       task.pid = child.pid + 99_999;
       await h.registry.stopTask(task, 'user');
-      assert.equal(killCalls[0]?.pid, -child.pid, 'signals must use spawn-captured ownership');
+      assert.equal(
+        killCalls[0]?.pid,
+        -child.pid,
+        'signals must use spawn-captured ownership',
+      );
       assert.equal(killCalls[0]?.signal, 'SIGTERM');
-      assert.equal(killCalls.filter((call) => call.signal === 'SIGKILL').length, 0);
+      assert.equal(
+        killCalls.filter((call) => call.signal === 'SIGKILL').length,
+        0,
+      );
       assert.ok(killCalls.some((call) => call.signal === 0));
       assert.deepEqual(child.killCalls, []);
-      assert.equal(task.status, 'killed');
+      assert.equal(task.status, 'cancelled');
     } finally {
+      groupAlive = false;
+      await cleanup(h.root);
+    }
+  });
+
+  void it('runs ps descendant collection between POSIX TERM and the grace force and kills collected descendants after the group SIGKILL', async () => {
+    let childRef: FakeChild | undefined;
+    let groupAlive = true;
+    const ordered: string[] = [];
+    const h = await createHarness({
+      platform: 'linux',
+      killGraceMs: 40,
+      stopWaitMs: 400,
+      killProcess: (pid, signal) => {
+        ordered.push(
+          `kill:${String(pid)}:${signal === undefined ? '0' : String(signal)}`,
+        );
+        if (signal === 0) {
+          if (groupAlive) return true;
+          throw errnoError('ESRCH', 'owned group is gone');
+        }
+        if (signal === 'SIGTERM') {
+          childRef?.close(null, 'SIGTERM');
+          return true;
+        }
+        if (signal === 'SIGKILL' && pid < 0) {
+          groupAlive = false;
+          return true;
+        }
+        return true;
+      },
+      collectPosixDescendantPids: (rootPid) => {
+        ordered.push(`collect:${String(rootPid)}`);
+        return Promise.resolve(new Set([5101, 5102]));
+      },
+      childFactory: (pid) => {
+        childRef = new FakeChild(pid);
+        return childRef;
+      },
+    });
+    try {
+      const { task, child } = await startFakeTask(h, 'POSIX Descendant Net');
+      await h.registry.stopTask(task, 'user');
+      assert.equal(
+        ordered[0],
+        `kill:${String(-child.pid)}:SIGTERM`,
+        'group SIGTERM must come first',
+      );
+      const collectIndex = ordered.findIndex((entry) =>
+        entry.startsWith('collect:'),
+      );
+      assert.ok(collectIndex >= 0, 'descendant collection must run between TERM and force');
+      assert.equal(
+        ordered[collectIndex],
+        `collect:${String(child.pid)}`,
+        'collection must target the spawn-captured group id',
+      );
+      const groupKillIndex = ordered.findIndex(
+        (entry) => entry === `kill:${String(-child.pid)}:SIGKILL`,
+      );
+      assert.ok(
+        groupKillIndex > collectIndex,
+        'group SIGKILL must follow the collection window',
+      );
+      for (const descendant of [5101, 5102]) {
+        const descendantIndex = ordered.indexOf(
+          `kill:${String(descendant)}:SIGKILL`,
+        );
+        assert.ok(
+          descendantIndex > groupKillIndex,
+          `descendant ${String(descendant)} SIGKILL must follow the group SIGKILL`,
+        );
+      }
+      assert.ok(
+        ordered.some((entry) => entry === `kill:${String(-child.pid)}:0`),
+        'group disappearance must still be observed',
+      );
+      assert.equal(task.status, 'cancelled');
+      assert.equal(task.killEscalationTimer, undefined);
+    } finally {
+      groupAlive = false;
+      await cleanup(h.root);
+    }
+  });
+
+  void it('degrades to the group signal when POSIX descendant collection fails', async () => {
+    let childRef: FakeChild | undefined;
+    let groupAlive = true;
+    const ordered: string[] = [];
+    const h = await createHarness({
+      platform: 'linux',
+      killGraceMs: 40,
+      stopWaitMs: 400,
+      killProcess: (pid, signal) => {
+        ordered.push(
+          `kill:${String(pid)}:${signal === undefined ? '0' : String(signal)}`,
+        );
+        if (signal === 0) {
+          if (groupAlive) return true;
+          throw errnoError('ESRCH', 'owned group is gone');
+        }
+        if (signal === 'SIGTERM') {
+          childRef?.close(null, 'SIGTERM');
+          return true;
+        }
+        if (signal === 'SIGKILL' && pid < 0) {
+          groupAlive = false;
+          return true;
+        }
+        return true;
+      },
+      collectPosixDescendantPids: () =>
+        Promise.reject(new Error('ps unavailable')),
+      childFactory: (pid) => {
+        childRef = new FakeChild(pid);
+        return childRef;
+      },
+    });
+    try {
+      const { task, child } = await startFakeTask(h, 'POSIX Degraded Net');
+      await h.registry.stopTask(task, 'user');
+      assert.ok(
+        ordered.every(
+          (entry) =>
+            !entry.startsWith('collect:') &&
+            !entry.startsWith(`kill:${String(child.pid)}`),
+        ),
+        'failed collection must not produce per-descendant signals',
+      );
+      assert.equal(
+        ordered.filter((entry) => entry.endsWith(':SIGKILL')).length,
+        1,
+        'exactly the one group SIGKILL must remain',
+      );
+      assert.equal(task.status, 'cancelled');
+    } finally {
+      groupAlive = false;
+      await cleanup(h.root);
+    }
+  });
+
+  void it('does not individually signal collected descendants when the group disappears before the grace force', async () => {
+    let childRef: FakeChild | undefined;
+    let groupAlive = true;
+    const ordered: string[] = [];
+    const h = await createHarness({
+      platform: 'linux',
+      killGraceMs: 30,
+      stopWaitMs: 300,
+      killProcess: (pid, signal) => {
+        ordered.push(
+          `kill:${String(pid)}:${signal === undefined ? '0' : String(signal)}`,
+        );
+        if (signal === 0) {
+          if (groupAlive) return true;
+          throw errnoError('ESRCH', 'owned group is gone');
+        }
+        if (signal === 'SIGTERM') {
+          groupAlive = false;
+          childRef?.close(null, 'SIGTERM');
+          return true;
+        }
+        return true;
+      },
+      collectPosixDescendantPids: (rootPid) => {
+        ordered.push(`collect:${String(rootPid)}`);
+        return Promise.resolve(new Set([5201]));
+      },
+      childFactory: (pid) => {
+        childRef = new FakeChild(pid);
+        return childRef;
+      },
+    });
+    try {
+      const { task, child } = await startFakeTask(h, 'POSIX Gone Before Force');
+      await h.registry.stopTask(task, 'user');
+      assert.equal(
+        ordered.filter((entry) => entry.endsWith(':SIGKILL')).length,
+        0,
+        'no force phase must run when the group is already gone',
+      );
+      assert.ok(
+        ordered.some((entry) => entry === `kill:${String(-child.pid)}:0`),
+        'group disappearance must be observed through signal-0',
+      );
+      assert.equal(task.status, 'cancelled');
+      assert.equal(task.killEscalationTimer, undefined);
+    } finally {
+      groupAlive = false;
+      await cleanup(h.root);
+    }
+  });
+
+  void it('records POSIX descendant kill failures without failing the group disappearance proof', async () => {
+    let childRef: FakeChild | undefined;
+    let groupAlive = true;
+    const h = await createHarness({
+      platform: 'linux',
+      killGraceMs: 40,
+      stopWaitMs: 400,
+      killProcess: (pid, signal) => {
+        if (signal === 0) {
+          if (groupAlive) return true;
+          throw errnoError('ESRCH', 'owned group is gone');
+        }
+        if (signal === 'SIGTERM') {
+          childRef?.close(null, 'SIGTERM');
+          return true;
+        }
+        if (pid === 5302) throw errnoError('EACCES', 'descendant denied');
+        if (pid < 0) {
+          groupAlive = false;
+          return true;
+        }
+        return true;
+      },
+      collectPosixDescendantPids: async () => new Set([5301, 5302]),
+      childFactory: (pid) => {
+        childRef = new FakeChild(pid);
+        return childRef;
+      },
+    });
+    try {
+      const { task } = await startFakeTask(h, 'POSIX Descendant Failure');
+      await h.registry.stopTask(task, 'user');
+      assert.equal(task.status, 'cancelled');
+      assert.match(
+        task.error ?? '',
+        /POSIX descendant SIGKILL failed[\s\S]*pid 5302[\s\S]*Descendant processes may have leaked/i,
+      );
+    } finally {
+      groupAlive = false;
+      await cleanup(h.root);
+    }
+  });
+
+  void it('releases the plugin-held output sources when the POSIX stop window expires with the group still alive', async () => {
+    let destroyedSources = 0;
+    const h = await createHarness({
+      platform: 'linux',
+      killGraceMs: 20,
+      stopWaitMs: 100,
+      killProcess: () => {
+        // 组与后代探测永久存活:TERM/SIGKILL 送达但组不消失,证明性失败在
+        // 所有权 deadline 内触发,子进程永不 close。
+        return true;
+      },
+      collectPosixDescendantPids: async () => new Set(),
+      childFactory: (pid) => {
+        const child = new FakeChild(pid);
+        const stdout = child.stdout as EventEmitter & {
+          destroy?: () => void;
+        };
+        stdout.destroy = () => {
+          destroyedSources += 1;
+        };
+        const stderr = child.stderr as EventEmitter & {
+          destroy?: () => void;
+        };
+        stderr.destroy = () => {
+          destroyedSources += 1;
+        };
+        return child;
+      },
+    });
+    try {
+      const { task } = await startFakeTask(h, 'POSIX Force-Exit Release');
+      await assert.rejects(
+        h.registry.stopTask(task, 'user'),
+        /Descendant processes may have leaked/i,
+      );
+      assert.equal(
+        destroyedSources,
+        2,
+        'child stdout/stderr read ends must be destroyed',
+      );
+      assert.equal(
+        task.stream?.destroyed,
+        true,
+        'output stream must be destroyed',
+      );
+      assert.equal(task.status, 'running');
+    } finally {
+      await cleanup(h.root);
+    }
+  });
+
+  void it('destroys survivor output read ends and reports loudly when the reload stop wait expires with the group alive', async () => {
+    if (process.platform === 'win32') return;
+    let destroyedSources = 0;
+    const hub = createReloadShellOwnerHubForTests({ handoffTimeoutMs: 2000 });
+    const h = await createHarness({
+      platform: 'linux',
+      reloadShellOwner: hub,
+      killGraceMs: 20,
+      stopWaitMs: 100,
+      // 组与后代探测永久存活:TERM/SIGKILL 送达但组不消失,证明性失败在所有权
+      // deadline 内触发,子进程永不 close(requestStop 以 stopWait 超时 reject)。
+      killProcess: () => true,
+      collectPosixDescendantPids: async () => new Set(),
+      childFactory: (pid) => {
+        const child = new FakeChild(pid);
+        const stdout = child.stdout as EventEmitter & {
+          destroy?: () => void;
+        };
+        stdout.destroy = () => {
+          destroyedSources += 1;
+        };
+        const stderr = child.stderr as EventEmitter & {
+          destroy?: () => void;
+        };
+        stderr.destroy = () => {
+          destroyedSources += 1;
+        };
+        return child;
+      },
+    });
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
+    const claim = hub.beginActivation(identity, 'startup', '7'.repeat(32));
+    const lease = hub.commitActivation(
+      claim,
+      await h.registry.stageReloadActivation(claim),
+    );
+    try {
+      const task = await h.registry.startTask(
+        h.ctx,
+        'node reload-stuck.js',
+        {
+          name: 'Reload Stuck',
+          isAgent: false,
+          surviveReload: true,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        },
+      );
+      await assert.rejects(
+        h.registry.stopTask(task, 'user'),
+        /Descendant processes may have leaked|did not exit/i,
+      );
+      assert.equal(
+        destroyedSources,
+        2,
+        'reload survivor stdout/stderr read ends must be destroyed',
+      );
+      assert.equal(
+        task.stream?.destroyed,
+        true,
+        'reload survivor output stream must be destroyed',
+      );
+    } finally {
+      if (h.registry.hasCurrentReloadLease()) h.registry.releaseReloadActivation(lease);
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it('kills collected POSIX descendants after the group SIGKILL on the reload survivor path', async () => {
+    if (process.platform === 'win32') return;
+    let childRef: FakeChild | undefined;
+    let groupAlive = true;
+    const hub = createReloadShellOwnerHubForTests({ handoffTimeoutMs: 2000 });
+    const h = await createHarness({
+      platform: 'linux',
+      reloadShellOwner: hub,
+      killGraceMs: 20,
+      stopWaitMs: 250,
+      killProcess: (pid, signal) => {
+        if (signal === 0) {
+          if (groupAlive) return true;
+          throw errnoError('ESRCH', 'owned group is gone');
+        }
+        if (pid === 5302) throw errnoError('EACCES', 'descendant denied');
+        if (signal === 'SIGKILL' && pid < 0) {
+          // 组 SIGKILL:组消失并令子进程 close,触发幸存执行的终态化
+          groupAlive = false;
+          queueMicrotask(() => childRef?.close(null, signal));
+          return true;
+        }
+        return true;
+      },
+      collectPosixDescendantPids: async () => new Set([5301, 5302]),
+      childFactory: (pid) => {
+        childRef = new FakeChild(pid);
+        return childRef;
+      },
+    });
+    const identity = makeReloadShellIdentity(
+      h.ctx.sessionId ?? '',
+      realpathSync(h.cwd),
+    );
+    const claim = hub.beginActivation(identity, 'startup', '8'.repeat(32));
+    const lease = hub.commitActivation(
+      claim,
+      await h.registry.stageReloadActivation(claim),
+    );
+    try {
+      const task = await h.registry.startTask(
+        h.ctx,
+        'node reload-tree.js',
+        {
+          name: 'Reload Tree',
+          isAgent: false,
+          surviveReload: true,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        },
+      );
+      await h.registry.stopTask(task, 'user');
+      assert.equal(task.status, 'cancelled');
+      assert.match(
+        task.error ?? '',
+        /POSIX descendant SIGKILL failed[\s\S]*pid 5302[\s\S]*Descendant processes may have leaked/i,
+      );
+    } finally {
+      if (h.registry.hasCurrentReloadLease()) h.registry.releaseReloadActivation(lease);
+      h.registry.setShuttingDown(true);
       groupAlive = false;
       await cleanup(h.root);
     }
@@ -2286,7 +2349,7 @@ setInterval(() => {}, 1000);
       const { task, child } = await startFakeTask(h, 'Fallback Kill');
       await h.registry.stopTask(task, 'user');
       assert.deepEqual(child.killCalls, ['SIGTERM']);
-      assert.equal(task.status, 'killed');
+      assert.equal(task.status, 'cancelled');
     } finally {
       await cleanup(h.root);
     }
@@ -2383,8 +2446,16 @@ setInterval(() => {}, 1000);
           }
           return new Promise<TaskkillOutcome>(() => undefined);
         }
-        assert.equal(signal, undefined, 'force taskkill must not reuse the soft abort signal');
-        assert.equal(softAbortCount, 1, 'soft attempt should be aborted before force starts');
+        assert.equal(
+          signal,
+          undefined,
+          'force taskkill must not reuse the soft abort signal',
+        );
+        assert.equal(
+          softAbortCount,
+          1,
+          'soft attempt should be aborted before force starts',
+        );
         queueMicrotask(() => {
           childRef?.close(null, 'SIGKILL');
         });
@@ -2399,10 +2470,17 @@ setInterval(() => {}, 1000);
       const { task } = await startFakeTask(h, 'Windows Duplicate Stop');
       const first = h.registry.stopTask(task, 'user');
       firstTimer = task.killEscalationTimer;
-      assert.ok(firstTimer, 'first graceful stop should arm an escalation timer');
+      assert.ok(
+        firstTimer,
+        'first graceful stop should arm an escalation timer',
+      );
       const second = h.registry.stopTask(task, 'user');
       const third = h.registry.stopTask(task, 'user');
-      assert.equal(task.killEscalationTimer, firstTimer, 'duplicate stops must share one timer');
+      assert.equal(
+        task.killEscalationTimer,
+        firstTimer,
+        'duplicate stops must share one timer',
+      );
       await Promise.all([first, second, third]);
       assert.deepEqual(phases, ['terminate', 'force']);
       assert.equal(task.killEscalationTimer, undefined);
@@ -2439,19 +2517,26 @@ setInterval(() => {}, 1000);
       platform: 'win32',
       killGraceMs: 500,
       stopWaitMs: 1000,
-      killTree: () => Promise.resolve(taskkillOutcome(128, 'process not found')),
+      killTree: () =>
+        Promise.resolve(taskkillOutcome(128, 'process not found')),
     });
     try {
       const { task, child } = await startFakeTask(h, 'Windows Missing Process');
       const stopped = h.registry.stopTask(task, 'user');
       await waitFor(
-        () => readFileSync(task.outputAbsPath, 'utf8').includes('process not found'),
+        () =>
+          readFileSync(task.outputAbsPath, 'utf8').includes(
+            'process not found',
+          ),
         'exit 128 notice',
       );
       child.close(0, null);
       await stopped;
-      assert.equal(task.status, 'killed');
-      assert.match(await readFile(task.outputAbsPath, 'utf8'), /already-exited race/);
+      assert.equal(task.status, 'cancelled');
+      assert.match(
+        await readFile(task.outputAbsPath, 'utf8'),
+        /already-exited race/,
+      );
     } finally {
       await cleanup(h.root);
     }
@@ -2466,7 +2551,8 @@ setInterval(() => {}, 1000);
       stopWaitMs: 500,
       killTree: (_pid, phase) => {
         phases.push(phase);
-        if (phase === 'terminate') return Promise.resolve(taskkillOutcome(1, 'soft denied'));
+        if (phase === 'terminate')
+          return Promise.resolve(taskkillOutcome(1, 'soft denied'));
         queueMicrotask(() => {
           childRef?.close(null, 'SIGKILL');
         });
@@ -2482,7 +2568,10 @@ setInterval(() => {}, 1000);
       await h.registry.stopTask(task, 'user');
       assert.deepEqual(phases, ['terminate', 'force']);
       assert.match(task.error ?? '', /soft denied/);
-      const metadata = parseJsonObject(await readFile(task.metadataAbsPath, 'utf8'), 'metadata');
+      const metadata = parseJsonObject(
+        await readFile(task.metadataAbsPath, 'utf8'),
+        'metadata',
+      );
       assert.match(String(metadata['error']), /soft denied/);
     } finally {
       await cleanup(h.root);
@@ -2528,8 +2617,8 @@ setInterval(() => {}, 1000);
       platform: 'win32',
       killGraceMs: 20,
       stopWaitMs: 1000,
-      publishTerminal: (task) => {
-        terminals.push(task);
+      publishTerminal: (publication) => {
+        terminals.push(publication.task);
       },
       killTree: (_pid, phase) => {
         if (phase === 'terminate') return Promise.resolve(taskkillOutcome(0));
@@ -2548,7 +2637,10 @@ setInterval(() => {}, 1000);
       const { task } = await startFakeTask(h, 'Windows Force Barrier');
       const stopped = h.registry.stopTask(task, 'user');
       await waitFor(() => forceStarted, 'force taskkill start');
-      await waitFor(() => task.finalized === true, 'child close reached finalization');
+      await waitFor(
+        () => task.finalized === true,
+        'child close reached finalization',
+      );
       const runningMetadata = parseJsonObject(
         await readFile(task.metadataAbsPath, 'utf8'),
         'metadata before force settles',
@@ -2557,12 +2649,12 @@ setInterval(() => {}, 1000);
       assert.equal(terminals.length, 0);
       force.resolve(taskkillOutcome(0));
       await stopped;
-      assert.equal(task.status, 'killed');
+      assert.equal(task.status, 'cancelled');
       const terminalMetadata = parseJsonObject(
         await readFile(task.metadataAbsPath, 'utf8'),
         'metadata after force settles',
       );
-      assert.equal(terminalMetadata['status'], 'killed');
+      assert.equal(terminalMetadata['status'], 'cancelled');
       assert.equal(terminals.length, 1);
     } finally {
       await cleanup(h.root);
@@ -2605,8 +2697,12 @@ setInterval(() => {}, 1000);
         killCalls.filter((signal) => signal !== 0),
         ['SIGTERM', 'SIGKILL'],
       );
-      assert.equal(task.status, 'killed');
-      assert.equal(task.killEscalationTimer, undefined, 'escalation timer must be cleared');
+      assert.equal(task.status, 'cancelled');
+      assert.equal(
+        task.killEscalationTimer,
+        undefined,
+        'escalation timer must be cleared',
+      );
     } finally {
       groupAlive = false;
       await cleanup(h.root);
@@ -2677,7 +2773,10 @@ setInterval(() => {}, 1000);
       child.fail(new Error('spawn exploded'));
       child.close(0, null);
       await waitFor(() => task.status !== 'running', 'spawn race finalization');
-      await waitFor(() => h.notifications.length === 1, 'single spawn-race notification');
+      await waitFor(
+        () => h.notifications.length === 1,
+        'single spawn-race notification',
+      );
       assert.equal(task.status, 'failed');
       assert.match(task.error ?? '', /spawn exploded/);
       assert.equal(h.notifications.length, 1);
@@ -2688,7 +2787,10 @@ setInterval(() => {}, 1000);
         notification.message.content,
         /<guidance>Terminal state and output metadata are durable\. Do not call bg_status to reconfirm; use bg_logs only if output is needed\.<\/guidance>/,
       );
-      assert.deepEqual(notification.options, { deliverAs: 'followUp', triggerTurn: true });
+      assert.deepEqual(notification.options, {
+        deliverAs: 'followUp',
+        triggerTurn: true,
+      });
 
       const capped = await h.registry.startTask(h.ctx, 'node noisy.js', {
         name: 'Output Race',
@@ -2699,8 +2801,14 @@ setInterval(() => {}, 1000);
       cappedChild.writeStdout('0123456789abcdef');
       cappedChild.close(1, null);
       cappedChild.close(0, null);
-      await waitFor(() => capped.status !== 'running', 'output-cap finalization');
-      await waitFor(() => h.notifications.length === 2, 'single output-cap notification');
+      await waitFor(
+        () => capped.status !== 'running',
+        'output-cap finalization',
+      );
+      await waitFor(
+        () => h.notifications.length === 2,
+        'single output-cap notification',
+      );
       assert.equal(capped.status, 'failed');
       assert.match(capped.error ?? '', /Output exceeded cap/);
       assert.equal(h.notifications.length, 2);
@@ -2714,12 +2822,13 @@ setInterval(() => {}, 1000);
     const metadataStatuses: unknown[] = [];
     let metadataPath = '';
     const h = await createHarness({
-      publishTerminal: (task) => {
-        terminals.push(task);
+      publishTerminal: (publication) => {
+        terminals.push(publication.task);
         metadataStatuses.push(
-          parseJsonObject(readFileSync(metadataPath, 'utf8'), 'terminal metadata must be written')[
-            'status'
-          ],
+          parseJsonObject(
+            readFileSync(metadataPath, 'utf8'),
+            'terminal metadata must be written',
+          )['status'],
         );
       },
     });
@@ -2729,7 +2838,10 @@ setInterval(() => {}, 1000);
       child.close(0, null);
       child.close(1, null);
       await waitFor(() => task.status !== 'running', 'terminal status');
-      await waitFor(() => terminals.length === 1, 'single terminal publication');
+      await waitFor(
+        () => terminals.length === 1,
+        'single terminal publication',
+      );
       const terminal = terminals[0];
       assert.ok(terminal, 'terminal snapshot should be present');
       assert.equal(terminal.id, task.id);
@@ -2740,20 +2852,80 @@ setInterval(() => {}, 1000);
     }
   });
 
+  void it('carries a bounded tail summary field in completion notifications (M5 REVIEW)', async () => {
+    const h = await createHarness({});
+    try {
+      const { task, child } = await startFakeTask(h, 'Summary Notification');
+      child.writeStdout('hello tail world\n');
+      child.close(0, null);
+      await waitFor(
+        () => task.status === 'completed',
+        'summary notification completion',
+      );
+      await waitFor(
+        () => h.notifications.length === 1,
+        'summary notification single delivery',
+      );
+      const notification = h.notifications[0];
+      assert.ok(notification, 'completion notification must be captured');
+      const content = notification.message.content;
+      const tailMatch = /<summary-tail>([\s\S]*?)<\/summary-tail>/u.exec(content);
+      assert.ok(tailMatch, 'notification must carry the bounded tail summary');
+      // readTerminalSummaryTail 会对 tail 做尾部空白裁剪
+      assert.equal(tailMatch[1], 'hello tail world');
+      assert.match(content, /<output-file>[^<]+<\/output-file>/u);
+
+      // 超长输出:完成摘要必须是 64KiB 内截断的 tail,且不携带完整日志
+      const noisy = await h.registry.startTask(h.ctx, 'node noisy-summary.js', {
+        name: 'Noisy Summary',
+        notifyOnCompletion: true,
+      });
+      const noisyChild = lastSpawn(h).child;
+      noisyChild.writeStdout('a'.repeat(200 * 1024));
+      noisyChild.close(0, null);
+      await waitFor(
+        () => noisy.status === 'completed',
+        'noisy summary completion',
+      );
+      await waitFor(
+        () => h.notifications.length === 2,
+        'noisy summary notification',
+      );
+      const noisyContent = h.notifications[1]?.message.content ?? '';
+      const noisyTail =
+        /<summary-tail>([\s\S]*?)<\/summary-tail>/u.exec(noisyContent)?.[1] ??
+        '';
+      assert.ok(
+        Buffer.byteLength(noisyTail, 'utf8') <= TERMINAL_SUMMARY_TAIL_BYTES,
+        'summary-tail must stay within 64KiB',
+      );
+      assert.doesNotMatch(
+        noisyContent,
+        /a{200000}/u,
+        'notification must not carry the full log',
+      );
+    } finally {
+      await cleanup(h.root);
+    }
+  });
+
   void it('keeps failed terminal EventBus delivery loud and retriable', async () => {
     const terminals: BgTaskSnapshot[] = [];
     let attempts = 0;
     const h = await createHarness({
-      publishTerminal: (task) => {
+      publishTerminal: (publication) => {
         attempts += 1;
         if (attempts === 1) throw new Error('terminal bus unavailable');
-        terminals.push(task);
+        terminals.push(publication.task);
       },
     });
     try {
       const { task, child } = await startFakeTask(h, 'Terminal Retry');
       child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'terminal retry completion');
+      await waitFor(
+        () => task.status === 'completed',
+        'terminal retry completion',
+      );
       await waitFor(() => terminals.length === 1, 'terminal retry publication');
       assert.equal(attempts, 2);
       assert.equal(task.terminalPublished, true);
@@ -2781,17 +2953,39 @@ setInterval(() => {}, 1000);
       const started = await startFakeTask(h, 'Terminal Shutdown Abandonment');
       task = started.task;
       started.child.close(0, null);
-      await waitFor(() => task?.terminalPublishRetryHandle !== undefined, 'terminal retry arm');
+      await waitFor(
+        () => task?.terminalPublishRetryHandle !== undefined,
+        'terminal retry arm',
+      );
 
       h.registry.setShuttingDown(true);
-      assert.equal(task.status, 'completed', 'terminal task truth must remain intact');
-      assert.notEqual(task.terminalPublished, true, 'abandonment is not successful delivery');
+      assert.equal(
+        task.status,
+        'completed',
+        'terminal task truth must remain intact',
+      );
+      assert.notEqual(
+        task.terminalPublished,
+        true,
+        'abandonment is not successful delivery',
+      );
       assert.equal(Reflect.get(task, 'terminalPublicationState'), 'abandoned');
-      assert.equal(Reflect.get(task, 'terminalPublicationAbandonReason'), 'registry_shutdown');
-      assert.equal(task.terminalPublishRetryHandle, undefined, 'shutdown must cancel retry timer');
+      assert.equal(
+        Reflect.get(task, 'terminalPublicationAbandonReason'),
+        'registry_shutdown',
+      );
+      assert.equal(
+        task.terminalPublishRetryHandle,
+        undefined,
+        'shutdown must cancel retry timer',
+      );
 
       await new Promise((resolve) => setTimeout(resolve, 250));
-      assert.equal(attempts, 1, 'a disposed registry must never re-arm its publisher');
+      assert.equal(
+        attempts,
+        1,
+        'a disposed registry must never re-arm its publisher',
+      );
       const metadata = parseJsonObject(
         await readFile(task.metadataAbsPath, 'utf8'),
         'terminal metadata must survive publication abandonment',
@@ -2850,7 +3044,8 @@ setInterval(() => {}, 1000);
     const h = await createHarness({
       publishTerminal: () => {
         attempts += 1;
-        if (failPublication) throw new Error(`persistent listener failure ${String(attempts)}`);
+        if (failPublication)
+          throw new Error(`persistent listener failure ${String(attempts)}`);
       },
     });
     try {
@@ -2860,10 +3055,21 @@ setInterval(() => {}, 1000);
       await waitFor(() => attempts >= 3, 'bounded terminal attempts');
       await new Promise((resolve) => setTimeout(resolve, 180));
 
-      assert.equal(attempts, 3, 'terminal delivery uses three total attempts, not an open loop');
-      assert.notEqual(task.terminalPublished, true, 'exhaustion is not successful delivery');
+      assert.equal(
+        attempts,
+        3,
+        'terminal delivery uses three total attempts, not an open loop',
+      );
+      assert.notEqual(
+        task.terminalPublished,
+        true,
+        'exhaustion is not successful delivery',
+      );
       assert.equal(Reflect.get(task, 'terminalPublicationState'), 'abandoned');
-      assert.equal(Reflect.get(task, 'terminalPublicationAbandonReason'), 'retry_exhausted');
+      assert.equal(
+        Reflect.get(task, 'terminalPublicationAbandonReason'),
+        'retry_exhausted',
+      );
       assert.equal(task.terminalPublishRetryHandle, undefined);
       assert.equal(
         h.errors.length,
@@ -2887,7 +3093,9 @@ setInterval(() => {}, 1000);
   void it('does not publish an ordinary terminal after a late gate resolves into shutdown', async () => {
     const gate = deferred<void>();
     const terminals: BgTaskSnapshot[] = [];
-    const h = await createHarness({ publishTerminal: (terminal) => terminals.push(terminal) });
+    const h = await createHarness({
+      publishTerminal: (publication) => terminals.push(publication.task),
+    });
     const task = await h.registry.startTask(h.ctx, 'node late-gate.js', {
       name: 'Late Ordinary Gate',
       notifyOnCompletion: true,
@@ -2896,14 +3104,21 @@ setInterval(() => {}, 1000);
     });
     try {
       lastSpawn(h).child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'late-gated ordinary completion');
+      await waitFor(
+        () => task.status === 'completed',
+        'late-gated ordinary completion',
+      );
       assert.equal(terminals.length, 0);
 
       h.registry.setShuttingDown(true);
       gate.resolve(undefined);
       await new Promise((resolve) => setTimeout(resolve, 200));
 
-      assert.equal(terminals.length, 0, 'a gate resolving after closure cannot publish');
+      assert.equal(
+        terminals.length,
+        0,
+        'a gate resolving after closure cannot publish',
+      );
       assert.notEqual(task.terminalPublished, true);
       assert.equal(Reflect.get(task, 'terminalPublicationState'), 'abandoned');
       assert.equal(task.terminalPublishRetryHandle, undefined);
@@ -2913,7 +3128,11 @@ setInterval(() => {}, 1000);
         'closure must release the gate reference',
       );
       assert.equal(task.terminalPublishInFlight, false);
-      assert.equal(h.notifications.length, 0, 'shutdown still suppresses completion notification');
+      assert.equal(
+        h.notifications.length,
+        0,
+        'shutdown still suppresses completion notification',
+      );
       const metadata = parseJsonObject(
         await readFile(task.metadataAbsPath, 'utf8'),
         'late-gated task metadata must remain durable',
@@ -2925,65 +3144,6 @@ setInterval(() => {}, 1000);
     }
   });
 
-  void it('does not re-arm a managed terminal when its late gate rejects after shutdown', async () => {
-    const completion = deferred<void>();
-    const gate = deferred<void>();
-    const h = await createHarness();
-    const facts = {
-      runId: 'reason-cccccccccccccccccccccccccccccccc',
-      workflow: 'reason' as const,
-      artifactDir: '.pi/fusion/test/reason-c',
-      artifactDirAbs: join(h.cwd, '.pi', 'fusion', 'test', 'reason-c'),
-      state: 'initializing',
-      usageDelivered: false,
-    };
-    const task = await h.registry.startManagedTask(h.ctx, {
-      id: facts.runId,
-      name: 'late managed gate',
-      command: 'fusion_reason',
-      isAgent: true,
-      completion: completion.promise,
-      cancel: () => undefined,
-      notifyOnCompletion: true,
-      triggerOnCompletion: true,
-      fusion: facts,
-      terminalPublicationGate: gate.promise,
-    });
-    try {
-      completion.resolve(undefined);
-      await waitFor(() => task.status === 'completed', 'late-gated managed completion');
-      h.registry.setShuttingDown(true);
-      gate.reject(new Error('late launch gate rejected'));
-      await new Promise((resolve) => setTimeout(resolve, 250));
-
-      assert.notEqual(task.terminalPublished, true);
-      assert.equal(Reflect.get(task, 'terminalPublicationState'), 'abandoned');
-      assert.equal(Reflect.get(task, 'terminalPublicationAbandonReason'), 'registry_shutdown');
-      assert.equal(task.terminalPublishRetryHandle, undefined);
-      assert.equal(
-        task.terminalPublicationGate,
-        undefined,
-        'closure must release the gate reference',
-      );
-      assert.equal(task.terminalPublishInFlight, false);
-      assert.equal(h.notifications.length, 0);
-      const metadata = parseJsonObject(
-        await readFile(task.metadataAbsPath, 'utf8'),
-        'managed terminal metadata must remain durable',
-      );
-      assert.equal(metadata['status'], 'completed');
-    } finally {
-      if (task.terminalPublishRetryHandle !== undefined)
-        clearTimeout(task.terminalPublishRetryHandle);
-      task.terminalPublishRetryHandle = undefined;
-      // Baseline-only cleanup: stop its rejected-gate retry loop.
-      if (Reflect.get(task, 'terminalPublicationState') === undefined)
-        task.terminalPublished = true;
-      completion.resolve(undefined);
-      await cleanup(h.root);
-    }
-  });
-
   void it('resets notified when completion notification delivery fails and records loud metadata errors', async () => {
     const failingNotify = await createHarness({
       sendCompletionNotification: () => {
@@ -2991,32 +3151,56 @@ setInterval(() => {}, 1000);
       },
     });
     try {
-      const { task, child } = await startFakeTask(failingNotify, 'Notify Failure');
+      const { task, child } = await startFakeTask(
+        failingNotify,
+        'Notify Failure',
+      );
       child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'notification failure task completion');
-      await waitFor(() => failingNotify.errors.length > 0, 'notification failure log');
+      await waitFor(
+        () => task.status === 'completed',
+        'notification failure task completion',
+      );
+      await waitFor(
+        () => failingNotify.errors.length > 0,
+        'notification failure log',
+      );
       assert.equal(task.notified, false);
       const metadata = parseJsonObject(
         await readFile(task.metadataAbsPath, 'utf8'),
         'notification metadata must be an object',
       );
       assert.equal(metadata['notified'], false);
-      assert.match(failingNotify.errors.flat().join(' '), /notification failed|send failed/);
+      assert.match(
+        failingNotify.errors.flat().join(' '),
+        /notification failed|send failed/,
+      );
     } finally {
       await cleanup(failingNotify.root);
     }
 
     const metadataFailure = await createHarness();
     try {
-      const { task, child } = await startFakeTask(metadataFailure, 'Metadata Failure');
-      await rm(join(metadataFailure.cwd, '.pi'), { recursive: true, force: true });
+      const { task, child } = await startFakeTask(
+        metadataFailure,
+        'Metadata Failure',
+      );
+      await rm(join(metadataFailure.cwd, '.pi'), {
+        recursive: true,
+        force: true,
+      });
       child.close(0, null);
-      await waitFor(() => task.status === 'failed', 'metadata failure task completion');
+      await waitFor(
+        () => task.status === 'failed',
+        'metadata failure task completion',
+      );
       await waitFor(
         () => metadataFailure.notifications.length === 1,
         'notification despite metadata failure',
       );
-      await waitFor(() => metadataFailure.errors.length > 0, 'metadata failure log');
+      await waitFor(
+        () => metadataFailure.errors.length > 0,
+        'metadata failure log',
+      );
       assert.equal(task.notified, true);
       assert.match(task.error ?? '', /Terminal metadata write failed/);
       assert.match(
@@ -3037,11 +3221,18 @@ setInterval(() => {}, 1000);
       assert.equal(task.contextUsage, undefined);
 
       const byName = Object.fromEntries(
-        Array.from({ length: 2500 }, (_, index) => [`tool-${String(index)}`, 1]),
+        Array.from({ length: 2500 }, (_, index) => [
+          `tool-${String(index)}`,
+          1,
+        ]),
       );
       const telemetry = JSON.stringify({
         type: 'background-task-telemetry',
-        contextUsage: { tokens: 12_345, contextWindow: 200_000, percent: 6.1725 },
+        contextUsage: {
+          tokens: 12_345,
+          contextWindow: 200_000,
+          percent: 6.1725,
+        },
         tokenUsage: {
           input: 10_000,
           output: 2000,
@@ -3052,7 +3243,10 @@ setInterval(() => {}, 1000);
         toolUsage: { total: 2500, failed: 3, byName },
         model: 'openai-codex/gpt-5.5',
       });
-      assert.ok(telemetry.length > 16 * 1024, 'fixture must exceed the old 16KiB telemetry buffer');
+      assert.ok(
+        telemetry.length > 16 * 1024,
+        'fixture must exceed the old 16KiB telemetry buffer',
+      );
       const telemetryPrefix = '{"type":"background-task-telemetry",';
       assert.ok(telemetry.startsWith(telemetryPrefix));
       const continuation = telemetry.slice(telemetryPrefix.length);
@@ -3085,15 +3279,25 @@ setInterval(() => {}, 1000);
 
       child.writeStdout('{"type":"background-task-telemetry",bad}\n');
       const retainedToolUsage = task.toolUsage;
-      assert.ok(retainedToolUsage, 'malformed telemetry must not clear previous tool usage');
+      assert.ok(
+        retainedToolUsage,
+        'malformed telemetry must not clear previous tool usage',
+      );
       assert.equal(retainedToolUsage.total, 2500);
       assert.equal(task.model, 'openai-codex/gpt-5.5');
       child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'telemetry task completion');
+      await waitFor(
+        () => task.status === 'completed',
+        'telemetry task completion',
+      );
       let metadata = await readJsonEventually(task.metadataAbsPath);
       for (let attempt = 0; attempt < 20; attempt++) {
         metadata = await readJsonEventually(task.metadataAbsPath);
-        if (JSON.stringify(metadata['tokenUsage']) === JSON.stringify(task.tokenUsage)) break;
+        if (
+          JSON.stringify(metadata['tokenUsage']) ===
+          JSON.stringify(task.tokenUsage)
+        )
+          break;
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       assert.deepEqual(metadata['tokenUsage'], task.tokenUsage);
@@ -3150,12 +3354,23 @@ setInterval(() => {}, 1000);
         cacheWrite: 0,
         totalTokens: 15,
       });
-      assert.deepEqual(task.toolUsage, { total: 1, failed: 1, byName: { read: 1 } });
+      assert.deepEqual(task.toolUsage, {
+        total: 1,
+        failed: 1,
+        byName: { read: 1 },
+      });
       assert.equal(task.model, 'prov/model');
-      assert.deepEqual(task.contextUsage, { tokens: 15, contextWindow: 1000, percent: 1.5 });
+      assert.deepEqual(task.contextUsage, {
+        tokens: 15,
+        contextWindow: 1000,
+        percent: 1.5,
+      });
 
       child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'wrapped-agent completion');
+      await waitFor(
+        () => task.status === 'completed',
+        'wrapped-agent completion',
+      );
 
       let output = '';
       await waitFor(() => {
@@ -3183,492 +3398,24 @@ setInterval(() => {}, 1000);
     const h = await createHarness();
     try {
       const { task, child } = await startFakeTask(h, 'XML Telemetry');
-      child.writeStdout('prefix\n<background-task-context-usage>\n  <tokens>321</tokens>\n');
+      child.writeStdout(
+        'prefix\n<background-task-context-usage>\n  <tokens>321</tokens>\n',
+      );
       assert.equal(task.contextUsage, undefined);
       child.writeStdout(
         '  <context-window>1000</context-window>\n  <percent>32.1</percent>\n</background-task-context-usage>\n',
       );
-      assert.deepEqual(task.contextUsage, { tokens: 321, contextWindow: 1000, percent: 32.1 });
+      assert.deepEqual(task.contextUsage, {
+        tokens: 321,
+        contextWindow: 1000,
+        percent: 32.1,
+      });
       child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'xml telemetry task completion');
-    } finally {
-      await cleanup(h.root);
-    }
-  });
-
-  void it('produces a direct-spawn attested Pi sidecar with raw events, stderr, hashes, and exact argv', async () => {
-    const h = await createHarness({ modelRegistry: oauthRegistry() });
-    const originalPath = process.env['PATH'];
-    let task: BgTask | undefined;
-    try {
-      await initCleanGit(h.cwd);
-      let admittedPi: string | undefined;
-      let canonicalPiTarget: string | undefined;
-      if (process.platform !== 'win32') {
-        const fixtureBin = join(h.root, 'attested-pi-bin');
-        const fixtureTarget = join(h.root, 'attested-pi-target');
-        admittedPi = join(fixtureBin, 'pi');
-        await mkdir(fixtureBin, { recursive: true });
-        await writeFile(fixtureTarget, '#!/bin/sh\nexit 0\n', 'utf8');
-        await chmod(fixtureTarget, 0o755);
-        await symlink(fixtureTarget, admittedPi, 'file');
-        canonicalPiTarget = realpathSync(admittedPi);
-        process.env['PATH'] =
-          originalPath === undefined ? fixtureBin : `${fixtureBin}${delimiter}${originalPath}`;
-      }
-
-      // The fixture leads PATH while the original entries keep real Git preflight
-      // reachable. Restore the process-global value even when setup rejects.
-      try {
-        task = await h.registry.startAttestedPiTask(h.ctx, {
-          name: 'Unit Attested',
-          provider: 'openai-codex',
-          model: 'gpt-5.5',
-          prompt: 'write report.md',
-          reportPath: 'report.md',
-          extraPiArgs: ['--no-extensions'],
-        });
-      } finally {
-        if (process.platform !== 'win32') {
-          if (originalPath === undefined) delete process.env['PATH'];
-          else process.env['PATH'] = originalPath;
-        }
-      }
-      await writeFile(join(h.cwd, 'report.md'), 'unit report\n', 'utf8');
-      const spawn = lastSpawn(h);
-
-      // Settle the fake child before launch assertions so a failed assertion
-      // cannot strand task cleanup or suppress the test runner's TAP summary.
-      spawn.child.writeStdout(piJsonEvents());
-      spawn.child.writeStderr('diagnostic\n');
-      spawn.child.close(0, null);
-      await waitFor(() => task?.status === 'completed', 'attested sidecar completion');
-
-      assert.match(task.id, /^b[0-9a-f]{32}$/);
-      // Actual launch identity and attested logical argv are separate contracts.
-      // POSIX must spawn the independently canonicalized fixture target; Windows
-      // retains its Node-plus-cli.js package launch shape.
-      const piArgs = process.platform === 'win32' ? spawn.args.slice(1) : [...spawn.args];
-      if (process.platform === 'win32') {
-        assert.equal(spawn.shell, process.execPath);
-        assert.ok(
-          spawn.args[0]?.endsWith('cli.js'),
-          'Windows launches the resolved Pi bin as the first argument',
-        );
-      } else {
-        assert.ok(admittedPi);
-        assert.ok(canonicalPiTarget);
-        assert.equal(spawn.shell, canonicalPiTarget);
-        assert.notEqual(spawn.shell, admittedPi, 'POSIX launch must pin the canonical target');
-      }
-      assert.equal(spawn.options.shell, false);
-      assert.equal(spawn.options.env?.['OPENAI_API_KEY'], undefined);
-      assert.equal(spawn.options.env?.['OPENAI_BASE_URL'], undefined);
-      assert.equal(spawn.options.env?.['ANTHROPIC_API_KEY'], undefined);
-      assert.equal(spawn.options.env?.['OPENROUTER_API_KEY'], undefined);
-      assert.deepEqual(piArgs, [
-        '--mode',
-        'json',
-        '--provider',
-        'openai-codex',
-        '--model',
-        'gpt-5.5',
-        '--no-extensions',
-        'write report.md',
-      ]);
-      assert.ok(task.attestationAbsPath, 'attestation path should be recorded on task');
-      assert.equal(
-        existsSync(task.attestationAbsPath ?? ''),
-        true,
-        'completed must not become externally visible before the attestation is durable',
-      );
-      const attestation = parseJsonObject(
-        await readFile(task.attestationAbsPath, 'utf8'),
-        'attestation sidecar must be an object',
-      );
-      assert.equal(attestation['schema_version'], 'phase2.pi_task_attestation.v1');
-      assert.equal(
-        requiredJsonObject(attestation['lifecycle'], 'lifecycle')['status'],
-        'completed',
-      );
-      const invocation = requiredJsonObject(attestation['invocation'], 'invocation');
-      assert.equal(invocation['pi_session_id'], 'pi-session-unit');
-      assert.equal(invocation['provider'], 'openai-codex');
-      assert.equal(invocation['model_id'], 'gpt-5.5');
-      assert.equal(invocation['credential_kind'], 'oauth');
-      assert.equal(invocation['direct_api_key'], false);
-      // The recorded evidence argv is the logical Pi invocation on every
-      // platform. It deliberately stays ['pi', ...] rather than echoing the
-      // Windows Node-plus-cli.js launch form, so attestation evidence keeps one
-      // stable meaning across platforms.
-      assert.deepEqual(invocation['argv'], ['pi', ...piArgs]);
-      const sourceHashes = requiredJsonObject(attestation['source_hashes'], 'source hashes');
-      const artifacts = requiredJsonObject(attestation['artifacts'], 'artifacts');
-      assert.equal(
-        requiredJsonObject(artifacts['task_output'], 'task output artifact')['sha256'],
-        sourceHashes['output_sha256'],
-      );
-      assert.equal(
-        requiredJsonObject(artifacts['stderr'], 'stderr artifact')['sha256'],
-        sourceHashes['stderr_sha256'],
-      );
-      assert.equal(
-        requiredJsonObject(artifacts['transcript'], 'transcript artifact')['sha256'],
-        sourceHashes['events_sha256'],
-      );
-      assert.match(await readFile(task.outputAbsPath, 'utf8'), /attested done/);
-      assert.match(await readFile(task.eventsAbsPath ?? '', 'utf8'), /pi-session-unit/);
-      assert.match(await readFile(task.stderrAbsPath ?? '', 'utf8'), /diagnostic/);
-      const metadata = parseJsonObject(
-        await readFile(task.metadataAbsPath, 'utf8'),
-        'metadata must remain parseable after attestation',
-      );
-      assert.equal(metadata['bytesWritten'], readFileSync(task.outputAbsPath).length);
-    } finally {
-      try {
-        const child = h.children.at(-1)?.child;
-        if (task?.status === 'running' && child !== undefined) {
-          child.close(1, null);
-          await waitFor(() => task?.status !== 'running', 'attested fixture settlement');
-        }
-      } finally {
-        await cleanup(h.root);
-      }
-    }
-  });
-
-  void it('rejects duplicate thinking in attested Pi extra args before spawn', async () => {
-    const h = await createHarness({ modelRegistry: oauthRegistry() });
-    try {
-      await initCleanGit(h.cwd);
-      await assert.rejects(
-        h.registry.startAttestedPiTask(h.ctx, {
-          name: 'Duplicate Thinking',
-          provider: 'openai-codex',
-          model: 'gpt-5.5',
-          thinking: 'high',
-          prompt: 'write report.md',
-          reportPath: 'report.md',
-          extraPiArgs: ['--thinking', 'low'],
-        }),
-        /structured thinking field|duplicate Pi args/,
-      );
-      assert.equal(h.children.length, 0, 'duplicate thinking must fail before spawning pi');
-    } finally {
-      await cleanup(h.root);
-    }
-  });
-
-  void it('launches attested Pi on Windows through Node while preserving logical argv', async () => {
-    const h = await createHarness({ platform: 'win32', modelRegistry: oauthRegistry() });
-    try {
-      await initCleanGit(h.cwd);
-      const prompt = 'write report.md & echo pwned "%VAR%" C:\\tmp\\space path\\';
-      const task = await h.registry.startAttestedPiTask(h.ctx, {
-        name: 'Win Attested',
-        provider: 'openai-codex',
-        model: 'gpt-5.5',
-        prompt,
-        reportPath: 'report.md',
-        extraPiArgs: ['--no-extensions', 'quoted "value"'],
-      });
-      await writeFile(join(h.cwd, 'report.md'), 'unit report\n', 'utf8');
-      const spawn = lastSpawn(h);
-      assert.equal(spawn.shell, process.execPath);
-      assert.equal(spawn.options.shell, false);
-      assert.equal(spawn.options.detached, false);
-      assert.equal(spawn.args.at(-1), prompt);
-      assert.ok(spawn.args[0]?.endsWith('cli.js'));
-      assert.deepEqual(spawn.args.slice(1), [
-        '--mode',
-        'json',
-        '--provider',
-        'openai-codex',
-        '--model',
-        'gpt-5.5',
-        '--no-extensions',
-        'quoted "value"',
-        prompt,
-      ]);
-      spawn.child.writeStdout(piJsonEvents());
-      spawn.child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'Windows attested completion');
-      assert.ok(task.attestationAbsPath);
-      const attestation = parseJsonObject(
-        await readFile(task.attestationAbsPath, 'utf8'),
-        'attestation sidecar must be an object',
-      );
-      const invocation = requiredJsonObject(attestation['invocation'], 'invocation');
-      assert.deepEqual(invocation['argv'], [
-        'pi',
-        '--mode',
-        'json',
-        '--provider',
-        'openai-codex',
-        '--model',
-        'gpt-5.5',
-        '--no-extensions',
-        'quoted "value"',
-        prompt,
-      ]);
-    } finally {
-      await cleanup(h.root);
-    }
-  });
-
-  void it('strips metered API environment from attested Pi child process', async () => {
-    const h = await createHarness({
-      modelRegistry: oauthRegistry(),
-      env: {
-        ...process.env,
-        OPENAI_API_KEY: 'metered-openai',
-        OPENAI_BASE_URL: 'https://api.openai.invalid',
-        ANTHROPIC_API_KEY: 'metered-anthropic',
-        ANTHROPIC_BASE_URL: 'https://api.anthropic.invalid',
-        OPENROUTER_API_KEY: 'metered-openrouter',
-        OPENROUTER_BASE_URL: 'https://openrouter.invalid',
-        PI_API_KEY: 'metered-pi',
-        PI_AUTH_FILE: '/tmp/forbidden-auth.json',
-      },
-    });
-    try {
-      await initCleanGit(h.cwd);
-      const task = await h.registry.startAttestedPiTask(h.ctx, {
-        name: 'Env Strip',
-        provider: 'openai-codex',
-        model: 'gpt-5.5',
-        prompt: 'write report.md',
-        reportPath: 'report.md',
-      });
-      await writeFile(join(h.cwd, 'report.md'), 'unit report\n', 'utf8');
-      const spawn = lastSpawn(h);
-      for (const key of [
-        'OPENAI_API_KEY',
-        'OPENAI_BASE_URL',
-        'ANTHROPIC_API_KEY',
-        'ANTHROPIC_BASE_URL',
-        'OPENROUTER_API_KEY',
-        'OPENROUTER_BASE_URL',
-        'PI_API_KEY',
-        'PI_AUTH_FILE',
-      ]) {
-        assert.equal(spawn.options.env?.[key], undefined, `${key} must be stripped`);
-      }
-      spawn.child.writeStdout(piJsonEvents());
-      spawn.child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'attested env-strip completion');
-    } finally {
-      await cleanup(h.root);
-    }
-  });
-
-  void it('rejects malformed attested Pi events and does not emit a sidecar', async () => {
-    const h = await createHarness({ modelRegistry: oauthRegistry() });
-    try {
-      await initCleanGit(h.cwd);
-      const task = await h.registry.startAttestedPiTask(h.ctx, {
-        name: 'Bad Attested',
-        provider: 'openai-codex',
-        model: 'gpt-5.5',
-        prompt: 'write report.md',
-        reportPath: 'report.md',
-      });
-      await writeFile(join(h.cwd, 'report.md'), 'unit report\n', 'utf8');
-      lastSpawn(h).child.writeStdout('{"type":"session","id":"s","cwd":"/tmp"}\n');
-      lastSpawn(h).child.close(0, null);
-      await waitFor(() => task.status === 'failed', 'malformed attested failure');
-      assert.match(task.error ?? '', /agent_start|assistant|agent_end|session/i);
-      assert.equal(existsSync(task.attestationAbsPath ?? ''), false);
-    } finally {
-      await cleanup(h.root);
-    }
-  });
-
-  void it('keeps ordinary bg_run tasks free of attestation sidecars', async () => {
-    const h = await createHarness();
-    try {
-      const { task, child } = await startFakeTask(h, 'Ordinary No Sidecar');
-      child.writeStdout('ordinary\n');
-      child.close(0, null);
-      await waitFor(() => task.status === 'completed', 'ordinary completion');
-      assert.equal(task.attestationPath, undefined);
-      assert.equal(existsSync(task.outputAbsPath.replace(/\.output$/, '.attestation.json')), false);
-    } finally {
-      await cleanup(h.root);
-    }
-  });
-
-  void it('tracks managed Fusion completion, durable progress, once-only usage, and cancellation', async () => {
-    const h = await createHarness({ stopWaitMs: 100 });
-    try {
-      let complete: (() => void) | undefined;
-      const completion = new Promise<void>((resolve) => {
-        complete = resolve;
-      });
-      let releaseTerminal: (() => void) | undefined;
-      const terminalPublicationGate = new Promise<void>((resolve) => {
-        releaseTerminal = resolve;
-      });
-      const facts = {
-        runId: 'reason-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        workflow: 'reason' as const,
-        artifactDir: '.pi/fusion/test/reason-a',
-        artifactDirAbs: join(h.cwd, '.pi', 'fusion', 'test', 'reason-a'),
-        state: 'initializing',
-        usageDelivered: false,
-      };
-      const task = await h.registry.startManagedTask(h.ctx, {
-        id: facts.runId,
-        name: 'fusion reason',
-        command: 'fusion_reason',
-        isAgent: true,
-        completion,
-        cancel: () => undefined,
-        notifyOnCompletion: true,
-        triggerOnCompletion: true,
-        fusion: facts,
-        terminalPublicationGate,
-      });
-      assert.equal(h.children.length, 0, 'managed task must not create a registry child process');
-      await h.registry.updateManagedTask(task, 'candidates_running', 'candidate wave started');
-      assert.equal(task.fusion?.state, 'candidates_running');
-      assert.match(await readFile(task.outputAbsPath, 'utf8'), /candidate wave started/);
-      assert.equal(await h.registry.claimFusionUsage(task), true);
-      assert.equal(await h.registry.claimFusionUsage(task), false);
-      assert.equal(task.fusion?.usageDelivered, true);
-      complete?.();
-      await waitFor(() => task.status === 'completed', 'managed Fusion completion');
-      assert.equal(
-        h.notifications.length,
-        0,
-        'completion must wait behind the launch publication gate',
-      );
-      releaseTerminal?.();
-      await waitFor(() => h.notifications.length === 1, 'gated managed Fusion notification');
-      assert.match(h.notifications[0]?.message.content ?? '', /Call bg_result/);
-
-      let rejectCancelled: ((error: Error) => void) | undefined;
-      const cancelled = new Promise<void>((_resolve, reject) => {
-        rejectCancelled = reject;
-      });
-      const cancelledFacts = {
-        ...facts,
-        runId: 'reason-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-        usageDelivered: false,
-      };
-      const cancelledTask = await h.registry.startManagedTask(h.ctx, {
-        id: cancelledFacts.runId,
-        name: 'fusion reason',
-        command: 'fusion_reason',
-        isAgent: true,
-        completion: cancelled,
-        cancel: () => rejectCancelled?.(new Error('fusion cancelled')),
-        notifyOnCompletion: false,
-        triggerOnCompletion: false,
-        fusion: cancelledFacts,
-        stopWaitMs: 100,
-      });
-      await h.registry.stopTask(cancelledTask, 'user');
-      assert.equal(cancelledTask.status, 'killed');
-      assert.equal(cancelledTask.managedCancelRequested, true);
-    } finally {
-      await cleanup(h.root);
-    }
-  });
-
-  void it('abandons an oldest pending publication so the newest managed result remains retrievable by bg_result', async () => {
-    const gate = deferred<void>();
-    const h = await createHarness({ maxRecentTasks: 1 });
-    const runId = 'reason-dddddddddddddddddddddddddddddddd';
-    try {
-      const blocked = await h.registry.startTask(h.ctx, 'node blocked-publication.js', {
-        name: 'old pending publication',
-        notifyOnCompletion: false,
-        terminalPublicationGate: gate.promise,
-      });
-      lastSpawn(h).child.close(0, null);
-      await waitFor(() => blocked.status === 'completed', 'old pending completion');
-      assert.equal(blocked.terminalPublicationState, 'pending');
-
-      const { store, details } = await createCommittedFusionResult(h.cwd, runId);
-      const managed = await h.registry.startManagedTask(h.ctx, {
-        id: runId,
-        name: 'new retained fusion result',
-        command: 'fusion_reason',
-        isAgent: true,
-        completion: Promise.resolve(),
-        cancel: () => undefined,
-        notifyOnCompletion: true,
-        triggerOnCompletion: true,
-        fusion: {
-          runId,
-          workflow: 'reason',
-          artifactDir: store.artifactDir,
-          artifactDirAbs: store.artifactDirAbs,
-          state: 'completed',
-          outcome: { status: 'committed', resultDetails: details, usage: details.usage },
-          usageDelivered: false,
-        },
-      });
       await waitFor(
-        () => managed.status === 'completed' && managed.terminalPublicationState === 'delivered',
-        'managed result completion',
+        () => task.status === 'completed',
+        'xml telemetry task completion',
       );
-      await waitFor(() => h.notifications.length === 1, 'managed result notification');
-
-      const registeredTools = new Map<string, unknown>();
-      const pi: ExtensionAPI = Object.assign(Object.create(null), {
-        registerTool(definition: unknown) {
-          if (isJsonObject(definition) && typeof definition['name'] === 'string') {
-            registeredTools.set(definition['name'], definition);
-          }
-        },
-        on() {
-          return () => undefined;
-        },
-        getActiveTools() {
-          return [];
-        },
-        setActiveTools() {},
-      });
-      registerBackgroundResultExtension(pi, {
-        activationCloseFence: new SynchronousActivationCloseFence(),
-        resolveTask: (idOrPrefix) => h.registry.resolveTask(idOrPrefix),
-        claimFusionUsage: (task) => h.registry.claimFusionUsage(task),
-      });
-      const resultDefinition = requiredJsonObject(
-        registeredTools.get('bg_result'),
-        'bg_result must be registered',
-      );
-      const execute = resultDefinition['execute'];
-      if (typeof execute !== 'function') assert.fail('bg_result execute must be callable');
-      const result = requiredJsonObject(
-        await Reflect.apply(execute, resultDefinition, [
-          'retention-bg-result',
-          { taskId: runId, delivery: 'inline' },
-        ]),
-        'bg_result must return an object',
-      );
-      const content = result['content'];
-      assert.ok(Array.isArray(content));
-      const firstContent = requiredJsonObject(content[0], 'bg_result content item');
-
-      assert.deepEqual(
-        h.registry.allTasks().map((task) => task.id),
-        [runId],
-      );
-      assert.equal(blocked.terminalPublicationState, 'abandoned');
-      assert.equal(blocked.terminalPublicationAbandonReason, 'retention_limit');
-      assert.equal(managed.notified, true);
-      assert.match(String(firstContent['text']), /retained fusion answer/);
-      const resultDetails = requiredJsonObject(result['details'], 'bg_result details');
-      assert.equal(resultDetails['task_id'], runId);
-      assert.equal(resultDetails['state'], 'committed');
-      assert.equal(resultDetails['delivery'], 'inline');
     } finally {
-      gate.resolve(undefined);
-      h.registry.setShuttingDown(true);
-      await new Promise((resolve) => setTimeout(resolve, 20));
       await cleanup(h.root);
     }
   });
@@ -3696,13 +3443,611 @@ setInterval(() => {}, 1000);
         await waitFor(() => task.status === 'completed', `finished ${suffix}`);
       }
 
-      await waitFor(() => h.registry.allTasks().length <= 3, 'old finished tasks pruned');
+      await waitFor(
+        () => h.registry.allTasks().length <= 3,
+        'old finished tasks pruned',
+      );
       const names = h.registry
         .allTasks()
         .map((task) => task.name)
         .sort();
-      assert.deepEqual(names, ['Finished 3', 'Finished 4', 'Still Running'].sort());
+      assert.deepEqual(
+        names,
+        ['Finished 3', 'Finished 4', 'Still Running'].sort(),
+      );
     } finally {
+      await cleanup(h.root);
+    }
+  });
+
+  void it('soft output threshold warns without killing; the task keeps running and completes normally', async () => {
+    const h = await createHarness({ softOutputBytes: 4 });
+    try {
+      const { task, child } = await startFakeTask(h, 'Soft Threshold');
+      child.writeStdout('0123456789');
+      // 超软阈值(4B)只触发一次软告警:不杀任务、不改任务状态、不入 failed
+      assert.equal(task.status, 'running');
+      assert.equal(task.softCapWarned, true);
+      assert.equal(task.failedReason, undefined);
+      await waitFor(
+        () => readFileSync(task.outputAbsPath, 'utf8').length >= 10,
+        'soft-threshold output flushed',
+      );
+      const logs = await h.registry.getTaskLogs(task, 4096, true);
+      assert.match(logs.text, /soft limit of 4B/u);
+      assert.ok(logs.details.totalBytes >= 10);
+      // 任务随后正常完成,软告警不污染终态
+      child.close(0, null);
+      await waitFor(
+        () => task.status === 'completed',
+        'soft-threshold task completion',
+      );
+      // 终态后输出流已关闭,文件大小稳定,totalBytes 与磁盘输出一致
+      const finalLogs = await h.registry.getTaskLogs(task, 4096, true);
+      assert.equal(
+        finalLogs.details.totalBytes,
+        readFileSync(task.outputAbsPath, 'utf8').length,
+        'bg_logs totalBytes must match the on-disk output size',
+      );
+      assert.equal(task.status, 'completed');
+      assert.equal(task.error, undefined);
+      assert.equal(task.failedReason, undefined);
+    } finally {
+      await cleanup(h.root);
+    }
+  });
+
+  void it('hard output threshold terminates with output_limit and retains the partial file', async () => {
+    const h = await createHarness({ maxOutputBytes: 8 });
+    try {
+      const { task, child } = await startFakeTask(h, 'Hard Threshold');
+      child.writeStdout('0123456789abcdef');
+      child.close(0, null);
+      await waitFor(
+        () => task.status === 'failed',
+        'hard threshold terminal',
+      );
+      assert.equal(task.capExceeded, true);
+      assert.equal(task.failedReason, 'output_limit');
+      assert.match(task.error ?? '', /Output exceeded cap of 8B/u);
+      // 已写输出文件保留,可审计
+      assert.ok(existsSync(task.outputAbsPath), 'partial output must be retained');
+      const logs = await h.registry.getTaskLogs(task, 4096, true);
+      assert.match(logs.text, /01234567/u);
+      assert.doesNotMatch(logs.text, /0123456789abcdef/u);
+      assert.equal(
+        logs.details.totalBytes,
+        readFileSync(task.outputAbsPath, 'utf8').length,
+      );
+    } finally {
+      await cleanup(h.root);
+    }
+  });
+
+  void it('marks ENOSPC stream errors disk_full and retains the already-written file', async () => {
+    const h = await createHarness();
+    try {
+      const { task, child } = await startFakeTask(h, 'Enospc Task');
+      child.writeStdout('12345');
+      await waitFor(
+        () => readFileSync(task.outputAbsPath, 'utf8').length >= 5,
+        'pre-ENOSPC output flushed',
+      );
+      // 注入输出流 ENOSPC 错误:应终止任务并标记 disk_full
+      task.stream?.emit(
+        'error',
+        errnoError('ENOSPC', 'no space left on device'),
+      );
+      child.close(0, null);
+      await waitFor(() => task.status === 'failed', 'enospc terminal');
+      assert.equal(task.failedReason, 'disk_full');
+      assert.match(task.error ?? '', /no space left on device/u);
+      assert.ok(
+        existsSync(task.outputAbsPath),
+        'written file must be retained after ENOSPC',
+      );
+      assert.match(readFileSync(task.outputAbsPath, 'utf8'), /12345/u);
+    } finally {
+      await cleanup(h.root);
+    }
+  });
+
+  void it('migrates terminal status by initiator and records failed reasons', async () => {
+    let childRef: FakeChild | undefined;
+    const h = await createHarness({
+      platform: 'linux',
+      killGraceMs: 15,
+      stopWaitMs: 350,
+      killProcess: (_pid, signal) => {
+        if (signal === 0) throw errnoError('ESRCH', 'owned group is gone');
+        if (signal === 'SIGTERM') {
+          childRef?.close(null, 'SIGTERM');
+          return true;
+        }
+        return true;
+      },
+      childFactory: (pid) => {
+        childRef = new FakeChild(pid);
+        return childRef;
+      },
+    });
+    try {
+      const user = await startFakeTask(h, 'User Stop');
+      await h.registry.stopTask(user.task, 'user', undefined, 'user');
+      assert.equal(user.task.status, 'cancelled');
+      assert.equal(user.task.stopInitiator, 'user');
+
+      const model = await startFakeTask(h, 'Model Stop');
+      await h.registry.stopTask(model.task, 'user', undefined, 'model');
+      assert.equal(model.task.status, 'cancelled');
+      assert.equal(model.task.stopInitiator, 'model');
+
+      const system = await startFakeTask(h, 'System Stop');
+      await h.registry.stopTask(system.task, 'shutdown', undefined, 'system');
+      assert.equal(system.task.status, 'killed');
+      assert.equal(system.task.stopInitiator, 'system');
+
+      const exit = await startFakeTask(h, 'Exit Failure');
+      exit.child.close(3, null);
+      await waitFor(() => exit.task.status === 'failed', 'exit failure terminal');
+      assert.equal(exit.task.failedReason, 'exit_error');
+      assert.match(exit.task.error ?? '', /Exited with code 3/u);
+
+      const spawnFailure = await startFakeTask(h, 'Spawn Failure');
+      spawnFailure.child.fail(new Error('spawn hook failed'));
+      await waitFor(
+        () => spawnFailure.task.status === 'failed',
+        'spawn failure terminal',
+      );
+      assert.equal(spawnFailure.task.failedReason, 'spawn_error');
+      assert.match(spawnFailure.task.error ?? '', /spawn hook failed/u);
+
+      const timed = await h.registry.startTask(h.ctx, 'node sleep.js', {
+        name: 'Timeout Task',
+        isAgent: false,
+        notifyOnCompletion: false,
+        triggerOnCompletion: false,
+        timeoutSeconds: 1,
+      });
+      const timedChild = lastSpawn(h).child;
+      await waitFor(() => timed.killKind === 'timeout', 'timeout armed', 2500);
+      timedChild.close(null, 'SIGTERM');
+      await waitFor(() => timed.status === 'failed', 'timeout terminal');
+      assert.equal(timed.failedReason, 'timed_out');
+      assert.match(timed.error ?? '', /Timed out after 1s/u);
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it('resolves stop-initiator conflicts with user > model > system', async () => {
+    let childRef: FakeChild | undefined;
+    const h = await createHarness({
+      platform: 'linux',
+      killGraceMs: 15,
+      stopWaitMs: 350,
+      killProcess: (_pid, signal) => {
+        if (signal === 0) throw errnoError('ESRCH', 'owned group is gone');
+        if (signal === 'SIGTERM') {
+          childRef?.close(null, 'SIGTERM');
+          return true;
+        }
+        return true;
+      },
+      childFactory: (pid) => {
+        childRef = new FakeChild(pid);
+        return childRef;
+      },
+    });
+    try {
+      const modelThenUser = await startFakeTask(h, 'Model Then User');
+      const stops = [
+        h.registry.stopTask(modelThenUser.task, 'user', undefined, 'model'),
+        h.registry.stopTask(modelThenUser.task, 'user', undefined, 'user'),
+      ];
+      const results = await Promise.allSettled(stops);
+      for (const result of results)
+        assert.equal(result.status, 'fulfilled', 'model/user stop settles');
+      assert.equal(modelThenUser.task.stopInitiator, 'user');
+      assert.equal(modelThenUser.task.status, 'cancelled');
+
+      const systemThenModel = await startFakeTask(h, 'System Then Model');
+      const stops2 = [
+        h.registry.stopTask(systemThenModel.task, 'user', undefined, 'system'),
+        h.registry.stopTask(systemThenModel.task, 'user', undefined, 'model'),
+      ];
+      const results2 = await Promise.allSettled(stops2);
+      for (const result of results2)
+        assert.equal(result.status, 'fulfilled', 'system/model stop settles');
+      assert.equal(systemThenModel.task.stopInitiator, 'model');
+
+      const userThenSystem = await startFakeTask(h, 'User Then System');
+      const stops3 = [
+        h.registry.stopTask(userThenSystem.task, 'user', undefined, 'user'),
+        h.registry.stopTask(userThenSystem.task, 'user', undefined, 'system'),
+      ];
+      const results3 = await Promise.allSettled(stops3);
+      for (const result of results3)
+        assert.equal(result.status, 'fulfilled', 'user/system stop settles');
+      assert.equal(userThenSystem.task.stopInitiator, 'user');
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it('settles waiter dual channels on terminal and background request; abort per contract', async () => {
+    const h = await createHarness();
+    try {
+      const { task, child } = await startFakeTask(h, 'Waiter Task');
+      const terminalP = h.registry.waitForTerminal(task.id);
+      const backgroundP = h.registry.waitForBackgroundRequest(task.id);
+
+      // 运行中不得提前结算 terminal 通道
+      let terminalSettled = false;
+      const probe = terminalP.then(() => {
+        terminalSettled = true;
+      });
+      await Promise.race([
+        probe,
+        new Promise((resolve) => setTimeout(resolve, 25)),
+      ]);
+      assert.equal(terminalSettled, false, 'running task must not settle early');
+
+      // background 请求通道单发结算(可幂等重复请求)
+      assert.equal(h.registry.requestBackground(task.id), true);
+      const bgSnapshot = await backgroundP;
+      assert.equal(bgSnapshot?.id, task.id);
+      assert.equal(bgSnapshot?.status, 'running');
+      assert.equal(h.registry.requestBackground(task.id), true);
+      assert.deepEqual(
+        await h.registry.waitForBackgroundRequest(task.id),
+        bgSnapshot,
+      );
+
+      // 终态结算 terminal 通道;已后台化的任务即使终态也返回快照(参照 ZCode 语义)
+      child.close(0, null);
+      const terminal = await terminalP;
+      assert.equal(terminal?.status, 'completed');
+      assert.equal(terminal?.branchGeneration, 0);
+      const backgroundedTerminal = await h.registry.waitForBackgroundRequest(
+        task.id,
+      );
+      assert.equal(backgroundedTerminal?.id, task.id);
+      assert.equal(backgroundedTerminal?.status, 'completed');
+
+      // 未后台化任务:终态时挂起的 background 等待收尾 undefined
+      const plain = await startFakeTask(h, 'Plain Terminal Task');
+      const plainBackgroundP = h.registry.waitForBackgroundRequest(
+        plain.task.id,
+      );
+      plain.child.close(0, null);
+      assert.equal(
+        await plainBackgroundP,
+        undefined,
+        'terminal settles pending background wait as undefined',
+      );
+      // REVIEW 语义一致性(#5):settleTaskWaiters 在终态且已后台化时同样以快照结算,
+      // 与 waitForBackgroundRequest 的立即结算语义对齐(参照 ZCode);该分支与立即
+      // 结算在所有可达路径上一致,不产生可观察差异(挂起等待总被 requestBackground
+      // 或终态结算先一步收盘)。
+
+      // 已终态任务立即结算快照;未知任务立即结算 undefined 且不可后台化
+      const alreadyTerminal = await h.registry.waitForTerminal(task.id);
+      assert.equal(alreadyTerminal?.status, 'completed');
+      assert.equal(await h.registry.waitForTerminal('unknown-id'), undefined);
+      assert.equal(
+        await h.registry.waitForBackgroundRequest('unknown-id'),
+        undefined,
+      );
+      assert.equal(h.registry.requestBackground('unknown-id'), false);
+
+      // 运行中任务上的等待可被 Abort(参照语义:已终态/未知任务先于 signal 结算)
+      const second = await startFakeTask(h, 'Abort Task');
+      const controller = new AbortController();
+      const abortP = h.registry.waitForTerminal(second.task.id, {
+        signal: controller.signal,
+      });
+      controller.abort(new Error('aborted wait'));
+      await assert.rejects(abortP, /aborted wait/u);
+
+      // 预中止 signal 立即 reject(双通道)
+      const preAborted = new AbortController();
+      preAborted.abort(new Error('pre-aborted'));
+      await assert.rejects(
+        h.registry.waitForTerminal(second.task.id, {
+          signal: preAborted.signal,
+        }),
+        /pre-aborted/u,
+      );
+      await assert.rejects(
+        h.registry.waitForBackgroundRequest(second.task.id, {
+          signal: preAborted.signal,
+        }),
+        /pre-aborted/u,
+      );
+      second.child.close(0, null);
+      await waitFor(
+        () => second.task.status === 'completed',
+        'abort task settles',
+      );
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it('derives wake defaults by entry semantic while explicit flags still override', async () => {
+  const h = await createHarness();
+  try {
+    const modelEntry = await h.registry.startTask(h.ctx, 'node model.js', {
+      name: 'Model Entry',
+      isAgent: false,
+      entrySource: 'model',
+    });
+    assert.equal(modelEntry.notifyOnCompletion, true);
+    assert.equal(
+      modelEntry.triggerOnCompletion,
+      true,
+      'model entry defaults to notify plus wake',
+    );
+
+    const userEntry = await h.registry.startTask(h.ctx, 'node user.js', {
+      name: 'User Entry',
+      isAgent: false,
+      entrySource: 'user',
+    });
+    assert.equal(userEntry.notifyOnCompletion, true);
+    assert.equal(
+      userEntry.triggerOnCompletion,
+      false,
+      'user entry defaults to notification only',
+    );
+
+    const explicit = await h.registry.startTask(h.ctx, 'node explicit.js', {
+      name: 'Explicit Entry',
+      isAgent: false,
+      entrySource: 'user',
+      notifyOnCompletion: false,
+      triggerOnCompletion: true,
+    });
+    assert.equal(explicit.notifyOnCompletion, false);
+    assert.equal(
+      explicit.triggerOnCompletion,
+      true,
+      'explicit flags win over entry defaults',
+    );
+
+    const unmarked = await h.registry.startTask(h.ctx, 'node plain.js', {
+      name: 'Unmarked Entry',
+      isAgent: false,
+    });
+    assert.equal(
+      unmarked.triggerOnCompletion,
+      false,
+      'unmarked entry keeps the legacy default',
+    );
+  } finally {
+    for (const child of h.children) child.child.close(null, 'SIGTERM');
+    h.registry.setShuttingDown(true);
+    await cleanup(h.root);
+  }
+});
+
+void it('fences stale branch-generation frames from waking while fresh frames wake normally', async () => {
+    const h = await createHarness();
+    try {
+      const stale = await startFakeTask(h, 'Stale Frame Task');
+      assert.equal(stale.task.branchGeneration, 0);
+      // 推进注册表代次,模拟 reload 后新激活 epoch 与旧代次帧不匹配
+      h.registry.setActiveBranchGeneration(1);
+      stale.child.close(0, null);
+      await waitFor(
+        () => stale.task.status === 'completed',
+        'stale terminal settlement',
+      );
+      assert.equal(
+        stale.task.staleBranchFrame,
+        true,
+        'old-generation frame must be marked stale',
+      );
+      assert.equal(h.notifications.length, 1);
+      assert.equal(
+        h.notifications[0]?.options.triggerTurn,
+        false,
+        'stale frame must never trigger wake',
+      );
+
+      const fresh = await startFakeTask(h, 'Fresh Frame Task');
+      assert.equal(fresh.task.branchGeneration, 1);
+      fresh.child.close(0, null);
+      await waitFor(
+        () => fresh.task.status === 'completed',
+        'fresh terminal settlement',
+      );
+      assert.equal(fresh.task.staleBranchFrame, undefined);
+      assert.equal(h.notifications.length, 2);
+      assert.equal(
+        h.notifications[1]?.options.triggerTurn,
+        true,
+        'fresh frame keeps wake',
+      );
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it('startup audit flips leftover running records to lost without touching live tasks', async () => {
+    const h = await createHarness();
+    try {
+      const { task } = await startFakeTask(h, 'Live Task');
+      const dir = join(h.cwd, '.pi', 'tasks', `${h.ctx.sessionId}-${process.pid}`);
+      // 预置旧格式遗留记录(缺失新字段),验证兼容性读取
+      const stalePath = join(dir, 'bDADA.json');
+      await writeFile(
+        stalePath,
+        JSON.stringify({
+          id: 'bDADA',
+          status: 'running',
+          command: 'echo stale',
+          outputPath: '.pi/tasks/x/bDADA.output',
+          cwd: h.cwd,
+          startTime: 1,
+          bytesWritten: 0,
+          isAgent: false,
+          surviveReload: false,
+          notified: false,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        }),
+        'utf8',
+      );
+      const donePath = join(dir, 'bDONE.json');
+      await writeFile(
+        donePath,
+        JSON.stringify({
+          id: 'bDONE',
+          status: 'killed',
+          command: 'echo done',
+          outputPath: '.pi/tasks/x/bDONE.output',
+          cwd: h.cwd,
+          startTime: 2,
+          bytesWritten: 0,
+          isAgent: false,
+          surviveReload: false,
+          notified: false,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        }),
+        'utf8',
+      );
+
+      const audited = await h.registry.auditStartupRecords(h.ctx);
+      assert.equal(audited, 1, 'only the stale running record is audited');
+
+      const staleRecord = parseJsonObject(
+        await readFile(stalePath, 'utf8'),
+        'stale record after audit',
+      );
+      assert.equal(staleRecord['status'], 'lost');
+      assert.ok(
+        Number.isFinite(staleRecord['endTime']),
+        'audited record must gain endTime',
+      );
+      assert.match(String(staleRecord['error']), /pi_bg_startup_audit/u);
+
+      const doneRecord = parseJsonObject(
+        await readFile(donePath, 'utf8'),
+        'done record after audit',
+      );
+      assert.equal(doneRecord['status'], 'killed');
+
+      // 幂等:二次审计不再改写任何记录
+      assert.equal(await h.registry.auditStartupRecords(h.ctx), 0);
+
+      // 活动任务元数据保持 running,不被审计误伤
+      const liveMetadata = parseJsonObject(
+        await readFile(task.metadataAbsPath, 'utf8'),
+        'live metadata after audit',
+      );
+      assert.equal(liveMetadata['status'], 'running');
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it('spawns argv directly without shell mediation on POSIX and keeps group authority capture', async () => {
+    const h = await createHarness();
+    try {
+      const task = await h.registry.startTask(h.ctx, '', {
+        argv: ['node', '-e', 'process.exit(0)'],
+        name: 'Direct Exec',
+        isAgent: false,
+        notifyOnCompletion: false,
+        triggerOnCompletion: false,
+      });
+      assert.equal(task.status, 'running');
+      assert.equal(
+        task.command,
+        'node -e process.exit(0)',
+        '直执行任务的 command 呈现 join 后的 argv',
+      );
+      const rec = lastSpawn(h);
+      assert.equal(rec.shell, 'node');
+      assert.deepEqual(rec.args, ['-e', 'process.exit(0)']);
+      assert.equal(rec.options.shell, undefined, '无 shell 中介');
+      assert.equal(rec.options.detached, true, 'POSIX 保持 detached');
+      assert.equal(
+        task.ownedPosixProcessGroupId,
+        rec.child.pid,
+        '沿用现有 ownedPosixProcessGroupId 捕获语义',
+      );
+      rec.child.close(0, null);
+      await waitFor(() => task.status === 'completed', 'direct exec settles');
+    } finally {
+      for (const child of h.children) child.child.close(null, 'SIGTERM');
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it('keeps shell-free argv spawn shape and no group capture on Windows', async () => {
+    const h = await createHarness({
+      platform: 'win32',
+      env: {
+        PATH: 'C:\\tools',
+        PATHEXT: '.EXE;.CMD',
+        ComSpec: 'C:\\Windows\\system32\\cmd.exe',
+      },
+    });
+    try {
+      const task = await h.registry.startTask(h.ctx, '', {
+        // 显式 .exe 路径(非 shim):直达 spawn,不经 cmd.exe
+        argv: ['C:\\tools\\node.exe', '--version'],
+        name: 'Win Direct',
+        isAgent: false,
+        notifyOnCompletion: false,
+        triggerOnCompletion: false,
+      });
+      assert.equal(task.status, 'running');
+      assert.equal(task.command, 'C:\\tools\\node.exe --version');
+      const rec = lastSpawn(h);
+      assert.equal(rec.shell, 'C:\\tools\\node.exe');
+      assert.deepEqual(rec.args, ['--version']);
+      assert.equal(rec.options.shell, undefined, '无 shell 中介');
+      assert.equal(rec.options.detached, false, 'Windows 保持非 detached');
+      assert.equal(
+        task.ownedPosixProcessGroupId,
+        undefined,
+        'Windows 不捕获 POSIX 组',
+      );
+      rec.child.close(0, null);
+      await waitFor(() => task.status === 'completed', 'win direct settles');
+    } finally {
+      for (const child of h.children) child.child.close(null, 'SIGTERM');
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it('rejects argv direct execution combined with surviveReload', async () => {
+    const h = await createHarness();
+    try {
+      await assert.rejects(
+        () =>
+          h.registry.startTask(h.ctx, '', {
+            argv: ['node', '-e', '1'],
+            surviveReload: true,
+            isAgent: false,
+          }),
+        /pi_bg_survive_reload_requires_shell_command/u,
+      );
+      assert.equal(h.children.length, 0, '拒绝路径不得产生子进程');
+    } finally {
+      h.registry.setShuttingDown(true);
       await cleanup(h.root);
     }
   });

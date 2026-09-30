@@ -6,12 +6,25 @@ import { fileURLToPath } from 'node:url';
 const root = new URL('../../', import.meta.url);
 
 function runNode(rel: string, args: string[] = []) {
-  const result = spawnSync(process.execPath, [fileURLToPath(new URL(rel, root)), ...args], {
-    cwd: fileURLToPath(root),
-    encoding: 'utf8',
-    env: { ...process.env, PI_OFFLINE: '1', PI_SKIP_VERSION_CHECK: '1', PI_TELEMETRY: '0' },
-  });
-  return { status: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL(rel, root)), ...args],
+    {
+      cwd: fileURLToPath(root),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PI_OFFLINE: '1',
+        PI_SKIP_VERSION_CHECK: '1',
+        PI_TELEMETRY: '0',
+      },
+    },
+  );
+  return {
+    status: result.status ?? 1,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
 }
 
 void describe('docs freshness gate mutation fixtures', () => {
@@ -24,15 +37,17 @@ void describe('docs freshness gate mutation fixtures', () => {
   void it('current docs verify deterministically with advisory receipt state', () => {
     const result = runNode('scripts/docs/verify.mjs');
     assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
-    assert.match(result.stdout, /deterministic generation OK; attestations advisory/);
+    assert.match(
+      result.stdout,
+      /deterministic generation OK; attestations advisory/,
+    );
   });
 
-  void it('optional strict mode still fails closed for missing or stale receipts', () => {
-    const result = runNode('scripts/docs/verify.mjs', ['--require-attestations']);
-    assert.notEqual(result.status, 0, `${result.stdout}${result.stderr}`);
-    assert.match(
-      result.stderr,
-      /missing behavioral PASS attestation receipt|stale attestation authored prose hash/,
-    );
+  void it('strict mode requires every behavioral receipt to match current prose and sources', () => {
+    const result = runNode('scripts/docs/verify.mjs', [
+      '--require-attestations',
+    ]);
+    assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /attestations required/);
   });
 });

@@ -25,6 +25,9 @@ import {
   BG_TERMINAL_CHANNEL,
   BG_TERMINAL_SCHEMA,
 } from '../../src/core/extension-api.js';
+import {
+  seedLegacyReloadSurvivor,
+} from '../helpers/reload-survival-fixture.js';
 
 const extensionPath = resolve('extensions/background-tasks.ts');
 
@@ -115,7 +118,7 @@ function isTaskSnapshot(value: unknown): value is BgTaskSnapshot {
   return (
     typeof Reflect.get(value, 'id') === 'string' &&
     typeof Reflect.get(value, 'command') === 'string' &&
-    (status === 'running' || status === 'completed' || status === 'failed' || status === 'killed') &&
+    (status === 'running' || status === 'completed' || status === 'failed' || status === 'killed' || status === 'cancelled' || status === 'lost') &&
     typeof Reflect.get(value, 'outputPath') === 'string' &&
     typeof Reflect.get(value, 'cwd') === 'string' &&
     typeof Reflect.get(value, 'startTime') === 'number' &&
@@ -128,32 +131,51 @@ function isTaskSnapshot(value: unknown): value is BgTaskSnapshot {
   );
 }
 
-async function runSurvivor(session: AgentSession, name: string): Promise<BgTaskSnapshot> {
-  const tool = session.getToolDefinition('bg_run');
-  assert.ok(tool, 'bg_run must be registered');
-  const args = {
-    name,
-    command: `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
-    isAgent: false,
-    surviveReload: true,
-    notifyOnCompletion: false,
-    triggerOnCompletion: false,
-  };
-  const prepared = tool.prepareArguments ? tool.prepareArguments(args) : args;
+/** 覆盖版 bash receipt 文本内的任务 id(`Started background task ... (bXXXX)`)。 */
+function taskIdFromReceipt(text: string): string {
+  const match = /\(b[0-9a-f]{8}\)/u.exec(text);
+  assert.ok(match, 'background task receipt should carry an id');
+  return match[0].slice(1, -1);
+}
+
+/**
+ * 以覆盖版 bash `run_in_background:true` 启动普通任务并立即取回快照
+ * (M4 起新启动入口不再暴露 `surviveReload`,缺省 kill-on-reload)。
+ */
+async function launchBackgroundTask(
+  session: AgentSession,
+  command: string,
+): Promise<BgTaskSnapshot> {
+  const tool = session.getToolDefinition('bash');
+  assert.ok(tool, 'covered bash must be registered');
   const value = await tool.execute(
-    `call-${name}`,
-    prepared,
+    `call-background-${Date.now()}`,
+    { command, run_in_background: true },
     undefined,
     undefined,
     session.extensionRunner.createContext(),
   );
-  const result = record(value, 'bg_run result');
-  const details = record(result['details'], 'bg_run details');
-  const task = details['task'];
-  assert.ok(isTaskSnapshot(task), 'bg_run task must be a snapshot');
-  assert.equal(task.surviveReload, true);
-  assert.equal(task.status, 'running');
-  assert.equal(typeof task.pid, 'number');
+  const result = record(value, 'bash background result');
+  const content = result['content'];
+  assert.ok(Array.isArray(content));
+  const text = String(
+    (content as Array<{ text?: string }>)[0]?.text ?? '',
+  );
+  const id = taskIdFromReceipt(text);
+  const statusTool = session.getToolDefinition('bg_status');
+  assert.ok(statusTool, 'bg_status must be registered');
+  const statusValue = await statusTool.execute(
+    'status-after-launch',
+    { taskId: id },
+    undefined,
+    undefined,
+    session.extensionRunner.createContext(),
+  );
+  const statusResult = record(statusValue, 'bg_status result');
+  const tasks = record(statusResult['details'], 'bg_status details')['tasks'];
+  assert.ok(Array.isArray(tasks), 'status tasks should be an array');
+  const task = tasks[0];
+  assert.ok(isTaskSnapshot(task), 'launched task must be a snapshot');
   return task;
 }
 
@@ -165,7 +187,7 @@ async function assertLifecycleKilled(task: BgTaskSnapshot, label: string): Promi
   while (pidExists(pid) && Date.now() < deadline) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 20));
   }
-  assert.equal(pidExists(pid), false, `${label} must kill the opted process rather than transfer it`);
+  assert.equal(pidExists(pid), false, `${label} must kill the running task rather than transfer it`);
 }
 
 void describe('real Pi session lifecycle SDK integration', { concurrency: false }, () => {
@@ -231,11 +253,13 @@ void describe('real Pi session lifecycle SDK integration', { concurrency: false 
       cwd,
       agentDir,
       sessionManager: SessionManager.create(cwd, sessionDir),
+      // reload 语义首次激活:认领 hub 中预置的遗留存活任务
+      sessionStartEvent: { type: 'session_start', reason: 'reload' },
     });
+    const longCommand = `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`;
     let disposed = false;
     try {
       runtime.setRebindSession(bindSession);
-      await bindSession(runtime.session);
       runtime.session.sessionManager.appendCustomEntry('lifecycle-sdk', { generation: 1 });
       runtime.session.sessionManager.appendMessage({
         role: 'assistant',
@@ -264,11 +288,19 @@ void describe('real Pi session lifecycle SDK integration', { concurrency: false 
 
       const firstRunner = runtime.session.extensionRunner;
       const firstContext = firstRunner.createContext();
-      const newSurvivor = await runSurvivor(runtime.session, 'runtime-new-survivor');
+      // M4 形态:opt 存活任务仅来自遗留 fixture —— 预置后首次激活即认领;
+      // 生命周期替换(new/switch/fork/clone/dispose)必须杀死它而非让渡。
+      const newSurvivor = await seedLegacyReloadSurvivor(
+        runtime.session,
+        cwd,
+        longCommand,
+        { name: 'runtime-new-survivor', notifyOnCompletion: false },
+      );
+      await bindSession(runtime.session);
       const firstTask = await runTask(
         eventBus,
         'runtime-new-running',
-        `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+        longCommand,
       );
       await runtime.newSession();
       assert.notEqual(runtime.session.extensionRunner, firstRunner);
@@ -279,18 +311,20 @@ void describe('real Pi session lifecycle SDK integration', { concurrency: false 
 
       const secondRunner = runtime.session.extensionRunner;
       const secondContext = secondRunner.createContext();
-      const switchSurvivor = await runSurvivor(runtime.session, 'runtime-switch-survivor');
+      // 后续激活不再承载 opt 任务:新启动入口不暴露 surviveReload,普通任务
+      // 在生命周期替换时同样缺省即杀(不转移)。
+      const switchTask = await launchBackgroundTask(runtime.session, longCommand);
       const secondTask = await runTask(
         eventBus,
         'runtime-switch-running',
-        `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+        longCommand,
       );
       await runtime.switchSession(initialSessionFile);
       assert.notEqual(runtime.session.extensionRunner, secondRunner);
       assert.throws(() => secondContext.cwd, /stale after session replacement or reload/u);
       await new Promise((resolveWait) => setTimeout(resolveWait, 100));
       assert.equal(terminals.includes(secondTask), false, 'switchSession must suppress old terminals');
-      await assertLifecycleKilled(switchSurvivor, 'switchSession');
+      await assertLifecycleKilled(switchTask, 'switchSession');
 
       const forkEntryId = runtime.session.sessionManager.appendMessage({
         role: 'user',
@@ -298,10 +332,10 @@ void describe('real Pi session lifecycle SDK integration', { concurrency: false 
         timestamp: Date.now(),
       });
       const forkRunner = runtime.session.extensionRunner;
-      const forkSurvivor = await runSurvivor(runtime.session, 'runtime-fork-survivor');
+      const forkTask = await launchBackgroundTask(runtime.session, longCommand);
       await runtime.fork(forkEntryId);
       assert.notEqual(runtime.session.extensionRunner, forkRunner);
-      await assertLifecycleKilled(forkSurvivor, 'fork');
+      await assertLifecycleKilled(forkTask, 'fork');
 
       const cloneEntryId = runtime.session.sessionManager.appendMessage({
         role: 'user',
@@ -309,10 +343,10 @@ void describe('real Pi session lifecycle SDK integration', { concurrency: false 
         timestamp: Date.now(),
       });
       const cloneRunner = runtime.session.extensionRunner;
-      const cloneSurvivor = await runSurvivor(runtime.session, 'runtime-clone-survivor');
+      const cloneTask = await launchBackgroundTask(runtime.session, longCommand);
       await runtime.fork(cloneEntryId, { position: 'at' });
       assert.notEqual(runtime.session.extensionRunner, cloneRunner);
-      await assertLifecycleKilled(cloneSurvivor, 'clone');
+      await assertLifecycleKilled(cloneTask, 'clone');
 
       const quickTask = await runTask(eventBus, 'runtime-fresh-quick', 'echo runtime-fresh');
       await waitForTerminal(terminals, quickTask);
@@ -329,18 +363,18 @@ void describe('real Pi session lifecycle SDK integration', { concurrency: false 
 
       const disposeRunner = runtime.session.extensionRunner;
       const disposeContext = disposeRunner.createContext();
-      const disposeSurvivor = await runSurvivor(runtime.session, 'runtime-dispose-survivor');
-      const disposeTask = await runTask(
+      const disposeTask = await launchBackgroundTask(runtime.session, longCommand);
+      const disposeTaskId = await runTask(
         eventBus,
         'runtime-dispose-running',
-        `node -e ${JSON.stringify('setTimeout(() => {}, 10000)')}`,
+        longCommand,
       );
       await runtime.dispose();
       disposed = true;
       assert.throws(() => disposeContext.cwd, /stale after session replacement or reload/u);
       await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-      assert.equal(terminals.includes(disposeTask), false, 'dispose must suppress old terminals');
-      await assertLifecycleKilled(disposeSurvivor, 'AgentSessionRuntime.dispose');
+      assert.equal(terminals.includes(disposeTaskId), false, 'dispose must suppress old terminals');
+      await assertLifecycleKilled(disposeTask, 'AgentSessionRuntime.dispose');
 
       eventBus.emit(BG_REQUEST_CHANNEL, {
         schema_version: BG_REQUEST_SCHEMA,

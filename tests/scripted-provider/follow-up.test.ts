@@ -7,27 +7,31 @@ import { tmpdir } from 'node:os';
 import {
   ModelRuntime,
   createAgentSession,
+  createEventBus,
   DefaultResourceLoader,
   ModelRegistry,
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type EventBus,
 } from '@earendil-works/pi-coding-agent';
 import { parseJsonText } from '../../src/core/common.js';
 import { isolatedTestEnv } from '../helpers/normalize.js';
+import {
+  BG_REQUEST_CHANNEL,
+  BG_REQUEST_SCHEMA,
+  BG_RESPONSE_CHANNEL,
+  BG_RESPONSE_SCHEMA,
+  type BackgroundTaskExtensionResponse,
+} from '../../src/core/extension-api.js';
 
 const backgroundExtensionPath = resolve('extensions/background-tasks.ts');
 const scriptedProviderPath = resolve('tests/scripted-provider/scripted-provider-extension.ts');
 const roots: string[] = [];
 
-type Scenario =
-  | 'bg-run-follow-up'
-  | 'notify-false'
-  | 'wake-false'
-  | 'failed-follow-up'
-  | 'display-only-bg';
+type Scenario = 'bg-run-follow-up' | 'failed-follow-up';
 
-async function harness(scenario: Scenario) {
+async function harness(scenario: Scenario = 'bg-run-follow-up') {
   const root = await mkdtemp(join(tmpdir(), 'pi-bg-agent-loop-'));
   roots.push(root);
   const cwd = join(root, 'project');
@@ -48,10 +52,12 @@ async function harness(scenario: Scenario) {
     defaultProvider: 'pi-bg-scripted',
     defaultModel: 'scripted-model',
   });
+  const eventBus = createEventBus();
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir,
     settingsManager,
+    eventBus,
     additionalExtensionPaths: [scriptedProviderPath, backgroundExtensionPath],
     noExtensions: true,
     noSkills: true,
@@ -65,7 +71,7 @@ async function harness(scenario: Scenario) {
     modelsPath: null,
   });
   const modelRegistry = new ModelRegistry(modelRuntime);
-  const { session } = await createAgentSession({
+  const created = await createAgentSession({
     cwd,
     agentDir,
     resourceLoader: loader,
@@ -76,13 +82,13 @@ async function harness(scenario: Scenario) {
   });
   const scriptedModel = modelRegistry.find('pi-bg-scripted', 'scripted-model');
   assert.ok(scriptedModel, 'scripted provider model should be registered');
-  await session.setModel(scriptedModel);
+  await created.session.setModel(scriptedModel);
   const restoreEnv = () => {
     restoreEnvValue('PI_BG_SCRIPTED_SCENARIO', previousScenario);
     restoreEnvValue('PI_BG_SCRIPTED_EVENTS', previousEvents);
     restoreEnvValue('PI_BG_SCRIPTED_API_KEY', previousApiKey);
   };
-  return { session, cwd, root, eventsPath, restoreEnv };
+  return { session: created.session, cwd, root, eventsPath, eventBus, restoreEnv };
 }
 
 afterEach(async () => {
@@ -245,9 +251,71 @@ async function disposeHarness(h: Awaited<ReturnType<typeof harness>>) {
   }
 }
 
+function requireEventResponse(value: unknown): BackgroundTaskExtensionResponse {
+  assert.ok(isJsonObject(value), 'EventBus response must be an object');
+  assert.equal(value['schema_version'], BG_RESPONSE_SCHEMA);
+  assert.equal(typeof value['request_id'], 'string');
+  assert.equal(typeof value['operation'], 'string');
+  assert.equal(typeof value['ok'], 'boolean');
+  return value as BackgroundTaskExtensionResponse;
+}
+
+function requireOkResult(response: BackgroundTaskExtensionResponse): unknown {
+  assert.equal(response.ok, true, response.ok ? 'ok' : response.error);
+  return response.ok ? response.result : undefined;
+}
+
+async function emitEventRequest(
+  eventBus: EventBus,
+  requestId: string,
+  operation: string,
+  payload: Record<string, unknown>,
+  timeoutMs = 5000,
+): Promise<BackgroundTaskExtensionResponse> {
+  const pending = new Promise<BackgroundTaskExtensionResponse>(
+    (resolveResponse, reject) => {
+      const timeout = setTimeout(() => {
+        unsubscribe();
+        reject(new Error(`timed out waiting for EventBus response ${requestId}`));
+      }, timeoutMs);
+      const unsubscribe = eventBus.on(BG_RESPONSE_CHANNEL, (data) => {
+        const frame = requireEventResponse(data);
+        if (frame.request_id !== requestId) return;
+        clearTimeout(timeout);
+        unsubscribe();
+        resolveResponse(frame);
+      });
+    },
+  );
+  eventBus.emit(BG_REQUEST_CHANNEL, {
+    schema_version: BG_REQUEST_SCHEMA,
+    request_id: requestId,
+    operation,
+    payload,
+  });
+  return pending;
+}
+
+/** 以「通知锁存」交付组合启动后台任务(M4 后该组合仅经 EventBus run 请求携带)。 */
+async function runWithDelivery(
+  eventBus: EventBus,
+  requestId: string,
+  command: string,
+  delivery: { notifyOnCompletion: boolean; triggerOnCompletion: boolean },
+): Promise<void> {
+  const response = await emitEventRequest(eventBus, requestId, 'run', {
+    name: requestId,
+    command,
+    isAgent: false,
+    notifyOnCompletion: delivery.notifyOnCompletion,
+    triggerOnCompletion: delivery.triggerOnCompletion,
+  });
+  requireOkResult(response);
+}
+
 void describe('scripted-provider completion follow-up behavior', { concurrency: false }, () => {
   void it(
-    'BUG-181 bg_run yields without polling and its completion event triggers one real follow-up turn',
+    'BUG-181 covered bash yields without polling and its completion event triggers one real follow-up turn',
     { timeout: 15_000 },
     async () => {
       const h = await harness('bg-run-follow-up');
@@ -271,14 +339,14 @@ void describe('scripted-provider completion follow-up behavior', { concurrency: 
         assert.equal(postToolEvent.eventDrivenContract?.launchReceipt, true);
         assert.deepEqual(
           assistantToolNames(h.session),
-          ['bg_run'],
+          ['bash'],
           'ordinary event-driven waiting must not issue bg_status, bg_logs, or a sleep tool',
         );
         const followUpEvent = requiredAt(events, 2, 'follow-up provider event should be recorded');
         assert.equal(followUpEvent.callCount, 3);
         assert.match(
           (followUpEvent.summaries ?? []).join('\n'),
-          /background-task-notification|Scripted Wakeup/,
+          /background-task-notification|scripted background task/,
         );
         assert.ok(
           assistantTexts(h.session).some((text) =>
@@ -291,7 +359,7 @@ void describe('scripted-provider completion follow-up behavior', { concurrency: 
           0,
           'completion notification should be recorded',
         );
-        assert.match(note.content, /<task-name>Scripted Wakeup<\/task-name>/);
+        assert.match(note.content, /<task-name>[^<]+<\/task-name>/);
         assert.match(note.content, /<status>completed<\/status>/);
         assert.match(note.content, /<guidance>Terminal state and output metadata are durable\./);
         assert.match(note.content, /Do not call bg_status to reconfirm/);
@@ -304,22 +372,22 @@ void describe('scripted-provider completion follow-up behavior', { concurrency: 
   );
 
   void it(
-    'notifyOnCompletion:false suppresses notification and prevents completion wakeup',
+    'notifyOnCompletion:false suppresses notification and prevents any completion wakeup',
     { timeout: 15_000 },
     async () => {
-      const h = await harness('notify-false');
+      const h = await harness();
       try {
-        await h.session.prompt('Start the no-notify scripted background task.');
+        await h.session.bindExtensions({ onError: () => undefined });
+        await runWithDelivery(
+          h.eventBus,
+          'follow-up-no-notify',
+          `node -e ${JSON.stringify('setTimeout(() => {}, 200)')}`,
+          { notifyOnCompletion: false, triggerOnCompletion: true },
+        );
         await new Promise((resolve) => setTimeout(resolve, 500));
         await h.session.agent.waitForIdle();
         assert.equal(customNotifications(h.session).length, 0);
-        const events = await providerEvents(h.eventsPath);
-        assert.equal(events.length, 2);
-        assert.ok(
-          assistantTexts(h.session).some((text) =>
-            text.includes('No-notify initial turn finished'),
-          ),
-        );
+        assert.equal((await providerEvents(h.eventsPath)).length, 0);
       } finally {
         await disposeHarness(h);
       }
@@ -330,30 +398,28 @@ void describe('scripted-provider completion follow-up behavior', { concurrency: 
     'notifyOnCompletion:true with triggerOnCompletion:false notifies without a provider wakeup',
     { timeout: 15_000 },
     async () => {
-      const h = await harness('wake-false');
+      const h = await harness();
       try {
-        await h.session.prompt('Start the notification-only scripted background task.');
+        await h.session.bindExtensions({ onError: () => undefined });
+        await runWithDelivery(
+          h.eventBus,
+          'follow-up-wake-false',
+          `node -e ${JSON.stringify('setTimeout(() => {}, 200)')}`,
+          { notifyOnCompletion: true, triggerOnCompletion: false },
+        );
         await waitFor(() => customNotifications(h.session).length === 1, 'notification-only event');
         await new Promise((resolve) => setTimeout(resolve, 350));
         await h.session.agent.waitForIdle();
 
-        const events = await providerEvents(h.eventsPath);
-        assert.equal(events.length, 2);
-        assert.equal(events[1]?.eventDrivenContract?.launchReceipt, false);
-        assert.deepEqual(assistantToolNames(h.session), ['bg_run']);
         const note = requiredAt(
           customNotifications(h.session),
           0,
           'notification-only completion should be recorded',
         );
-        assert.match(note.content, /<task-name>No Wake Scripted<\/task-name>/);
+        assert.match(note.content, /<task-name>[^<]+<\/task-name>/);
         assert.match(note.content, /<status>completed<\/status>/);
         assert.equal(note.details['triggerOnCompletion'], false);
-        assert.ok(
-          assistantTexts(h.session).some((text) =>
-            text.includes('Notification-only initial turn finished'),
-          ),
-        );
+        assert.equal((await providerEvents(h.eventsPath)).length, 0);
       } finally {
         await disposeHarness(h);
       }
@@ -382,7 +448,7 @@ void describe('scripted-provider completion follow-up behavior', { concurrency: 
           0,
           'failed-task notification should be recorded',
         );
-        assert.match(note.content, /<task-name>Failing Scripted<\/task-name>/);
+        assert.match(note.content, /<task-name>[^<]+<\/task-name>/);
         assert.match(note.content, /<status>failed<\/status>/);
         assert.match(note.content, /<exit-code>7<\/exit-code>/);
         assert.match(note.content, /<error>Exited with code 7<\/error>/);
@@ -405,7 +471,7 @@ void describe('scripted-provider completion follow-up behavior', { concurrency: 
         );
         assert.match(
           (failedFollowUpEvent.summaries ?? []).join('\n'),
-          /background-task-notification|Failing Scripted/,
+          /background-task-notification|Failing Scripted|failing scripted background task/,
         );
         assert.ok(
           assistantTexts(h.session).some((text) =>
@@ -419,13 +485,19 @@ void describe('scripted-provider completion follow-up behavior', { concurrency: 
   );
 
   void it(
-    '/bg remains display-only: it notifies but does not trigger a provider follow-up',
+    'display-only notification path stays latched: it notifies but never triggers a provider follow-up (M4 dock「转后台」语义)',
     { timeout: 15_000 },
     async () => {
-      const h = await harness('display-only-bg');
+      const h = await harness();
       try {
-        await h.session.prompt(
-          '/bg --name "Display Only Scripted" node -e "setTimeout(() => { console.log(\'display done\'); }, 80);"',
+        await h.session.bindExtensions({ onError: () => undefined });
+        // M4 起用户入口为 dock「转后台」(entrySource:'user',仅通知不唤醒);
+        // 此处以同构的「通知锁存」交付组合断言其语义:通知落盘、无 provider 唤醒。
+        await runWithDelivery(
+          h.eventBus,
+          'follow-up-display-only',
+          `node -e ${JSON.stringify('setTimeout(() => {}, 200)')}`,
+          { notifyOnCompletion: true, triggerOnCompletion: false },
         );
         await waitFor(
           () => customNotifications(h.session).length === 1,
@@ -438,7 +510,7 @@ void describe('scripted-provider completion follow-up behavior', { concurrency: 
           0,
           'display-only notification should be recorded',
         );
-        assert.match(note.content, /<task-name>Display Only Scripted<\/task-name>/);
+        assert.match(note.content, /<task-name>[^<]+<\/task-name>/);
         assert.match(note.content, /<status>completed<\/status>/);
         assert.equal(note.details['triggerOnCompletion'], false);
         assert.equal((await providerEvents(h.eventsPath)).length, 0);

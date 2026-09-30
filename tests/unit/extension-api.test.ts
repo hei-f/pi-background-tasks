@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { EventBus } from '@earendil-works/pi-coding-agent';
@@ -20,6 +20,7 @@ import {
 } from '../../src/core/extension-api.js';
 import {
   BackgroundTaskRegistry,
+  TERMINAL_SUMMARY_TAIL_BYTES,
   type BackgroundTaskContext,
   type BackgroundTaskSpawn,
 } from '../../src/core/registry.js';
@@ -215,9 +216,9 @@ async function createProtocolHarness(
         errors.push(args);
       },
     },
-    publishTerminal: (task) => {
+    publishTerminal: (publication) => {
       if (!service) throw new Error('test EventBus service is not installed');
-      service.publishTerminal(task);
+      service.publishTerminal(publication);
     },
   });
   const ctx: BackgroundTaskContext = {
@@ -285,7 +286,9 @@ function requireTask(value: unknown, label: string): BgTaskSnapshot {
     status !== 'running' &&
     status !== 'completed' &&
     status !== 'failed' &&
-    status !== 'killed'
+    status !== 'cancelled' &&
+    status !== 'killed' &&
+    status !== 'lost'
   ) {
     assert.fail(`${label}.status`);
   }
@@ -308,11 +311,33 @@ function requireTask(value: unknown, label: string): BgTaskSnapshot {
   };
 }
 
+const TERMINAL_OPTIONAL_KEYS = [
+  'status',
+  'failedReason',
+  'initiator',
+  'originMeta',
+  'summaryTail',
+  'usage',
+] as const;
+
 function requireTerminal(value: unknown): BackgroundTaskExtensionTerminal {
   assert.ok(isRecord(value), 'terminal must be an object');
-  assert.deepEqual(Object.keys(value).sort(), ['schema_version', 'task']);
+  // M5 扩展帧:保留闭包校验语义,未知键仍报错;新字段全部可选
+  const allowed = new Set<string>(['schema_version', 'task', ...TERMINAL_OPTIONAL_KEYS]);
+  for (const key of Object.keys(value)) {
+    assert.ok(allowed.has(key), `terminal contains unknown key ${key}`);
+  }
   assert.equal(value['schema_version'], BG_TERMINAL_SCHEMA);
-  return { schema_version: BG_TERMINAL_SCHEMA, task: requireTask(value['task'], 'terminal.task') };
+  const out: BackgroundTaskExtensionTerminal = {
+    schema_version: BG_TERMINAL_SCHEMA,
+    task: requireTask(value['task'], 'terminal.task'),
+  };
+  for (const key of TERMINAL_OPTIONAL_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      Reflect.set(out, key, value[key]);
+    }
+  }
+  return out;
 }
 
 function waitForResponse(
@@ -532,7 +557,7 @@ void describe('background EventBus protocol', () => {
   void it('publishes exactly one correlated terminal after the run response for every terminal path', async () => {
     async function runCase(options: {
       label: string;
-      expectedStatus: 'completed' | 'failed' | 'killed';
+      expectedStatus: 'completed' | 'failed' | 'cancelled';
       timeoutMs?: number | undefined;
       timeoutSeconds?: number | undefined;
       onSpawn?: ((child: FakeChild) => void) | undefined;
@@ -595,10 +620,10 @@ void describe('background EventBus protocol', () => {
           terminalIndex > responseIndex,
           `${options.label} terminal must follow run response`,
         );
-        if (options.expectedStatus === 'killed') {
+        if (options.expectedStatus === 'cancelled') {
           const killResponseIndex = order.indexOf('kill-response');
-          assert.ok(killResponseIndex >= 0, 'killed case missing kill response marker');
-          assert.ok(terminalIndex > killResponseIndex, 'killed terminal must follow kill response');
+          assert.ok(killResponseIndex >= 0, 'cancelled case missing kill response marker');
+          assert.ok(terminalIndex > killResponseIndex, 'cancelled terminal must follow kill response');
         }
       } finally {
         unsubscribeTerminal();
@@ -631,12 +656,12 @@ void describe('background EventBus protocol', () => {
       timeoutMs: 2500,
     });
     await runCase({
-      label: 'killed',
-      expectedStatus: 'killed',
+      label: 'cancelled',
+      expectedStatus: 'cancelled',
       afterRun: async (h, task) => {
         const kill = await emitRequest(h.bus, {
           schema_version: BG_REQUEST_SCHEMA,
-          request_id: 'kill-killed',
+          request_id: 'kill-cancelled',
           operation: 'kill',
           payload: { taskId: task.id },
         });
@@ -644,9 +669,327 @@ void describe('background EventBus protocol', () => {
         const result = kill.ok ? kill.result : undefined;
         assert.ok(isRecord(result), 'kill result must be an object');
         const resultRecord: Record<string, unknown> = result;
-        assert.equal(requireTask(resultRecord['task'], 'kill.result.task').status, 'killed');
+        assert.equal(
+          requireTask(resultRecord['task'], 'kill.result.task').status,
+          'cancelled',
+        );
       },
     });
+  });
+
+  void it('maps the full terminal status set, failedReason, and initiator onto v1 terminal frames', async () => {
+    async function runCase(options: {
+      label: string;
+      expectedStatus: 'completed' | 'failed' | 'cancelled' | 'killed';
+      expectedFailedReason?: string | undefined;
+      expectedInitiator?: string | undefined;
+      timeoutSeconds?: number | undefined;
+      timeoutMs?: number | undefined;
+      afterRun?:
+        | ((h: ProtocolHarness, task: BgTaskSnapshot) => Promise<void> | void)
+        | undefined;
+    }): Promise<void> {
+      const h = await createProtocolHarness();
+      const terminalPushed: BackgroundTaskExtensionTerminal[] = [];
+      const unsubscribeTerminal = h.bus.on(BG_TERMINAL_CHANNEL, (data) => {
+        const terminal = requireTerminal(data);
+        terminalPushed.push(terminal);
+      });
+      try {
+        const payload: Record<string, unknown> = {
+          name: `Frame ${options.label}`,
+          command: `echo frame-${options.label}`,
+          isAgent: false,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        };
+        if (options.timeoutSeconds !== undefined)
+          payload['timeoutSeconds'] = options.timeoutSeconds;
+        const run = await emitRequest(h.bus, {
+          schema_version: BG_REQUEST_SCHEMA,
+          request_id: `frame-${options.label}`,
+          operation: 'run',
+          payload,
+        });
+        assert.equal(run.ok, true, run.ok ? 'ok' : run.error);
+        const task = requireTask(
+          run.ok ? run.result : undefined,
+          `${options.label}.run.result`,
+        );
+        if (options.timeoutSeconds !== undefined) {
+          // 超时路径:等待超时定时器终止子进程,不主动关闭
+        } else if (options.afterRun !== undefined) {
+          await options.afterRun(h, task);
+        } else {
+          h.children[0]?.close(0, null);
+        }
+        const terminal = await waitForTerminal(
+          terminalPushed,
+          task.id,
+          options.timeoutMs ?? TERMINAL_WAIT_TIMEOUT_MS,
+        );
+        assert.equal(terminal.status, options.expectedStatus);
+        assert.deepEqual(terminal.originMeta, { backgroundSource: 'bash' });
+        if (options.expectedFailedReason === undefined) {
+          assert.ok(
+            !Object.prototype.hasOwnProperty.call(terminal, 'failedReason'),
+            `${options.label} must not fabricate failedReason`,
+          );
+        } else {
+          assert.equal(terminal.failedReason, options.expectedFailedReason);
+        }
+        if (options.expectedInitiator === undefined) {
+          assert.ok(
+            !Object.prototype.hasOwnProperty.call(terminal, 'initiator'),
+            `${options.label} must not fabricate initiator`,
+          );
+        } else {
+          assert.equal(terminal.initiator, options.expectedInitiator);
+        }
+        // 完成任务的 usage 快照始终携带真实的 durationMs(缺失的遥测字段不伪造 0)
+        assert.ok(terminal.usage, 'terminal task must carry a usage snapshot');
+        assert.equal(typeof terminal.usage?.durationMs, 'number');
+        assert.ok(
+          (terminal.usage?.durationMs ?? -1) >= 0,
+          'durationMs must be a non-negative real duration',
+        );
+      } finally {
+        unsubscribeTerminal();
+        h.close();
+        await cleanupRoot(h.root);
+      }
+    }
+
+    await runCase({ label: 'completed', expectedStatus: 'completed' });
+    await runCase({
+      label: 'failed',
+      expectedStatus: 'failed',
+      expectedFailedReason: 'exit_error',
+      afterRun: (h) => {
+        h.children[0]?.close(9, null);
+      },
+    });
+    await runCase({
+      label: 'timeout',
+      expectedStatus: 'failed',
+      expectedFailedReason: 'timed_out',
+      timeoutSeconds: 1,
+      timeoutMs: 2500,
+    });
+    await runCase({
+      label: 'cancelled',
+      expectedStatus: 'cancelled',
+      expectedInitiator: 'model',
+      afterRun: async (h, task) => {
+        const kill = await emitRequest(h.bus, {
+          schema_version: BG_REQUEST_SCHEMA,
+          request_id: 'frame-kill-cancelled',
+          operation: 'kill',
+          payload: { taskId: task.id },
+        });
+        assert.equal(kill.ok, true, kill.ok ? 'ok' : kill.error);
+      },
+    });
+    await runCase({
+      label: 'killed',
+      expectedStatus: 'killed',
+      expectedInitiator: 'system',
+      afterRun: async (h) => {
+        const stopped = await h.registry.stopAllRunning(
+          'shutdown',
+          'unit shutdown',
+          'system',
+        );
+        assert.equal(stopped.failures.length, 0, 'system stop must prove cleanup');
+      },
+    });
+
+    // lost 无发布驱动路径(启动审计落盘,不发布),经服务直发合成快照验证 status 映射
+    const h = await createHarness();
+    const lostTerminals: BackgroundTaskExtensionTerminal[] = [];
+    const unsubscribeLost = h.bus.on(BG_TERMINAL_CHANNEL, (data) => {
+      const terminal = requireTerminal(data);
+      lostTerminals.push(terminal);
+    });
+    try {
+      h.service.publishTerminal({
+        task: {
+          id: 'blost9',
+          command: 'date',
+          status: 'lost',
+          outputPath: '.pi/tasks/unit/blost9.output',
+          cwd: h.ctx.cwd,
+          startTime: 10,
+          bytesWritten: 0,
+          isAgent: false,
+          surviveReload: false,
+          notified: false,
+          notifyOnCompletion: false,
+          triggerOnCompletion: false,
+        },
+      });
+      assert.equal(lostTerminals.length, 1, 'lost publication must settle a terminal');
+      assert.equal(lostTerminals[0]?.status, 'lost');
+      assert.equal(lostTerminals[0]?.originMeta?.backgroundSource, 'bash');
+    } finally {
+      unsubscribeLost();
+      h.close();
+      await rm(h.root, { recursive: true, force: true });
+    }
+  });
+
+  void it('carries a bounded 64KiB summaryTail on completion frames and omits it with empty output', async () => {
+    async function runCase(options: {
+      label: string;
+      withOutput?: boolean | undefined;
+    }): Promise<{
+      terminal: BackgroundTaskExtensionTerminal;
+      harness: ProtocolHarness;
+    }> {
+      const h = await createProtocolHarness();
+      const terminalPushed: BackgroundTaskExtensionTerminal[] = [];
+      const unsubscribeTerminal = h.bus.on(BG_TERMINAL_CHANNEL, (data) => {
+        const terminal = requireTerminal(data);
+        terminalPushed.push(terminal);
+      });
+      try {
+        const run = await emitRequest(h.bus, {
+          schema_version: BG_REQUEST_SCHEMA,
+          request_id: `tail-${options.label}`,
+          operation: 'run',
+          payload: {
+            name: `Tail ${options.label}`,
+            command: `echo ${options.label}`,
+            isAgent: false,
+            notifyOnCompletion: false,
+            triggerOnCompletion: false,
+          },
+        });
+        assert.equal(run.ok, true, run.ok ? 'ok' : run.error);
+        const task = requireTask(
+          run.ok ? run.result : undefined,
+          `${options.label}.run.result`,
+        );
+        if (options.withOutput === true) {
+          const outputAbsPath = join(
+            h.root,
+            'project',
+            '.pi',
+            'tasks',
+            `extension-api-protocol-unit-${process.pid}`,
+            `${task.id}.output`,
+          );
+          await appendFile(outputAbsPath, 'z'.repeat(TERMINAL_SUMMARY_TAIL_BYTES + 8 * 1024), 'utf8');
+        }
+        h.children[0]?.close(0, null);
+        const terminal = await waitForTerminal(terminalPushed, task.id);
+        assert.equal(terminal.status, 'completed');
+        return { terminal, harness: h };
+      } finally {
+        unsubscribeTerminal();
+        h.close();
+        await cleanupRoot(h.root);
+      }
+    }
+
+    const empty = await runCase({ label: 'empty' });
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(empty.terminal, 'summaryTail'),
+      'empty output must not fabricate a summary tail',
+    );
+
+    const withOutput = await runCase({ label: 'with-output', withOutput: true });
+    assert.ok(
+      withOutput.terminal.summaryTail !== undefined,
+      'completed task output must carry summaryTail',
+    );
+    assert.ok(
+      Buffer.byteLength(withOutput.terminal.summaryTail, 'utf8') <=
+      TERMINAL_SUMMARY_TAIL_BYTES,
+      'summaryTail must stay within 64KiB',
+    );
+    assert.equal(
+      withOutput.terminal.summaryTail,
+      'z'.repeat(TERMINAL_SUMMARY_TAIL_BYTES),
+      'summaryTail must be the bounded tail of the output file',
+    );
+  });
+
+  void it('unifies the usage snapshot shape with dock telemetry and omits unavailable fields', async () => {
+    const h = await createHarness();
+    const terminals: BackgroundTaskExtensionTerminal[] = [];
+    const unsubscribe = h.bus.on(BG_TERMINAL_CHANNEL, (data) => {
+      const terminal = requireTerminal(data);
+      terminals.push(terminal);
+    });
+    const base = (status: 'completed' | 'failed'): BgTaskSnapshot => ({
+      id: 'busage1',
+      command: 'pi --mode json -p probe',
+      status,
+      outputPath: '.pi/tasks/unit/busage1.output',
+      cwd: h.ctx.cwd,
+      startTime: 1000,
+      endTime: 7000,
+      bytesWritten: 0,
+      isAgent: true,
+      surviveReload: false,
+      notified: false,
+      notifyOnCompletion: true,
+      triggerOnCompletion: true,
+    });
+    try {
+      const rich: BgTaskSnapshot = {
+        ...base('completed'),
+        tokenUsage: {
+          input: 10,
+          output: 5,
+          cacheRead: 2,
+          cacheWrite: 1,
+          totalTokens: 18,
+        },
+        toolUsage: { total: 3, failed: 0, byName: { read: 3 } },
+      };
+      h.service.publishTerminal({ task: rich });
+      const richTerminal = terminals[0];
+      assert.ok(richTerminal !== undefined, 'rich publication must settle a terminal');
+      assert.ok(richTerminal.usage, 'rich task must carry a usage snapshot');
+      assert.equal(richTerminal.usage.durationMs, 6000);
+      assert.deepEqual(richTerminal.usage.modelUsage, {
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 2,
+        cacheWriteTokens: 1,
+        totalTokens: 18,
+      });
+      assert.equal(richTerminal.usage.toolUseCount, 3);
+      assert.equal(richTerminal.usage.totalTokens, 18);
+
+      const plain: BgTaskSnapshot = base('failed');
+      h.service.publishTerminal({ task: plain });
+      const plainTerminal = terminals[1];
+      assert.ok(plainTerminal !== undefined, 'plain publication must settle a terminal');
+      assert.ok(plainTerminal.usage, 'terminal task must always carry real durationMs');
+      assert.equal(plainTerminal.usage.durationMs, 6000);
+      assert.equal(
+        plainTerminal.usage.modelUsage,
+        undefined,
+        'missing telemetry reports unavailable, not fabricated zeros',
+      );
+      assert.equal(
+        plainTerminal.usage.toolUseCount,
+        undefined,
+        'missing telemetry reports unavailable, not fabricated zeros',
+      );
+      assert.equal(
+        plainTerminal.usage.totalTokens,
+        undefined,
+        'missing telemetry reports unavailable, not fabricated zeros',
+      );
+    } finally {
+      unsubscribe();
+      h.close();
+      await rm(h.root, { recursive: true, force: true });
+    }
   });
 
   void it('does not spawn or answer an EventBus run whose admission resumes after shutdown', async () => {
@@ -945,7 +1288,7 @@ void describe('background EventBus protocol', () => {
       assert.equal(task.terminalPublicationGate, undefined);
       assert.equal(task.terminalPublishInFlight, false);
       assert.throws(
-        () => h.service.publishTerminal(snapshot),
+        () => h.service.publishTerminal({ task: snapshot }),
         (error: unknown) =>
           error instanceof Error &&
           error.name === 'BackgroundTaskExtensionServiceClosedError' &&

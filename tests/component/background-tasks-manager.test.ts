@@ -144,6 +144,11 @@ function manager(
         tasks.unshift(rerun);
         return Promise.resolve(rerun);
       },
+      startBackgroundTask: (command) => {
+        const started = task({ id: `bg-start-${String(tasks.length)}`, name: 'Dock Start', command });
+        tasks.unshift(started);
+        return Promise.resolve(started);
+      },
       showOutputPath: (t) => {
         paths.push(t.outputPath);
       },
@@ -221,6 +226,156 @@ void describe('BackgroundTasksManager component', () => {
       assert.equal(rerunInput?.id, original.id);
       assert.equal(rerunInput?.surviveReload, true);
       assert.match(stripAnsi(h.instance.render(90).join('\n')), /Reran as .*\(bsurvive2\)/u);
+    } finally {
+      h.instance.dispose();
+    }
+  });
+
+  void it('composes a background command through the dock "to background" entry and submits with Enter', async () => {
+    const startedCommands: string[] = [];
+    const tasks = [task()];
+    const h = manager(
+      {
+        startBackgroundTask: (command) => {
+          startedCommands.push(command.trim());
+          const started = task({
+            id: 'bg-start-1',
+            name: 'Dock Start',
+            command,
+          });
+          tasks.unshift(started);
+          return Promise.resolve(started);
+        },
+      },
+      tasks,
+    );
+    try {
+      h.instance.handleInput('b');
+      const compose = stripAnsi(h.instance.render(90).join('\n'));
+      assert.match(compose, /Shell command to run in the background/u);
+      assert.match(compose, /user entry/u);
+
+      for (const key of ['n', 'p', 'm', ' ', 'r', 'u', 'n']) {
+        h.instance.handleInput(key);
+      }
+      assert.match(
+        stripAnsi(h.instance.render(90).join('\n')),
+        /npm run/u,
+      );
+
+      h.instance.handleInput('\x7f');
+      h.instance.handleInput('\x7f');
+      assert.match(
+        stripAnsi(h.instance.render(90).join('\n')),
+        /npm r/u,
+        'backspace 逐字符移除',
+      );
+
+      h.instance.handleInput('\r');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.deepEqual(startedCommands, ['npm r']);
+      const list = stripAnsi(h.instance.render(90).join('\n'));
+      assert.match(list, /Started as Dock Start/u);
+    } finally {
+      h.instance.dispose();
+    }
+  });
+
+  void it('cancels dock background composition with Escape and rejects empty command', async () => {
+    const h = manager({}, [task()]);
+    try {
+      h.instance.handleInput('B');
+      h.instance.handleInput('\x1b');
+      const list = stripAnsi(h.instance.render(90).join('\n'));
+      assert.match(list, /bg tasks focused/u, '取消后回到列表视图');
+
+      h.instance.handleInput('b');
+      h.instance.handleInput('\r');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const empty = stripAnsi(h.instance.render(90).join('\n'));
+      assert.match(empty, /Background command is empty/u);
+    } finally {
+      h.instance.dispose();
+    }
+  });
+
+  void it('keeps the dock open while composing commands containing q/x letters and submits on Enter (REVIEW)', async () => {
+    const startedCommands: string[] = [];
+    const tasks = [task()];
+    const h = manager(
+      {
+        startBackgroundTask: (command) => {
+          startedCommands.push(command.trim());
+          const started = task({
+            id: 'bg-start-2',
+            name: 'Dock Start',
+            command,
+          });
+          tasks.unshift(started);
+          return Promise.resolve(started);
+        },
+      },
+      tasks,
+    );
+    try {
+      h.instance.handleInput('b');
+      const open = stripAnsi(h.instance.render(90).join('\n'));
+      assert.match(open, /Shell command to run in the background/u);
+      assert.equal(h.closed, false, 'compose 输入态下 dock 不得关闭');
+
+      // 逐字符输入含 q/x 字母的命令(q/x 关闭语义仅属列表/详情视图,compose 中是
+      // 可打印字母,如 `chmod +x`、`exit`):任何一步输入都不得关闭 dock
+      for (const key of [
+        'c',
+        'h',
+        'm',
+        'o',
+        'd',
+        ' ',
+        '+',
+        'x',
+        ' ',
+        'r',
+        'u',
+        'n',
+        '.',
+        's',
+        'h',
+      ]) {
+        h.instance.handleInput(key);
+        const rendered = stripAnsi(h.instance.render(90).join('\n'));
+        assert.match(
+          rendered,
+          /Shell command to run in the background/u,
+          `键入 ${key} 时不得关闭 compose`,
+        );
+      }
+      assert.match(
+        stripAnsi(h.instance.render(90).join('\n')),
+        /chmod \+x run\.sh/u,
+        'q/x 字母逐字符进入 compose 缓冲',
+      );
+      assert.equal(h.closed, false, 'q/x 字母输入不得关闭 dock');
+
+      h.instance.handleInput('\r');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.match(
+        stripAnsi(h.instance.render(90).join('\n')),
+        /Started as Dock Start/u,
+        'Enter 提交含 q/x 字母的命令',
+      );
+
+      // 另一条以 x 开头的命令同样保持 compose 打开并提交
+      h.instance.handleInput('b');
+      for (const key of ['e', 'x', 'i', 't']) {
+        h.instance.handleInput(key);
+        const rendered = stripAnsi(h.instance.render(90).join('\n'));
+        assert.match(rendered, /Shell command to run in the background/u);
+      }
+      assert.equal(h.closed, false, '`exit` 输入不得关闭 dock');
+      h.instance.handleInput('\r');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.deepEqual(startedCommands, ['chmod +x run.sh', 'exit']);
     } finally {
       h.instance.dispose();
     }

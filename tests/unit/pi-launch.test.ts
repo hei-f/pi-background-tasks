@@ -2,7 +2,14 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { delimiter, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -30,7 +37,11 @@ interface FixtureFile {
   readonly mode?: number | undefined;
 }
 
-async function writeNestedFile(path: string, content = '', mode?: number): Promise<void> {
+async function writeNestedFile(
+  path: string,
+  content = '',
+  mode?: number,
+): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, content, 'utf8');
   if (mode !== undefined) await chmod(path, mode);
@@ -57,7 +68,12 @@ async function createPackageFixture(
   prefix = 'pi-bg-launch-',
 ): Promise<PackageFixture> {
   const root = await mkdtemp(join(tmpdir(), prefix));
-  const packageRoot = join(root, 'node_modules', '@earendil-works', 'pi-coding-agent');
+  const packageRoot = join(
+    root,
+    'node_modules',
+    '@earendil-works',
+    'pi-coding-agent',
+  );
   const manifestPath = join(packageRoot, 'package.json');
   await mkdir(packageRoot, { recursive: true });
   await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`, 'utf8');
@@ -76,14 +92,17 @@ async function createPackageFixture(
   const relativeCli =
     typeof bin === 'string'
       ? bin
-      : typeof bin === 'object' && bin !== null && typeof Reflect.get(bin, 'pi') === 'string'
+      : typeof bin === 'object' &&
+          bin !== null &&
+          typeof Reflect.get(bin, 'pi') === 'string'
         ? String(Reflect.get(bin, 'pi'))
         : undefined;
   return {
     root,
     packageRoot,
     manifestPath,
-    cliPath: relativeCli === undefined ? undefined : join(packageRoot, relativeCli),
+    cliPath:
+      relativeCli === undefined ? undefined : join(packageRoot, relativeCli),
     deps: depsFor(manifestPath),
   };
 }
@@ -161,7 +180,11 @@ void describe('Pi launch resolution', () => {
           }
         },
       });
-      assert.deepEqual(spec, { executable: thirdReal, argvPrefix: [], kind: 'path' });
+      assert.deepEqual(spec, {
+        executable: thirdReal,
+        argvPrefix: [],
+        kind: 'path',
+      });
       assert.deepEqual(accessAttempts, [firstReal, thirdReal]);
     } finally {
       await removeFixture(root);
@@ -213,27 +236,48 @@ void describe('Pi launch resolution', () => {
       await writeNestedFile(changedCandidate, script('CHANGED_PATH'), 0o755);
 
       process.chdir(admittedCwd);
-      const launch = resolvePiLaunch({ platform: 'darwin', path: 'bin', hostScript: '' });
+      const launch = resolvePiLaunch({
+        platform: 'darwin',
+        path: 'bin',
+        hostScript: '',
+      });
       const args = ['argument with spaces', '$(printf not-executed)'];
-      const relativeSpawn = spawnSync(launch.executable, piLaunchArgv(launch, args), {
-        cwd: childCwd,
-        env: { ...process.env, PATH: 'bin' },
-        encoding: 'utf8',
-        shell: false,
-      });
-      const changedEnvSpawn = spawnSync(launch.executable, piLaunchArgv(launch, args), {
-        cwd: childCwd,
-        env: { ...process.env, PATH: changedBin },
-        encoding: 'utf8',
-        shell: false,
-      });
+      const relativeSpawn = spawnSync(
+        launch.executable,
+        piLaunchArgv(launch, args),
+        {
+          cwd: childCwd,
+          env: { ...process.env, PATH: 'bin' },
+          encoding: 'utf8',
+          shell: false,
+        },
+      );
+      const changedEnvSpawn = spawnSync(
+        launch.executable,
+        piLaunchArgv(launch, args),
+        {
+          cwd: childCwd,
+          env: { ...process.env, PATH: changedBin },
+          encoding: 'utf8',
+          shell: false,
+        },
+      );
 
       const expectedExecutable = realpathSync(admitted);
-      const expectedOutput = 'ADMITTED:argument with spaces:$(printf not-executed)';
+      const expectedOutput =
+        'ADMITTED:argument with spaces:$(printf not-executed)';
       assert.equal(launch.executable, expectedExecutable);
-      assert.equal(relativeSpawn.status, 0, relativeSpawn.error?.message ?? relativeSpawn.stderr);
+      assert.equal(
+        relativeSpawn.status,
+        0,
+        relativeSpawn.error?.message ?? relativeSpawn.stderr,
+      );
       assert.equal(relativeSpawn.stdout, expectedOutput);
-      assert.equal(changedEnvSpawn.status, 0, changedEnvSpawn.error?.message ?? changedEnvSpawn.stderr);
+      assert.equal(
+        changedEnvSpawn.status,
+        0,
+        changedEnvSpawn.error?.message ?? changedEnvSpawn.stderr,
+      );
       assert.equal(changedEnvSpawn.stdout, expectedOutput);
     } finally {
       process.chdir(originalCwd);
@@ -266,7 +310,9 @@ void describe('Pi launch resolution', () => {
   });
 
   void it('rejects arbitrary JavaScript hosts and a host file other than declared bin.pi', async () => {
-    const arbitraryRoot = await mkdtemp(join(tmpdir(), 'pi-launch-arbitrary-host-'));
+    const arbitraryRoot = await mkdtemp(
+      join(tmpdir(), 'pi-launch-arbitrary-host-'),
+    );
     try {
       const arbitrary = join(arbitraryRoot, 'host.js');
       await writeNestedFile(arbitrary, 'console.log("not pi")\n', 0o755);
@@ -352,6 +398,7 @@ void describe('Pi launch resolution', () => {
       }
 
       await writeFile(nestedManifest, '{"name":"ignored-by-throw"}\n', 'utf8');
+      const nestedRealManifest = realpathSync(nestedManifest);
       assert.throws(
         () =>
           resolvePiLaunch({
@@ -359,7 +406,8 @@ void describe('Pi launch resolution', () => {
             path: join(fixture.root, 'empty-bin'),
             hostScript: cliPath,
             readFile: (path) => {
-              if (path === nestedManifest) throw new Error('fixture permission denied');
+              if (path === nestedRealManifest)
+                throw new Error('fixture permission denied');
               return readFileSync(path);
             },
           }),
@@ -438,7 +486,10 @@ void describe('Pi launch resolution', () => {
   });
 
   void it('uses the named running host package before a different Windows module installation', async () => {
-    const host = await createPiPackage('dist/host cli.js', 'pi-bg-host spaces-');
+    const host = await createPiPackage(
+      'dist/host cli.js',
+      'pi-bg-host spaces-',
+    );
     const moduleInstall = await createPiPackage('dist/module.js');
     try {
       assert.ok(host.cliPath);
@@ -511,7 +562,11 @@ void describe('Pi launch resolution', () => {
             }),
           new RegExp(`source realpath.*fixture ${code}`, 'i'),
         );
-        assert.equal(moduleLookups, 0, `${code} must forbid module substitution`);
+        assert.equal(
+          moduleLookups,
+          0,
+          `${code} must forbid module substitution`,
+        );
       }
     } finally {
       await removeFixture(host.root);
@@ -558,7 +613,11 @@ void describe('Pi launch resolution', () => {
         },
       });
       assert.equal(spec.argvPrefix[0], realpathSync(fixture.cliPath));
-      assert.deepEqual(attempted, [], 'a verified running host must be authoritative');
+      assert.deepEqual(
+        attempted,
+        [],
+        'a verified running host must be authoritative',
+      );
     } finally {
       await removeFixture(fixture.root);
     }
@@ -578,7 +637,8 @@ void describe('Pi launch resolution', () => {
         execPath: process.execPath,
         resolveModule: (specifier) => {
           attempted.push(specifier);
-          if (specifier === PI_PACKAGE_MANIFEST) throw new Error('manifest export unavailable');
+          if (specifier === PI_PACKAGE_MANIFEST)
+            throw new Error('manifest export unavailable');
           if (specifier === PI_PACKAGE_NAME) return fixture.cliPath as string;
           throw new Error(`unexpected ${specifier}`);
         },
@@ -612,13 +672,16 @@ void describe('Pi launch resolution', () => {
       { name: PI_PACKAGE_NAME, bin: { pi: 'dist/cli.cjs' } },
       { name: PI_PACKAGE_NAME, bin: { pi: 'dist/cli.mjs' } },
     ]) {
-      const bin = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin.pi;
+      const bin =
+        typeof manifest.bin === 'string' ? manifest.bin : manifest.bin.pi;
       const fixture = await createPackageFixture(manifest, [bin]);
       try {
         const spec = resolvePiLaunch(fixture.deps);
         assert.equal(spec.executable, process.execPath);
         assert.equal(spec.kind, 'package-node-cli');
-        assert.deepEqual(spec.argvPrefix, [realpathSync(join(fixture.packageRoot, bin))]);
+        assert.deepEqual(spec.argvPrefix, [
+          realpathSync(join(fixture.packageRoot, bin)),
+        ]);
         assert.deepEqual(piLaunchArgv(spec, ['--mode', 'json']), [
           realpathSync(join(fixture.packageRoot, bin)),
           '--mode',
@@ -685,7 +748,11 @@ void describe('Pi launch resolution', () => {
           }),
         /generic JavaScript runtime|cannot launch.*JavaScript/i,
       );
-      assert.equal(moduleLookups, 1, 'an arbitrary compiled SDK app must not bypass package lookup');
+      assert.equal(
+        moduleLookups,
+        1,
+        'an arbitrary compiled SDK app must not bypass package lookup',
+      );
 
       const compiledWindows = join(root, 'pi.exe');
       await writeNestedFile(compiledWindows, 'compiled Windows fixture\n');
@@ -749,7 +816,10 @@ void describe('Pi launch resolution', () => {
         [],
       );
       try {
-        assert.throws(() => resolvePiLaunch(absolute.deps), /absolute|outside the package root/);
+        assert.throws(
+          () => resolvePiLaunch(absolute.deps),
+          /absolute|outside the package root/,
+        );
       } finally {
         await removeFixture(absolute.root);
       }
@@ -760,7 +830,9 @@ void describe('Pi launch resolution', () => {
       [],
     );
     try {
-      await writeNestedFile(join(lexical.packageRoot, '..', 'outside', 'cli.js'));
+      await writeNestedFile(
+        join(lexical.packageRoot, '..', 'outside', 'cli.js'),
+      );
       assert.throws(
         () => resolvePiLaunch(lexical.deps),
         /pi_executable_resolution_failed: Pi package bin target (?:path escapes|resolves outside) the package root/,
@@ -777,8 +849,15 @@ void describe('Pi launch resolution', () => {
       const outside = join(linked.root, 'outside.js');
       await writeNestedFile(outside, '');
       await mkdir(join(linked.packageRoot, 'dist'), { recursive: true });
-      await symlink(outside, join(linked.packageRoot, 'dist', 'cli.js'), 'file');
-      assert.throws(() => resolvePiLaunch(linked.deps), /outside the package root/);
+      await symlink(
+        outside,
+        join(linked.packageRoot, 'dist', 'cli.js'),
+        'file',
+      );
+      assert.throws(
+        () => resolvePiLaunch(linked.deps),
+        /outside the package root/,
+      );
     } finally {
       await removeFixture(linked.root);
     }
@@ -791,7 +870,11 @@ void describe('Pi launch resolution', () => {
     );
     try {
       await mkdir(join(fixture.packageRoot, 'bin'), { recursive: true });
-      await symlink('../dist/real-cli.js', join(fixture.packageRoot, 'bin', 'pi.js'), 'file');
+      await symlink(
+        '../dist/real-cli.js',
+        join(fixture.packageRoot, 'bin', 'pi.js'),
+        'file',
+      );
       const packageAlias = join(fixture.root, 'package-alias');
       await symlink(
         fixture.packageRoot,
@@ -800,7 +883,10 @@ void describe('Pi launch resolution', () => {
       );
       const aliasManifest = join(packageAlias, 'package.json');
       const spec = resolvePiLaunch(depsFor(aliasManifest));
-      assert.equal(spec.argvPrefix[0], realpathSync(join(fixture.packageRoot, 'dist', 'real-cli.js')));
+      assert.equal(
+        spec.argvPrefix[0],
+        realpathSync(join(fixture.packageRoot, 'dist', 'real-cli.js')),
+      );
     } finally {
       await removeFixture(fixture.root);
     }
@@ -810,7 +896,10 @@ void describe('Pi launch resolution', () => {
     const malformed = await createPiPackage();
     try {
       await writeFile(malformed.manifestPath, '{', 'utf8');
-      assert.throws(() => resolvePiLaunch(malformed.deps), /pi_executable_resolution_failed/);
+      assert.throws(
+        () => resolvePiLaunch(malformed.deps),
+        /pi_executable_resolution_failed/,
+      );
     } finally {
       await removeFixture(malformed.root);
     }
@@ -818,7 +907,10 @@ void describe('Pi launch resolution', () => {
     const missingRoot = await mkdtemp(join(tmpdir(), 'pi-bg-launch-missing-'));
     try {
       const missingManifest = join(missingRoot, 'package.json');
-      assert.throws(() => resolvePiLaunch(depsFor(missingManifest)), /pi_executable_resolution_failed/);
+      assert.throws(
+        () => resolvePiLaunch(depsFor(missingManifest)),
+        /pi_executable_resolution_failed/,
+      );
     } finally {
       await removeFixture(missingRoot);
     }
@@ -830,7 +922,10 @@ void describe('Pi launch resolution', () => {
     ]) {
       const fixture = await createPackageFixture(manifest, []);
       try {
-        assert.throws(() => resolvePiLaunch(fixture.deps), /pi_executable_resolution_failed/);
+        assert.throws(
+          () => resolvePiLaunch(fixture.deps),
+          /pi_executable_resolution_failed/,
+        );
       } finally {
         await removeFixture(fixture.root);
       }
@@ -841,8 +936,13 @@ void describe('Pi launch resolution', () => {
       [],
     );
     try {
-      await mkdir(join(directoryTarget.packageRoot, 'dist', 'cli.js'), { recursive: true });
-      assert.throws(() => resolvePiLaunch(directoryTarget.deps), /regular file/);
+      await mkdir(join(directoryTarget.packageRoot, 'dist', 'cli.js'), {
+        recursive: true,
+      });
+      assert.throws(
+        () => resolvePiLaunch(directoryTarget.deps),
+        /regular file/,
+      );
     } finally {
       await removeFixture(directoryTarget.root);
     }
@@ -861,16 +961,32 @@ void describe('Pi launch resolution', () => {
   });
 
   void it('keeps spaced paths and quoted arguments as distinct Windows argv values', async () => {
-    const fixture = await createPiPackage('dist/cli with spaces.js', 'pi bg launch spaced-');
+    const fixture = await createPiPackage(
+      'dist/cli with spaces.js',
+      'pi bg launch spaced-',
+    );
     try {
       const windowsNode = 'C:\\Program Files\\nodejs\\node.exe';
       const spec = resolvePiLaunch({ ...fixture.deps, execPath: windowsNode });
-      const args = ['--session-dir', 'C:\\Task Dir\\session', '--model', 'a"b\\c'];
+      const args = [
+        '--session-dir',
+        'C:\\Task Dir\\session',
+        '--model',
+        'a"b\\c',
+      ];
       const argv = piLaunchArgv(spec, args);
       assert.equal(spec.executable, windowsNode);
-      assert.deepEqual(argv, [realpathSync(fixture.cliPath as string), ...args]);
+      assert.deepEqual(argv, [
+        realpathSync(fixture.cliPath as string),
+        ...args,
+      ]);
       assert.doesNotThrow(() =>
-        assertWindowsCommandLineWithinLimit(spec, args, 'win32', 'quoted-spaced-stage'),
+        assertWindowsCommandLineWithinLimit(
+          spec,
+          args,
+          'win32',
+          'quoted-spaced-stage',
+        ),
       );
     } finally {
       await removeFixture(fixture.root);
@@ -884,7 +1000,12 @@ void describe('Pi launch resolution', () => {
       kind: 'package-node-cli',
     };
     assert.doesNotThrow(() =>
-      assertWindowsCommandLineWithinLimit(launch, ['--model', 'gpt-5.5'], 'win32', 'unit-stage'),
+      assertWindowsCommandLineWithinLimit(
+        launch,
+        ['--model', 'gpt-5.5'],
+        'win32',
+        'unit-stage',
+      ),
     );
     const secret = 'SECRET_TOKEN_VALUE';
     assert.throws(
@@ -904,7 +1025,12 @@ void describe('Pi launch resolution', () => {
       },
     );
     assert.doesNotThrow(() =>
-      assertWindowsCommandLineWithinLimit(launch, [secret.repeat(3000)], 'linux', 'posix-stage'),
+      assertWindowsCommandLineWithinLimit(
+        launch,
+        [secret.repeat(3000)],
+        'linux',
+        'posix-stage',
+      ),
     );
   });
 });

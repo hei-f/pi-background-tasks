@@ -81,15 +81,45 @@ function effectiveSystemPrompt(context: Context): string {
   return parts.join('\n\n');
 }
 
-function latestBgRunTask(context: Context): JsonObject | undefined {
+/** 覆盖版 bash 后台调用 receipt 文本(M4 起不再有独立 bg_run 工具的 details.task)。 */
+function latestBashReceipt(context: Context): string | undefined {
   const result = context.messages
     .filter(
       (message) =>
-        message.role === 'toolResult' && 'toolName' in message && message.toolName === 'bg_run',
+        message.role === 'toolResult' && 'toolName' in message && message.toolName === 'bash',
+    )
+    .at(-1);
+  return result === undefined ? undefined : messageText(result);
+}
+
+/** 最近一次 bg_status 结果内的任务快照。 */
+function latestStatusTask(context: Context): JsonObject | undefined {
+  const result = context.messages
+    .filter(
+      (message) =>
+        message.role === 'toolResult' &&
+        'toolName' in message &&
+        message.toolName === 'bg_status',
     )
     .at(-1);
   if (result === undefined || !('details' in result) || !isObject(result.details)) return undefined;
-  return isObject(result.details['task']) ? result.details['task'] : undefined;
+  const tasks = result.details['tasks'];
+  if (!Array.isArray(tasks)) return undefined;
+  const task = tasks.at(-1);
+  return isObject(task) ? task : undefined;
+}
+
+/** 从覆盖版 bash receipt 解析 `(bXXXXXXXX)` 任务 id 与输出路径。 */
+function parseReceipt(
+  text: string | undefined,
+): { taskId: string | undefined; outputPath: string | undefined } {
+  if (text === undefined) return { taskId: undefined, outputPath: undefined };
+  const idMatch = /\(b[0-9a-f]{8}\)/u.exec(text);
+  const pathMatch = /Output: (\S+)/u.exec(text);
+  return {
+    taskId: idMatch?.[0].slice(1, -1),
+    outputPath: pathMatch?.[1],
+  };
 }
 
 function text(value: string): TextContent {
@@ -100,14 +130,20 @@ function toolCall(command: string): ToolCall {
   return {
     type: 'toolCall',
     id: 'shell-policy-bg-run',
-    name: 'bg_run',
+    name: 'bash',
     arguments: {
-      name: 'Shell Policy Witness',
       command,
-      isAgent: false,
-      notifyOnCompletion: false,
-      triggerOnCompletion: false,
+      run_in_background: true,
     },
+  };
+}
+
+function statusToolCall(id: string): ToolCall {
+  return {
+    type: 'toolCall',
+    id: 'shell-policy-status',
+    name: 'bg_status',
+    arguments: { taskId: id },
   };
 }
 
@@ -178,14 +214,16 @@ export default function shellPolicyProvider(pi: ExtensionAPI): void {
       calls += 1;
       const prompt = effectiveSystemPrompt(context);
       const guidance = guidanceFrom(prompt);
-      const task = latestBgRunTask(context);
+      const receipt = latestBashReceipt(context);
+      const parsed = parseReceipt(receipt);
+      const task = latestStatusTask(context);
       record({
         call: calls,
         guidance,
         peerGuidance: prompt.includes('peer feature guidance survives'),
         taskShellPolicy: task?.['shellPolicy'],
-        taskId: task?.['id'],
-        taskOutputPath: task?.['outputPath'],
+        taskId: task?.['id'] ?? parsed.taskId,
+        taskOutputPath: task?.['outputPath'] ?? parsed.outputPath,
         toolResult: context.messages.map(messageText).at(-1),
       });
 
@@ -199,6 +237,10 @@ export default function shellPolicyProvider(pi: ExtensionAPI): void {
         );
       } else if (calls === 1) {
         message = assistant([text('Shell policy guidance was unavailable or unexpected.')], 'stop');
+      } else if (calls === 2 && parsed.taskId !== undefined) {
+        // M4 后模型入口仅暴露覆盖版 bash;经 bg_status 取回任务快照以观测
+        // 实际执行采用的 shell policy(仍是点检而非等待原语)。
+        message = assistant([statusToolCall(parsed.taskId)], 'toolUse');
       } else {
         message = assistant([text('Shell policy launch receipt observed.')], 'stop');
       }
