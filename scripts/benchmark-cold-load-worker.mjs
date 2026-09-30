@@ -47,24 +47,6 @@ function emit(metrics, facts = {}) {
 const runtimePath = (sourcePath, compiledPath) =>
   args.runtime === 'compiled' ? compiledPath : sourcePath;
 
-if (args.scenario === 'delegate-facade-import') {
-  const start = performance.now();
-  const module = await import(url(runtimePath('src/delegate-extension.ts', 'dist/src/delegate-extension.js')));
-  emit({ facade_import_ms: elapsed(start) }, {
-    exported_registrars: ['registerDelegateExtension', 'registerBackgroundResultExtension'].filter((name) => typeof module[name] === 'function'),
-  });
-  process.exit(0);
-}
-
-if (args.scenario === 'fusion-facade-import') {
-  const start = performance.now();
-  const module = await import(url(runtimePath('src/fusion-extension.ts', 'dist/src/fusion-extension.js')));
-  emit({ facade_import_ms: elapsed(start) }, {
-    exported_registrar: typeof module.registerFusionExtension === 'function',
-  });
-  process.exit(0);
-}
-
 const sdkImportStart = performance.now();
 const sdk = await import(url('node_modules/@earendil-works/pi-coding-agent/dist/index.js'));
 const sdkImportMs = elapsed(sdkImportStart);
@@ -82,11 +64,6 @@ const backgroundPath = join(
   args.root,
   runtimePath('extensions/background-tasks.ts', 'dist/extensions/background-tasks.js'),
 );
-const attributionPath = join(
-  args.root,
-  runtimePath('extensions/anthropic-attribution.ts', 'dist/extensions/anthropic-attribution.js'),
-);
-
 async function makeLoader(paths) {
   const settingsManager = SettingsManager.inMemory({
     defaultProvider: 'bench-provider',
@@ -121,15 +98,9 @@ if (
   args.scenario === 'sdk-process-only-load' ||
   args.scenario === 'sdk-default-load'
 ) {
-  if (args.scenario === 'sdk-process-only-load') {
-    process.env.PI_BG_FEATURES = 'process';
-    process.env.PI_BG_DOCK_SHORTCUT = 'off';
-  } else {
-    Reflect.deleteProperty(process.env, 'PI_BG_FEATURES');
-    Reflect.deleteProperty(process.env, 'PI_BG_DOCK_SHORTCUT');
-  }
-  const paths =
-    args.scenario === 'sdk-no-extension-load' ? [] : [attributionPath, backgroundPath];
+  if (args.scenario === 'sdk-process-only-load') process.env.PI_BG_DOCK_SHORTCUT = 'off';
+  else Reflect.deleteProperty(process.env, 'PI_BG_DOCK_SHORTCUT');
+  const paths = args.scenario === 'sdk-no-extension-load' ? [] : [backgroundPath];
   const { loader } = await makeLoader(paths);
   const start = performance.now();
   await loader.reload();
@@ -140,10 +111,7 @@ if (
   process.exit(0);
 }
 
-process.env.PI_BG_FEATURES = args.scenario === 'delegate-first' ? 'process,delegate' : 'process,fusion';
 process.env.PI_BG_DOCK_SHORTCUT = 'off';
-process.env.PI_BG_DISABLE_UPDATE_CHECK = '1';
-process.env.PI_BG_FUSION_TEST_KEY = 'bench-key';
 
 const { loader, settingsManager, eventBus } = await makeLoader([backgroundPath]);
 const loaderStart = performance.now();
@@ -182,7 +150,7 @@ const model = modelRegistry.find('bench-provider', 'bench-model');
 if (!model) throw new Error('benchmark model did not register');
 await session.setModel(model);
 session.setThinkingLevel('low');
-await session.bindExtensions({ mode: args.scenario === 'model-selector-first' ? 'tui' : 'json' });
+await session.bindExtensions({ mode: 'json' });
 
 function tool(name) {
   const found = session.getToolDefinition(name);
@@ -228,98 +196,5 @@ async function close() {
   }
 }
 
-if (args.scenario === 'model-selector-first') {
-  const baseUi = session.extensionRunner.getUIContext();
-  let customCalls = 0;
-  session.extensionRunner.setUIContext({
-    ...baseUi,
-    custom: async () => {
-      customCalls += 1;
-      return { type: 'cancelled' };
-    },
-    notify: () => undefined,
-  });
-  const command = session.extensionRunner
-    .getRegisteredCommands()
-    .find((candidate) => candidate.invocationName === 'fusion-models');
-  if (!command) throw new Error('missing /fusion-models');
-  const context = session.extensionRunner.createCommandContext();
-  Object.defineProperty(context, 'mode', { value: 'tui', configurable: true });
-  const start = performance.now();
-  await command.handler('', context);
-  const firstMs = elapsed(start);
-  await close();
-  emit({ sdk_import_ms: sdkImportMs, package_load_ms: packageLoadMs, model_selector_first_ms: firstMs }, { custom_calls: customCalls });
-  process.exit(0);
-}
-
-if (args.scenario === 'delegate-first') {
-  const fakePi = join(binDir, 'pi');
-  const fakeSource = `#!/usr/bin/env node
-const fs = require('node:fs');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const dir = process.env.PI_BG_DELEGATE_ARTIFACT_DIR;
-const seedPath = process.env.PI_BG_DELEGATE_SEED_PATH;
-const expectedSha = process.env.PI_BG_DELEGATE_SEED_SHA256;
-const taskId = process.env.PI_BG_DELEGATE_TASK_ID;
-const nonce = process.env.PI_BG_DELEGATE_LAUNCH_NONCE;
-try { fs.readFileSync(0); } catch {}
-function sha256(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex'); }
-const seedRaw = fs.readFileSync(seedPath, 'utf8');
-const seed = JSON.parse(seedRaw);
-const answer = Buffer.from('BENCH DELEGATE ANSWER', 'utf8');
-const pkg = {
- schema_version: 'pi-background-tasks.delegate-result.v1', task_id: taskId, launch_nonce: nonce,
- seed_sha256: expectedSha, directive_sha256: seed.directive.sha256,
- route: { provider: seed.route.provider, model: seed.route.model },
- route_attestations: [{ provider: seed.route.provider, model: seed.route.model, stop_reason: 'stop' }],
- stop_reason: 'stop', turns: 1, tool_calls: 0,
- usage: { status: 'unavailable', reason: 'benchmark fake child' },
- answer: { encoding: 'utf-8', byte_length: answer.length, sha256: sha256(answer), blocks: [{ kind: 'text', byte_length: answer.length, sha256: sha256(answer), data_base64: answer.toString('base64') }] },
- spilled_artifacts: []
-};
-function canonical(value) { if (Array.isArray(value)) return value.map(canonical); if (value && typeof value === 'object') { const out = {}; for (const key of Object.keys(value).sort()) out[key] = canonical(value[key]); return out; } return value; }
-const temporary = path.join(dir, 'result.json.tmp');
-fs.writeFileSync(temporary, JSON.stringify(canonical(pkg)) + '\\n');
-fs.renameSync(temporary, path.join(dir, 'result.json'));
-`;
-  await writeFile(fakePi, fakeSource, 'utf8');
-  await chmod(fakePi, 0o755);
-  process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ''}`;
-  const start = performance.now();
-  const launch = await execute('bg_delegate', { name: 'Cold delegate', prompt: 'Return benchmark evidence.' });
-  const firstMs = elapsed(start);
-  const taskId = field(field(launch, 'details'), 'task')?.id;
-  if (typeof taskId !== 'string') throw new Error('delegate receipt omitted task id');
-  const terminalStatus = await waitTerminal(taskId);
-  const resultStart = performance.now();
-  const result = await execute('bg_result', { taskId, delivery: 'inline' });
-  const resultMs = elapsed(resultStart);
-  const state = field(field(result, 'details'), 'state');
-  await close();
-  emit({ sdk_import_ms: sdkImportMs, package_load_ms: packageLoadMs, delegate_first_ms: firstMs, delegate_result_first_ms: resultMs }, { task_status: terminalStatus, result_state: state });
-  process.exit(0);
-}
-
-if (args.scenario === 'fusion-first') {
-  const helper = await import(url('tests/helpers/fusion-fake-pi.ts'));
-  const fake = await helper.installFusionFakePi(args.sampleRoot, { mergedText: 'BENCH FUSION ANSWER' });
-  process.env.PATH = fake.env.PATH;
-  const start = performance.now();
-  const launch = await execute('fusion_reason', { prompt: 'Return benchmark evidence.' });
-  const firstMs = elapsed(start);
-  const taskId = field(field(launch, 'details'), 'task')?.id;
-  if (typeof taskId !== 'string') throw new Error('fusion receipt omitted task id');
-  const terminalStatus = await waitTerminal(taskId);
-  const resultStart = performance.now();
-  const result = await execute('bg_result', { taskId, delivery: 'inline' });
-  const resultMs = elapsed(resultStart);
-  const state = field(field(result, 'details'), 'state');
-  const childCalls = (await readFile(fake.logPath, 'utf8')).trim().split('\n').filter(Boolean).length;
-  await close();
-  emit({ sdk_import_ms: sdkImportMs, package_load_ms: packageLoadMs, fusion_first_ms: firstMs, fusion_result_first_ms: resultMs }, { task_status: terminalStatus, result_state: state, mocked_child_calls: childCalls });
-  process.exit(0);
-}
-
 throw new Error(`unsupported scenario: ${args.scenario}`);
+

@@ -14,8 +14,6 @@ try {
     [
       '--no-extensions',
       '-e',
-      './dist/extensions/anthropic-attribution.js',
-      '-e',
       './dist/extensions/background-tasks.js',
       '--offline',
       '--no-tools',
@@ -31,7 +29,8 @@ try {
         ...isolatedTestEnv,
         PI_CODING_AGENT_DIR: agentDir,
         PI_CODING_AGENT_SESSION_DIR: join(agentDir, 'sessions'),
-        NPM_CONFIG_CACHE: process.env['NPM_CONFIG_CACHE'] ?? '/tmp/pi-npm-cache',
+        NPM_CONFIG_CACHE:
+          process.env['NPM_CONFIG_CACHE'] ?? '/tmp/pi-npm-cache',
       },
     },
   );
