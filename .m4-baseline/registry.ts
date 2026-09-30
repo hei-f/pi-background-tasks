@@ -1,0 +1,4002 @@
+import { spawn as nodeSpawn, type SpawnOptions } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { createWriteStream, existsSync } from 'node:fs';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { Api, Model } from '@earendil-works/pi-ai';
+import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { formatSize } from '@earendil-works/pi-coding-agent';
+import {
+  boundedRead,
+  deriveTaskNameFromCommand,
+  escapeXml,
+  formatAgentActivityLine,
+  formatDuration,
+  isEnospcError,
+  isJsonObject,
+  normalizeTaskName,
+  parseAgentActivity,
+  parseJsonText,
+  resolveShellPolicy,
+  sanitizePathSegment,
+  shellInvocationForPolicy,
+  shellPolicySnapshot,
+  shellQuote,
+  snapshot,
+  taskDisplayName,
+  type BgLogsDetails,
+  type BgTask,
+  type BgTaskSnapshot,
+  type JsonObject,
+  type KillKind,
+  type ReloadShellActivationClaimV1,
+  type ReloadShellActivationLeaseV1,
+  type ReloadShellHostAdapterV1,
+  type ReloadShellIdentityV1,
+  type ReloadShellOwnerHubV1,
+  type ReloadableShellExecutionV1,
+  type ResolvedShellPolicy,
+  type StartTaskOptions,
+  type StopInitiator,
+  type TaskContextUsage,
+  type TaskStatus,
+  type TaskTokenUsage,
+  type TaskToolUsage,
+  type TerminalPublicationAbandonReason,
+  ReloadSurvivalError,
+} from './common.js';
+import { writeFileDurable } from './durable-fs.js';
+import { closeAndFsyncOutputStream, writeJsonAtomic } from './task-durable.js';
+import { resolvePiLaunch, type PiLaunchSpec } from './pi-launch.js';
+import { BackgroundTaskExtensionServiceClosedError } from './extension-api.js';
+import {
+  createReloadableShellExecutionV1,
+  RELOAD_SHELL_OWNER_PROTOCOL,
+} from './reload-shell-owner.js';
+import {
+  runWindowsTaskkill,
+  type TaskkillOutcome,
+  type WindowsKillPhase,
+  type WindowsTaskkillOptions,
+} from './windows-taskkill.js';
+import {
+  collectPosixDescendantPids as collectPosixDescendantPidsDefault,
+} from './process-tree.js';
+
+/** 启动审计遗留 running 记录的落盘错误说明前缀。 */
+export const STARTUP_AUDIT_ERROR =
+  'pi_bg_startup_audit: task record was still "running" when a fresh extension activation audited the runtime directory; the process is not revived and the retained output file remains readable at its recorded path';
+
+/** 停止发起者优先级表,user > model > system。 */
+const STOP_INITIATOR_PRIORITY: Record<StopInitiator, number> = {
+  user: 3,
+  model: 2,
+  system: 1,
+};
+
+function stopInitiatorPriority(initiator?: StopInitiator): number {
+  return initiator === undefined ? 0 : STOP_INITIATOR_PRIORITY[initiator];
+}
+
+export const MAX_OUTPUT_BYTES = Number(
+  process.env['PI_BG_MAX_OUTPUT_BYTES'] ?? 2 * 1024 * 1024 * 1024,
+);
+export const SOFT_OUTPUT_BYTES = Number(
+  process.env['PI_BG_SOFT_OUTPUT_BYTES'] ?? 256 * 1024 * 1024,
+);
+export const KILL_GRACE_MS = 3000;
+export const STOP_WAIT_MS = KILL_GRACE_MS + 1500;
+/**
+ * TERM 后启动 ps 后代收集的延迟窗口(生产默认 3000ms grace 下为 TERM 后 1500ms,
+ * 即 grace 的一半);与 killEscalationTimer 一样被注入的 killGraceMs 按比例缩放,
+ * 保证「TERM → 收集窗口 → 组 SIGKILL+逐后代 SIGKILL」时序在任意注入窗口下成立。
+ */
+export const POSIX_DESCENDANT_COLLECT_DELAY_MS = 1500;
+export const MAX_RECENT_TASKS = 100;
+export const TERMINAL_PUBLICATION_MAX_ATTEMPTS = 3;
+export const TERMINAL_PUBLICATION_RETRY_MS = 100;
+export const TASK_ADMISSION_TIMEOUT_MS = 30_000;
+const TERMINAL_PUBLICATION_DIAGNOSTIC_CHARS = 500;
+const TELEMETRY_BUFFER_CHARS = 512 * 1024;
+
+export type TerminalPublicationClosureReason = Extract<
+  TerminalPublicationAbandonReason,
+  'registry_shutdown' | 'publisher_closed'
+>;
+
+type TerminalPublicationGateOutcome =
+  | { readonly kind: 'released' }
+  | { readonly kind: 'rejected'; readonly error: unknown }
+  | {
+      readonly kind: 'closed';
+      readonly reason: TerminalPublicationAbandonReason;
+    };
+
+interface TerminalPublicationAbandonSignal {
+  readonly promise: Promise<TerminalPublicationAbandonReason>;
+  readonly resolve: (reason: TerminalPublicationAbandonReason) => void;
+}
+
+export class BackgroundTaskAdmissionClosedError extends Error {
+  readonly code = 'pi_background_tasks_admission_closed';
+
+  constructor(kind: string) {
+    super(`Cannot start ${kind} after background task admissions have closed`);
+    this.name = 'BackgroundTaskAdmissionClosedError';
+  }
+}
+
+export class BackgroundTaskAdmissionTimeoutError extends Error {
+  readonly code = 'pi_background_tasks_admission_timeout';
+
+  constructor(kind: string, timeoutMs: number) {
+    super(`Timed out while preparing ${kind} after ${String(timeoutMs)}ms`);
+    this.name = 'BackgroundTaskAdmissionTimeoutError';
+  }
+}
+
+interface TaskAdmission {
+  readonly kind: string;
+  readonly controller: AbortController;
+  readonly deadlineAt: number;
+  readonly timeoutMs: number;
+  timeoutHandle: NodeJS.Timeout | undefined;
+  released: boolean;
+}
+export const WIN32_CMD_PI_TELEMETRY_UNAVAILABLE_REASON =
+  'win32-cmd-cannot-safely-intercept-pi-argv';
+export const NON_POSIX_SHELL_PI_TELEMETRY_UNAVAILABLE_REASON =
+  'user-non-posix-shell-cannot-safely-intercept-pi-argv';
+
+export interface BackgroundTaskModelRegistry extends Pick<
+  ExtensionContext['modelRegistry'],
+  'getAll'
+> {
+  find?: (provider: string, modelId: string) => Model<Api> | undefined;
+  isUsingOAuth?: (model: Model<Api>) => boolean;
+}
+
+export interface BackgroundTaskContext {
+  cwd: string;
+  sessionId?: string;
+  modelRegistry: BackgroundTaskModelRegistry;
+  model?: ExtensionContext['model'] | undefined;
+}
+
+interface OutputEventSource {
+  on(event: 'data', listener: (data: Buffer | string) => void): unknown;
+  /** M3 force-exit:释放插件持有的 pipe 读端(Node ReadStream 实现;测试假件可为缺省)。 */
+  destroy?: (() => void) | undefined;
+}
+
+interface ChildStdin {
+  write(data: Buffer, callback: (error?: Error | null) => void): boolean;
+  end(callback?: () => void): unknown;
+  once(event: 'error', listener: (error: Error) => void): unknown;
+}
+
+export interface BackgroundTaskChildProcess {
+  pid?: number | undefined;
+  stdin?: ChildStdin | null | undefined;
+  stdout?: OutputEventSource | null | undefined;
+  stderr?: OutputEventSource | null | undefined;
+  kill(signal?: NodeJS.Signals): boolean;
+  on(event: 'error', listener: (error: Error) => void): unknown;
+  on(
+    event: 'close',
+    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
+  ): unknown;
+}
+
+export type BackgroundTaskSpawn = (
+  command: string,
+  args: string[],
+  options: SpawnOptions,
+) => BackgroundTaskChildProcess;
+
+type KillProcessFn = (pid: number, signal?: NodeJS.Signals | number) => boolean;
+type KillTreeFn = (
+  pid: number,
+  phase: WindowsKillPhase,
+  signal?: AbortSignal,
+) => Promise<TaskkillOutcome>;
+
+interface PosixProcessGroupKillState {
+  readonly groupId: number;
+  readonly completion: Promise<void>;
+  readonly resolveCompletion: () => void;
+  readonly deadlineAt: number;
+  forceAttempted: boolean;
+  settled: boolean;
+  failure?: Error | undefined;
+  lastProbeError?: Error | undefined;
+  verificationTimer?: NodeJS.Timeout | undefined;
+  /** M3:TERM 后 grace 窗口内安排的 ps 后代收集定时器。 */
+  descendantCollectTimer?: NodeJS.Timeout | undefined;
+  /** M3:收集成功后的后代 pid 快照;失败/超时保持缺省,退化到组信号路径。 */
+  descendantPids?: Set<number> | undefined;
+  failureListeners?: Array<(error: Error) => void> | undefined;
+}
+
+interface WindowsKillState {
+  softController?: AbortController | undefined;
+  softPromise?: Promise<void> | undefined;
+  forcePromise?: Promise<void> | undefined;
+  forceFailure?: Error | undefined;
+  forceFailureListeners?: Array<(error: Error) => void> | undefined;
+}
+
+/** waiter 双通道(runtime-task 参照 ZCode)的单个等待者记录。 */
+interface TaskWaiter {
+  onAbort?: (() => void) | undefined;
+  reject: (error: unknown) => void;
+  resolve: (snapshot: BgTaskSnapshot | undefined) => void;
+  signal?: AbortSignal | undefined;
+}
+
+function waiterAbortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error('Background task wait aborted');
+}
+
+/** 判定任务是否已终止(五态终态全集,即非 running)。 */
+function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return status !== 'running';
+}
+
+export interface CompletionNotificationMessage {
+  customType: 'background-task-notification';
+  content: string;
+  display: true;
+  details: BgTaskSnapshot;
+}
+
+export interface CompletionNotificationOptions {
+  deliverAs: 'followUp';
+  triggerTurn: boolean;
+}
+
+export type CompletionNotificationSender = (
+  message: CompletionNotificationMessage,
+  options: CompletionNotificationOptions,
+) => void;
+
+export interface BackgroundTaskRegistryOptions {
+  onChange?: () => void;
+  sendCompletionNotification: CompletionNotificationSender;
+  publishTerminal?: (task: BgTaskSnapshot) => void;
+  spawn?: BackgroundTaskSpawn;
+  killProcess?: KillProcessFn;
+  killTree?: KillTreeFn;
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  shellPolicy?: ResolvedShellPolicy;
+  makeTaskId?: () => string;
+  now?: () => number;
+  maxOutputBytes?: number;
+  softOutputBytes?: number;
+  maxRecentTasks?: number;
+  killGraceMs?: number;
+  stopWaitMs?: number;
+  taskAdmissionTimeoutMs?: number;
+  /** M3:可注入的 POSIX 后代收集(单测注入 fixture;缺省为真实 ps 一次扫描)。 */
+  collectPosixDescendantPids?: (rootPid: number) => Promise<Set<number>>;
+  logger?: Pick<Console, 'error'>;
+  reloadShellOwner?: ReloadShellOwnerHubV1;
+}
+
+interface RuntimeDir {
+  abs: string;
+  display: string;
+}
+
+interface ModelWindowIndex {
+  byQualifiedId: Record<string, number>;
+  byId: Record<string, number>;
+  defaultModel?: string | undefined;
+  defaultProvider?: string | undefined;
+  defaultContextWindow?: number | undefined;
+}
+
+function defaultTaskId(): string {
+  return `b${randomBytes(4).toString('hex')}`;
+}
+
+export function commandMayLaunchPiAgent(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env['PI_BG_DISABLE_PI_TELEMETRY'] === '1') return false;
+  return /(^|[\s;&|()])pi(?=\s)(?=[^\n;&|]*(?:\s-p(?:\s|$)|\s--print(?:\s|$)|\s--mode(?:=|\s+)json\b))/m.test(
+    command,
+  );
+}
+
+export function buildModelWindowIndex(
+  ctx: Pick<BackgroundTaskContext, 'modelRegistry' | 'model'>,
+): ModelWindowIndex {
+  const byQualifiedId: Record<string, number> = {};
+  const candidatesById = new Map<string, Set<number>>();
+  for (const model of ctx.modelRegistry.getAll()) {
+    const contextWindow =
+      typeof model.contextWindow === 'number' &&
+      Number.isFinite(model.contextWindow) &&
+      model.contextWindow > 0
+        ? Math.floor(model.contextWindow)
+        : undefined;
+    if (!contextWindow) continue;
+    byQualifiedId[`${model.provider}/${model.id}`] = contextWindow;
+    let candidates = candidatesById.get(model.id);
+    if (!candidates) {
+      candidates = new Set<number>();
+      candidatesById.set(model.id, candidates);
+    }
+    candidates.add(contextWindow);
+  }
+  const byId: Record<string, number> = {};
+  for (const [id, windows] of candidatesById) {
+    const onlyWindow = windows.values().next();
+    if (windows.size === 1 && !onlyWindow.done) byId[id] = onlyWindow.value;
+  }
+  const current = ctx.model;
+  return {
+    byQualifiedId,
+    byId,
+    defaultModel: current?.id,
+    defaultProvider: current?.provider,
+    defaultContextWindow: current?.contextWindow,
+  };
+}
+
+export function createPiTelemetryWrapperSource(
+  index: ModelWindowIndex,
+  launch: PiLaunchSpec = resolvePiLaunch(),
+): string {
+  return `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const index = ${JSON.stringify(index)};
+const launch = ${JSON.stringify(launch)};
+const WINDOWS_COMMAND_LINE_LIMIT = 32767;
+
+const tokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+let costTotal = 0;
+let hasCostTotal = false;
+let agentModel;
+const toolUsage = { total: 0, failed: 0, byName: {} };
+const seenToolCallIds = new Set();
+const failedToolCallIds = new Set();
+
+function nonNegativeInteger(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+}
+
+function normalizeUsage(usage) {
+  if (!usage) return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+  const input = nonNegativeInteger(usage.input);
+  const output = nonNegativeInteger(usage.output);
+  const cacheRead = nonNegativeInteger(usage.cacheRead);
+  const cacheWrite = nonNegativeInteger(usage.cacheWrite);
+  const explicitTotal = nonNegativeInteger(usage.totalTokens);
+  const totalTokens = explicitTotal || (input + output + cacheRead + cacheWrite);
+  const cost = usage.cost && typeof usage.cost.total === "number" && Number.isFinite(usage.cost.total) && usage.cost.total >= 0
+    ? usage.cost.total
+    : undefined;
+  return { input, output, cacheRead, cacheWrite, totalTokens, cost };
+}
+
+function addTokenUsage(usage) {
+  const normalized = normalizeUsage(usage);
+  if (!normalized.totalTokens) return normalized;
+  tokenUsage.input += normalized.input;
+  tokenUsage.output += normalized.output;
+  tokenUsage.cacheRead += normalized.cacheRead;
+  tokenUsage.cacheWrite += normalized.cacheWrite;
+  tokenUsage.totalTokens += normalized.totalTokens;
+  if (normalized.cost !== undefined) {
+    costTotal += normalized.cost;
+    hasCostTotal = true;
+  }
+  return normalized;
+}
+
+function currentTokenUsage() {
+  if (!tokenUsage.totalTokens) return undefined;
+  const out = { ...tokenUsage };
+  if (hasCostTotal) out.costTotal = costTotal;
+  return out;
+}
+
+function markToolStarted(id, name) {
+  const key = id ? String(id) : undefined;
+  if (key && seenToolCallIds.has(key)) return;
+  if (key) seenToolCallIds.add(key);
+  const toolName = name ? String(name) : "unknown";
+  toolUsage.total += 1;
+  toolUsage.byName[toolName] = (toolUsage.byName[toolName] || 0) + 1;
+}
+
+function markToolFailed(id) {
+  const key = id ? String(id) : undefined;
+  if (key && failedToolCallIds.has(key)) return;
+  if (key) failedToolCallIds.add(key);
+  toolUsage.failed += 1;
+}
+
+function currentToolUsage() {
+  if (!toolUsage.total && !toolUsage.failed) return undefined;
+  return { total: toolUsage.total, failed: toolUsage.failed, byName: { ...toolUsage.byName } };
+}
+
+function renderWindowsArgument(value) {
+  if (value.length > 0 && !/[ \\t\"]/.test(value)) return value;
+  let rendered = "\\\"";
+  let backslashes = 0;
+  for (const char of value) {
+    if (char === "\\\\") {
+      backslashes += 1;
+      continue;
+    }
+    if (char === "\\\"") {
+      rendered += "\\\\".repeat(backslashes * 2 + 1);
+      rendered += "\\\"";
+      backslashes = 0;
+      continue;
+    }
+    if (backslashes > 0) {
+      rendered += "\\\\".repeat(backslashes);
+      backslashes = 0;
+    }
+    rendered += char;
+  }
+  if (backslashes > 0) rendered += "\\\\".repeat(backslashes * 2);
+  rendered += "\\\"";
+  return rendered;
+}
+
+function assertWindowsLimit(stage, args) {
+  if (process.platform !== "win32") return;
+  const measured = [launch.executable, ...launch.argvPrefix, ...args].map(renderWindowsArgument).join(" ").length + 1;
+  if (measured > WINDOWS_COMMAND_LINE_LIMIT) {
+    const error = new Error("pi_command_line_too_long: " + stage + " measured UTF-16 command line length " + String(measured) + " exceeds limit " + String(WINDOWS_COMMAND_LINE_LIMIT));
+    error.code = "pi_command_line_too_long";
+    throw error;
+  }
+}
+
+function emitUnifiedTelemetry(payload) {
+  const out = { type: "background-task-telemetry", ...payload };
+  const tokens = currentTokenUsage();
+  const tools = currentToolUsage();
+  if (tokens && !out.tokenUsage) out.tokenUsage = tokens;
+  if (tools && !out.toolUsage) out.toolUsage = tools;
+  if (agentModel && !out.model) out.model = agentModel;
+  process.stdout.write(JSON.stringify(out) + "\\n");
+}
+
+function emitActivity(activity) {
+  process.stdout.write(JSON.stringify({ type: "background-task-activity", ...activity }) + "\\n");
+}
+
+function summarizeArgs(args) {
+  if (!args || typeof args !== "object") return "";
+  const pick = (value) => {
+    if (typeof value === "string" && value.trim()) return value.trim().slice(0, 200);
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    return undefined;
+  };
+  const preferred = ["path", "file_path", "file", "filename", "command", "cmd", "pattern", "query", "url", "name", "value", "text", "message"];
+  for (const key of preferred) { const summary = pick(args[key]); if (summary) return summary; }
+  for (const key of Object.keys(args)) { const summary = pick(args[key]); if (summary) return summary; }
+  return "";
+}
+
+function emitAssistantActivity(message) {
+  const content = message && Array.isArray(message.content) ? message.content : [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+      emitActivity({ kind: "assistant_text", text: part.text });
+    } else if (part.type === "thinking" || part.type === "reasoning") {
+      const text = typeof part.text === "string" ? part.text : (typeof part.thinking === "string" ? part.thinking : "");
+      if (text.trim()) emitActivity({ kind: "reasoning", text: text });
+    }
+  }
+}
+
+function resolveModelName(fromMessage, fromArgs, providerFromArgs) {
+  const message = fromMessage ? String(fromMessage) : "";
+  const args = fromArgs ? String(fromArgs) : "";
+  const bareOf = (value) => value.includes("/") ? value.split("/").pop() : value;
+  if (message && message.includes("/")) return message;
+  if (args && args.includes("/") && (!message || bareOf(args) === message)) return args;
+  const primary = message || args;
+  if (!primary) return undefined;
+  if (primary.includes("/")) return primary;
+  if (providerFromArgs) return providerFromArgs + "/" + primary;
+  if (index.defaultProvider) return index.defaultProvider + "/" + primary;
+  return primary;
+}
+
+function parseInvocation(argv) {
+  const out = [];
+  let model;
+  let provider;
+  let hasMode = false;
+  let modeValue;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-p" || arg === "--print") continue;
+    if (arg === "--mode") {
+      hasMode = true;
+      modeValue = argv[i + 1];
+      out.push(arg);
+      if (i + 1 < argv.length) out.push(argv[++i]);
+      continue;
+    }
+    if (arg.startsWith("--mode=")) {
+      hasMode = true;
+      modeValue = arg.slice("--mode=".length);
+      out.push(arg);
+      continue;
+    }
+    if (arg === "--model" && i + 1 < argv.length) {
+      model = argv[i + 1];
+      out.push(arg, argv[++i]);
+      continue;
+    }
+    if (arg.startsWith("--model=")) model = arg.slice("--model=".length);
+    if (arg === "--provider" && i + 1 < argv.length) {
+      provider = argv[i + 1];
+      out.push(arg, argv[++i]);
+      continue;
+    }
+    if (arg.startsWith("--provider=")) provider = arg.slice("--provider=".length);
+    out.push(arg);
+  }
+  if (hasMode && modeValue !== "json") return { args: argv, parseJson: false, model, provider };
+  if (!hasMode) out.unshift("--mode", "json");
+  return { args: out, parseJson: true, model, provider };
+}
+
+function resolveWindow(modelFromArgs, providerFromArgs, modelFromMessage) {
+  const candidates = [];
+  if (modelFromMessage) candidates.push(modelFromMessage);
+  if (modelFromArgs) candidates.push(modelFromArgs);
+  if (modelFromArgs && providerFromArgs && !modelFromArgs.includes("/")) candidates.push(providerFromArgs + "/" + modelFromArgs);
+  if (modelFromArgs && index.defaultProvider && !modelFromArgs.includes("/")) candidates.push(index.defaultProvider + "/" + modelFromArgs);
+  if (index.defaultModel && index.defaultProvider) candidates.push(index.defaultProvider + "/" + index.defaultModel);
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (index.byQualifiedId[candidate]) return index.byQualifiedId[candidate];
+    const bare = String(candidate).includes("/") ? String(candidate).split("/").pop() : String(candidate);
+    if (bare && index.byId[bare]) return index.byId[bare];
+  }
+  return index.defaultContextWindow || 0;
+}
+
+function countToolCallsFromMessage(message) {
+  const content = message && Array.isArray(message.content) ? message.content : [];
+  for (const part of content) {
+    if (part && part.type === "toolCall") markToolStarted(part.id, part.name);
+  }
+}
+
+function emitMessageTelemetry(message, modelFromArgs, providerFromArgs) {
+  const usage = addTokenUsage(message && message.usage);
+  const resolvedModel = resolveModelName(message && message.model, modelFromArgs, providerFromArgs);
+  if (resolvedModel) agentModel = resolvedModel;
+  const contextWindow = resolveWindow(modelFromArgs, providerFromArgs, message && message.model);
+  const contextUsage = usage.totalTokens && contextWindow
+    ? { tokens: usage.totalTokens, contextWindow, percent: (usage.totalTokens / contextWindow) * 100 }
+    : undefined;
+  if (contextUsage) process.stdout.write(JSON.stringify({ type: "background-task-context-usage", ...contextUsage }) + "\\n");
+  const payload = {};
+  if (contextUsage) payload.contextUsage = contextUsage;
+  emitUnifiedTelemetry(payload);
+}
+
+function emitToolTelemetry() {
+  emitUnifiedTelemetry({});
+}
+
+const parsed = parseInvocation(process.argv.slice(2));
+let child;
+let buffer = "";
+try {
+  const childArgs = [...launch.argvPrefix, ...parsed.args];
+  assertWindowsLimit("telemetry-wrapper-pi", parsed.args);
+  child = spawn(launch.executable, childArgs, { stdio: ["ignore", "pipe", "pipe"], env: process.env, shell: false, windowsHide: true });
+} catch (error) {
+  const message = error && typeof error.message === "string" ? error.message : String(error);
+  process.stderr.write("[pi-bg telemetry wrapper error: " + message + "]\\n");
+  process.exitCode = 1;
+}
+
+if (child) {
+  if (!parsed.parseJson) {
+    child.stdout.pipe(process.stdout);
+  } else {
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) processLine(line);
+    });
+  }
+  child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+  child.on("error", (error) => {
+    process.stderr.write("[pi-bg telemetry wrapper error: " + error.message + "]\\n");
+  });
+  child.on("close", (code, signal) => {
+    if (parsed.parseJson && buffer.trim()) processLine(buffer);
+    // Never call process.exit() here: the final message telemetry may still be
+    // buffered on wrapper stdout, and forced exit can publish a stale context
+    // snapshot from the preceding assistant turn. exitCode lets Node drain the
+    // pipe; signal termination is deferred through the same stdout barrier.
+    process.stdout.write("", () => {
+      if (signal) process.kill(process.pid, signal);
+      else process.exitCode = code ?? 0;
+    });
+  });
+}
+
+function processLine(line) {
+  if (!line.trim()) return;
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    process.stdout.write(line + "\\n");
+    return;
+  }
+  if (event.type === "tool_execution_start") {
+    const toolName = event.toolName || event.tool_name || "tool";
+    markToolStarted(event.toolCallId || event.tool_call_id, toolName);
+    emitActivity({ kind: "tool_start", tool: String(toolName), argsSummary: summarizeArgs(event.args || event.arguments || event.input || event.parameters) });
+    emitToolTelemetry();
+    return;
+  }
+  if (event.type === "tool_execution_end") {
+    const toolName = event.toolName || event.tool_name || "tool";
+    if (event.isError) markToolFailed(event.toolCallId || event.tool_call_id);
+    emitActivity({ kind: "tool_end", tool: String(toolName), isError: !!event.isError, error: typeof event.error === "string" ? event.error : undefined });
+    emitToolTelemetry();
+    return;
+  }
+  if (event.type === "message_end" && event.message && event.message.role === "assistant") {
+    emitAssistantActivity(event.message);
+    countToolCallsFromMessage(event.message);
+    emitMessageTelemetry(event.message, parsed.model, parsed.provider);
+  }
+}
+`;
+}
+
+interface ContextUsagePayload extends JsonObject {
+  readonly contextWindow?: unknown;
+  readonly tokens?: unknown;
+  readonly percent?: unknown;
+}
+
+interface TokenUsagePayload extends JsonObject {
+  readonly input?: unknown;
+  readonly output?: unknown;
+  readonly cacheRead?: unknown;
+  readonly cacheWrite?: unknown;
+  readonly totalTokens?: unknown;
+  readonly costTotal?: unknown;
+}
+
+interface ToolUsagePayload extends JsonObject {
+  readonly byName?: unknown;
+  readonly failed?: unknown;
+  readonly total?: unknown;
+}
+
+function normalizeContextUsage(value: unknown): TaskContextUsage | undefined {
+  if (!isJsonObject(value)) return undefined;
+  const input: ContextUsagePayload = value;
+  const rawContextWindow = input.contextWindow;
+  const contextWindow =
+    typeof rawContextWindow === 'number' &&
+    Number.isFinite(rawContextWindow) &&
+    rawContextWindow > 0
+      ? Math.floor(rawContextWindow)
+      : undefined;
+  if (!contextWindow) return undefined;
+  const rawTokens = input.tokens;
+  const tokens =
+    rawTokens === null
+      ? null
+      : typeof rawTokens === 'number' &&
+          Number.isFinite(rawTokens) &&
+          rawTokens >= 0
+        ? Math.floor(rawTokens)
+        : null;
+  const rawPercent = input.percent;
+  const percent =
+    rawPercent === null
+      ? null
+      : typeof rawPercent === 'number' &&
+          Number.isFinite(rawPercent) &&
+          rawPercent >= 0
+        ? rawPercent
+        : tokens === null
+          ? null
+          : (tokens / contextWindow) * 100;
+  return { tokens, contextWindow, percent };
+}
+
+function parseContextUsageXml(xml: string): TaskContextUsage | undefined {
+  const readNumber = (tag: string): number | null | undefined => {
+    const match = new RegExp(`<${tag}>(.*?)</${tag}>`, 'i').exec(xml);
+    if (!match) return undefined;
+    const raw = match[1]?.trim();
+    if (raw === 'null' || raw === '?') return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+  const tokens = readNumber('tokens');
+  const contextWindow =
+    readNumber('context-window') ?? readNumber('contextWindow');
+  const percent = readNumber('percent');
+  return normalizeContextUsage({ tokens, contextWindow, percent });
+}
+
+function nonNegativeInteger(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : 0;
+}
+
+function normalizeModel(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > 120 ? trimmed.slice(0, 120) : trimmed;
+}
+
+function normalizeTokenUsage(value: unknown): TaskTokenUsage | undefined {
+  if (!isJsonObject(value)) return undefined;
+  const input: TokenUsagePayload = value;
+  const usage: TaskTokenUsage = {
+    input: nonNegativeInteger(input.input),
+    output: nonNegativeInteger(input.output),
+    cacheRead: nonNegativeInteger(input.cacheRead),
+    cacheWrite: nonNegativeInteger(input.cacheWrite),
+    totalTokens: nonNegativeInteger(input.totalTokens),
+  };
+  if (usage.totalTokens <= 0)
+    usage.totalTokens =
+      usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  const rawCostTotal = input.costTotal;
+  if (
+    typeof rawCostTotal === 'number' &&
+    Number.isFinite(rawCostTotal) &&
+    rawCostTotal >= 0
+  )
+    usage.costTotal = rawCostTotal;
+  return usage.totalTokens > 0 ? usage : undefined;
+}
+
+function normalizeToolUsage(value: unknown): TaskToolUsage | undefined {
+  if (!isJsonObject(value)) return undefined;
+  const input: ToolUsagePayload = value;
+  const byName: Record<string, number> = {};
+  const rawByName = input.byName;
+  if (isJsonObject(rawByName)) {
+    for (const [name, count] of Object.entries(rawByName)) {
+      const normalized = nonNegativeInteger(count);
+      if (normalized > 0) byName[name] = normalized;
+    }
+  }
+  const byNameTotal = Object.values(byName).reduce(
+    (sum, count) => sum + count,
+    0,
+  );
+  const failed = nonNegativeInteger(input.failed);
+  const total = Math.max(nonNegativeInteger(input.total), byNameTotal, failed);
+  return total > 0 || failed > 0 ? { total, failed, byName } : undefined;
+}
+
+interface TelemetryControlPayload extends JsonObject {
+  readonly type?: unknown;
+  readonly contextUsage?: unknown;
+  readonly tokenUsage?: unknown;
+  readonly toolUsage?: unknown;
+  readonly model?: unknown;
+}
+
+interface TelemetryDelta {
+  context?: TaskContextUsage | undefined;
+  tokens?: TaskTokenUsage | undefined;
+  tools?: TaskToolUsage | undefined;
+  model?: string | undefined;
+}
+
+function noopOnChange(): void {
+  return undefined;
+}
+
+export class BackgroundTaskRegistry {
+  private readonly tasks = new Map<string, BgTask>();
+  private runtimeDir: RuntimeDir | undefined;
+  private shuttingDown = false;
+  private taskAdmissionsClosed = false;
+  private readonly activeTaskAdmissions = new Set<TaskAdmission>();
+  private readonly taskAdmissionDrainWaiters = new Set<() => void>();
+  private terminalPublicationClosed = false;
+  private terminalPublicationCloseReason:
+    TerminalPublicationClosureReason | undefined;
+  private readonly terminalPublicationClosedSignal: Promise<TerminalPublicationClosureReason>;
+  private resolveTerminalPublicationClosedSignal: (
+    reason: TerminalPublicationClosureReason,
+  ) => void = () => {};
+  private readonly spawn: BackgroundTaskSpawn;
+  private readonly killProcess: KillProcessFn;
+  private readonly killTree: KillTreeFn;
+  private readonly platform: NodeJS.Platform;
+  private readonly env: NodeJS.ProcessEnv;
+  private shellPolicy: ResolvedShellPolicy | undefined;
+  private readonly shellPolicyEnv: NodeJS.ProcessEnv | undefined;
+  private readonly makeTaskIdFn: () => string;
+  private readonly now: () => number;
+  private readonly maxOutputBytes: number;
+  private readonly softOutputBytes: number;
+  private readonly maxRecentTasks: number;
+  private readonly killGraceMs: number;
+  private readonly stopWaitMs: number;
+  private readonly taskAdmissionTimeoutMs: number;
+  private readonly collectPosixDescendantPids: (
+    rootPid: number,
+  ) => Promise<Set<number>>;
+  private readonly logger: Pick<Console, 'error'>;
+  private readonly onChange: () => void;
+  private readonly sendCompletionNotification: CompletionNotificationSender;
+  private readonly publishTerminalSnapshot: (task: BgTaskSnapshot) => void;
+  private readonly posixProcessGroupKillStates = new WeakMap<
+    BgTask,
+    PosixProcessGroupKillState
+  >();
+  private readonly windowsKillStates = new WeakMap<BgTask, WindowsKillState>();
+  private readonly terminalPublicationAbandonSignals = new WeakMap<
+    BgTask,
+    TerminalPublicationAbandonSignal
+  >();
+  private readonly reloadShellOwner: ReloadShellOwnerHubV1 | undefined;
+  private reloadShellLease: ReloadShellActivationLeaseV1 | undefined;
+  private reloadShellIdentity: ReloadShellIdentityV1 | undefined;
+  /** branchGeneration fence 代次:每次扩展激活(新注册表实例)从 0 重新开始,
+   * 经 reload handoff 导入的任务保留旧代次,新代次由扩展激活(claim.generation)推进;
+   * 旧代次帧结算时标陈旧、不触发唤醒。 */
+  private activeBranchGeneration = 0;
+  private readonly terminalWaiters = new Map<string, Set<TaskWaiter>>();
+  private readonly backgroundRequestWaiters = new Map<string, Set<TaskWaiter>>();
+
+  constructor(options: BackgroundTaskRegistryOptions) {
+    this.terminalPublicationClosedSignal = new Promise((resolve) => {
+      this.resolveTerminalPublicationClosedSignal = resolve;
+    });
+    this.spawn =
+      options.spawn ??
+      ((command, args, spawnOptions) => nodeSpawn(command, args, spawnOptions));
+    this.killProcess = options.killProcess ?? process.kill.bind(process);
+    this.platform = options.platform ?? process.platform;
+    this.env = options.env ?? process.env;
+    this.shellPolicy = options.shellPolicy;
+    this.shellPolicyEnv =
+      options.shellPolicy === undefined ? { ...this.env } : undefined;
+    const taskkillEnv = this.env;
+    this.killTree =
+      options.killTree ??
+      ((pid, phase, signal) => {
+        const taskkillOptions: WindowsTaskkillOptions =
+          signal === undefined
+            ? { env: taskkillEnv }
+            : { env: taskkillEnv, signal };
+        return runWindowsTaskkill(pid, phase, taskkillOptions);
+      });
+    this.makeTaskIdFn = options.makeTaskId ?? defaultTaskId;
+    this.now = options.now ?? Date.now;
+    this.maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
+    this.softOutputBytes = options.softOutputBytes ?? SOFT_OUTPUT_BYTES;
+    this.maxRecentTasks = options.maxRecentTasks ?? MAX_RECENT_TASKS;
+    this.killGraceMs = options.killGraceMs ?? KILL_GRACE_MS;
+    this.stopWaitMs = options.stopWaitMs ?? STOP_WAIT_MS;
+    this.collectPosixDescendantPids =
+      options.collectPosixDescendantPids ??
+      ((rootPid) => collectPosixDescendantPidsDefault(rootPid));
+    this.taskAdmissionTimeoutMs = BackgroundTaskRegistry.positiveTimeout(
+      options.taskAdmissionTimeoutMs,
+      TASK_ADMISSION_TIMEOUT_MS,
+      'taskAdmissionTimeoutMs',
+    );
+    this.logger = options.logger ?? console;
+    this.onChange = options.onChange ?? noopOnChange;
+    this.sendCompletionNotification = options.sendCompletionNotification;
+    this.publishTerminalSnapshot = options.publishTerminal ?? noopOnChange;
+    this.reloadShellOwner = options.reloadShellOwner;
+  }
+
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
+  private resolvedShellPolicy(): ResolvedShellPolicy {
+    const existing = this.shellPolicy;
+    if (existing !== undefined) return existing;
+    const resolved = resolveShellPolicy(
+      this.platform,
+      this.shellPolicyEnv ?? this.env,
+      process.cwd(),
+    );
+    this.shellPolicy = resolved;
+    return resolved;
+  }
+
+  private static positiveTimeout(
+    value: number | undefined,
+    fallback: number,
+    label: string,
+  ): number {
+    const candidate = value ?? fallback;
+    if (!Number.isFinite(candidate) || candidate <= 0) {
+      throw new Error(`${label} must be a positive finite number`);
+    }
+    return Math.max(1, Math.floor(candidate));
+  }
+
+  private beginTaskAdmission(kind: string): TaskAdmission {
+    this.assertTaskAdmissionOpen(kind);
+    const controller = new AbortController();
+    const admission: TaskAdmission = {
+      kind,
+      controller,
+      deadlineAt: Date.now() + this.taskAdmissionTimeoutMs,
+      timeoutMs: this.taskAdmissionTimeoutMs,
+      timeoutHandle: undefined,
+      released: false,
+    };
+    admission.timeoutHandle = setTimeout(() => {
+      if (admission.released || admission.controller.signal.aborted) return;
+      admission.controller.abort(
+        new BackgroundTaskAdmissionTimeoutError(
+          admission.kind,
+          admission.timeoutMs,
+        ),
+      );
+    }, admission.timeoutMs);
+    this.activeTaskAdmissions.add(admission);
+    return admission;
+  }
+
+  private releaseTaskAdmission(admission: TaskAdmission): void {
+    if (admission.released) return;
+    admission.released = true;
+    if (admission.timeoutHandle !== undefined) {
+      clearTimeout(admission.timeoutHandle);
+      admission.timeoutHandle = undefined;
+    }
+    this.activeTaskAdmissions.delete(admission);
+    if (this.activeTaskAdmissions.size !== 0) return;
+    for (const resolve of this.taskAdmissionDrainWaiters) resolve();
+    this.taskAdmissionDrainWaiters.clear();
+  }
+
+  private taskAdmissionError(admission: TaskAdmission): Error {
+    const reason = admission.controller.signal.reason;
+    if (reason instanceof Error) return reason;
+    if (this.shuttingDown || this.taskAdmissionsClosed) {
+      return new BackgroundTaskAdmissionClosedError(admission.kind);
+    }
+    return new BackgroundTaskAdmissionTimeoutError(
+      admission.kind,
+      admission.timeoutMs,
+    );
+  }
+
+  private surfacedTaskAdmissionError(
+    admission: TaskAdmission,
+    ...details: unknown[]
+  ): Error {
+    const primary = this.taskAdmissionError(admission);
+    const meaningful = details.filter((detail) => {
+      if (detail === undefined || detail === primary) return false;
+      if (typeof detail !== 'object' || detail === null) return true;
+      return (
+        Reflect.get(detail, 'name') !== 'AbortError' &&
+        Reflect.get(detail, 'code') !== Reflect.get(primary, 'code')
+      );
+    });
+    if (meaningful.length === 0) return primary;
+    return new AggregateError(
+      [primary, ...meaningful],
+      `${primary.message}; admission cancellation or cleanup reported additional failures: ${meaningful.map(BackgroundTaskRegistry.errorMessage).join('; ')}`,
+    );
+  }
+
+  private assertTaskAdmissionOpen(
+    kind: string,
+    admission?: TaskAdmission,
+  ): void {
+    if (admission?.controller.signal.aborted === true)
+      throw this.taskAdmissionError(admission);
+    if (this.shuttingDown || this.taskAdmissionsClosed) {
+      throw new BackgroundTaskAdmissionClosedError(kind);
+    }
+  }
+
+  private async awaitTaskAdmissionBoundary<T>(
+    promise: Promise<T>,
+    admission: TaskAdmission,
+  ): Promise<T> {
+    try {
+      const value = await promise;
+      this.assertTaskAdmissionOpen(admission.kind, admission);
+      return value;
+    } catch (error) {
+      if (
+        admission.controller.signal.aborted &&
+        typeof error === 'object' &&
+        error !== null
+      ) {
+        const isPlainAbort = Reflect.get(error, 'name') === 'AbortError';
+        const isCleanDurableCancellation =
+          Reflect.get(error, 'code') === 'durable_file_cancelled' &&
+          Reflect.get(error, 'renameCompleted') !== true &&
+          Array.isArray(Reflect.get(error, 'cleanupFailures')) &&
+          (Reflect.get(error, 'cleanupFailures') as unknown[]).length === 0;
+        if (isPlainAbort || isCleanDurableCancellation) {
+          throw this.taskAdmissionError(admission);
+        }
+      }
+      throw error;
+    }
+  }
+
+  closeTaskAdmissions(): void {
+    if (this.taskAdmissionsClosed) return;
+    this.taskAdmissionsClosed = true;
+    for (const admission of this.activeTaskAdmissions) {
+      if (!admission.controller.signal.aborted) {
+        admission.controller.abort(
+          new BackgroundTaskAdmissionClosedError(admission.kind),
+        );
+      }
+    }
+  }
+
+  waitForTaskAdmissions(): Promise<void> {
+    if (this.activeTaskAdmissions.size === 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.taskAdmissionDrainWaiters.add(resolve);
+    });
+  }
+
+  setShuttingDown(value: boolean): void {
+    if (value) {
+      this.shuttingDown = true;
+      this.closeTaskAdmissions();
+      this.closeTerminalPublication('registry_shutdown');
+      return;
+    }
+    // Publication and admission closure belong to one extension activation and
+    // are one-way. Pi session replacement creates a fresh registry; an old
+    // registry must not be reopened by a late lifecycle continuation.
+    if (!this.terminalPublicationClosed && !this.taskAdmissionsClosed)
+      this.shuttingDown = false;
+  }
+
+  closeTerminalPublication(reason: TerminalPublicationClosureReason): void {
+    if (!this.terminalPublicationClosed) {
+      this.terminalPublicationClosed = true;
+      this.terminalPublicationCloseReason = reason;
+      this.resolveTerminalPublicationClosedSignal(reason);
+    }
+    const effectiveReason = this.terminalPublicationCloseReason ?? reason;
+    for (const task of this.tasks.values()) {
+      if (
+        task.terminalPublicationState === 'pending' &&
+        task.terminalEmitInFlight === true
+      ) {
+        // A synchronous listener can close the service while emit() is still on
+        // the stack. Dispose queued work now, but let the emitter's return/throw
+        // settle the in-flight attempt exactly once.
+        if (task.terminalPublishRetryHandle !== undefined) {
+          clearTimeout(task.terminalPublishRetryHandle);
+          task.terminalPublishRetryHandle = undefined;
+        }
+        task.terminalPublicationGate = undefined;
+        continue;
+      }
+      const shouldLog =
+        task.terminalPublicationState === 'pending' &&
+        task.status !== 'running' &&
+        (task.terminalPublishAttempts > 0 ||
+          task.terminalPublishRetryHandle !== undefined ||
+          task.terminalPublicationGate !== undefined);
+      this.abandonTerminalPublication(
+        task,
+        effectiveReason,
+        undefined,
+        shouldLog,
+      );
+    }
+    this.pruneOldTasks();
+  }
+
+  allTasks(): BgTask[] {
+    return [...this.tasks.values()];
+  }
+
+  snapshot(task: BgTask): BgTaskSnapshot {
+    return snapshot(task);
+  }
+
+  /** 推进 branchGeneration fence 代次(扩展激活时以 reload claim generation 调用)。 */
+  setActiveBranchGeneration(generation: number): void {
+    this.activeBranchGeneration = Math.max(0, Math.floor(generation));
+  }
+
+  /**
+   * waiter 双通道之一:等待任务达终态。任务不存在或已终态立即结算;
+   * AbortSignal 中止时按参照语义 reject(signal.reason)。
+   */
+  waitForTerminal(
+    id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<BgTaskSnapshot | undefined> {
+    const current = this.tasks.get(id);
+    if (current === undefined) return Promise.resolve(undefined);
+    if (isTerminalTaskStatus(current.status))
+      return Promise.resolve(snapshot(current));
+    return this.waitForChannel(this.terminalWaiters, id, options);
+  }
+
+  /**
+   * waiter 双通道之一:等待任务被请求转入后台(requestBackground)。
+   * 任务不存在或已终态立即结算(终态返回 undefined);已后台化返回快照。
+   */
+  waitForBackgroundRequest(
+    id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<BgTaskSnapshot | undefined> {
+    const current = this.tasks.get(id);
+    if (current === undefined) return Promise.resolve(undefined);
+    if (current.backgroundRequested === true)
+      return Promise.resolve(snapshot(current));
+    if (isTerminalTaskStatus(current.status)) return Promise.resolve(undefined);
+    return this.waitForChannel(this.backgroundRequestWaiters, id, options);
+  }
+
+  /** 请求将任务转入后台(单发),已终态或未知任务返回 false。 */
+  requestBackground(id: string): boolean {
+    const task = this.tasks.get(id);
+    if (task === undefined || isTerminalTaskStatus(task.status)) return false;
+    if (task.backgroundRequested === true) return true;
+    task.backgroundRequested = true;
+    this.onChange();
+    this.resolveBackgroundRequestWaiters(id, snapshot(task));
+    return true;
+  }
+
+  private waitForChannel(
+    waitersByTask: Map<string, Set<TaskWaiter>>,
+    id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<BgTaskSnapshot | undefined> {
+    const signal = options?.signal;
+    if (signal?.aborted === true) return Promise.reject(waiterAbortReason(signal));
+    return new Promise((resolve, reject) => {
+      const waiter: TaskWaiter = { resolve, reject, signal };
+      if (signal !== undefined) {
+        waiter.onAbort = () => {
+          this.removeTaskWaiter(waitersByTask, id, waiter);
+          reject(waiterAbortReason(signal));
+        };
+        signal.addEventListener('abort', waiter.onAbort, { once: true });
+      }
+      let waiters = waitersByTask.get(id);
+      if (waiters === undefined) {
+        waiters = new Set<TaskWaiter>();
+        waitersByTask.set(id, waiters);
+      }
+      waiters.add(waiter);
+    });
+  }
+
+  private resolveTaskWaiters(
+    waitersByTask: Map<string, Set<TaskWaiter>>,
+    id: string,
+    result: BgTaskSnapshot | undefined,
+  ): void {
+    const waiters = waitersByTask.get(id);
+    if (waiters === undefined) return;
+    waitersByTask.delete(id);
+    for (const waiter of waiters) {
+      if (waiter.signal !== undefined && waiter.onAbort !== undefined) {
+        waiter.signal.removeEventListener('abort', waiter.onAbort);
+      }
+      waiter.resolve(result);
+    }
+  }
+
+  private removeTaskWaiter(
+    waitersByTask: Map<string, Set<TaskWaiter>>,
+    id: string,
+    waiter: TaskWaiter,
+  ): void {
+    const waiters = waitersByTask.get(id);
+    if (waiters === undefined) return;
+    waiters.delete(waiter);
+    if (waiters.size === 0) waitersByTask.delete(id);
+  }
+
+  private resolveTerminalWaiters(id: string, result: BgTaskSnapshot | undefined): void {
+    this.resolveTaskWaiters(this.terminalWaiters, id, result);
+  }
+
+  private resolveBackgroundRequestWaiters(
+    id: string,
+    result: BgTaskSnapshot | undefined,
+  ): void {
+    this.resolveTaskWaiters(this.backgroundRequestWaiters, id, result);
+  }
+
+  /**
+   * 任务状态变更后的 waiter 结算:达终态时结算 terminal 通道(带快照),
+   * 并关闭 background 通道(未后台化 → undefined);已后台化时结算 background 通道。
+   * register/update/导入/终态落点均调用。
+   */
+  private settleTaskWaiters(task: BgTask): void {
+    if (isTerminalTaskStatus(task.status)) {
+      this.resolveTerminalWaiters(task.id, snapshot(task));
+      this.resolveBackgroundRequestWaiters(task.id, undefined);
+      return;
+    }
+    if (task.backgroundRequested === true) {
+      this.resolveBackgroundRequestWaiters(task.id, snapshot(task));
+    }
+  }
+
+  /**
+   * branchGeneration 迟到结算 fence:任务帧代次与注册表当前代次不匹配即标陈旧,
+   * 后续唤醒(trigger 型通知)被抑制。
+   */
+  private applyBranchGenerationFence(task: BgTask): void {
+    const generation = task.branchGeneration;
+    if (
+      generation !== undefined &&
+      generation !== this.activeBranchGeneration
+    ) {
+      task.staleBranchFrame = true;
+    }
+  }
+
+  hasCurrentReloadLease(): boolean {
+    const lease = this.reloadShellLease;
+    return (
+      lease !== undefined &&
+      this.reloadShellOwner?.isCurrentLease(lease) === true
+    );
+  }
+
+  async stageReloadActivation(
+    claim: ReloadShellActivationClaimV1,
+  ): Promise<ReloadShellHostAdapterV1> {
+    if (claim.protocol !== RELOAD_SHELL_OWNER_PROTOCOL) {
+      throw new ReloadSurvivalError(
+        'pi_bg_reload_owner_protocol_incompatible',
+        'activation claim does not use the supported reload shell owner protocol',
+      );
+    }
+    const staged: ReloadableShellExecutionV1[] = [];
+    const ids = new Set<string>();
+    for (const execution of claim.executions) {
+      if (
+        execution.protocol !== RELOAD_SHELL_OWNER_PROTOCOL ||
+        execution.task.reloadExecution !== execution ||
+        execution.task.surviveReload !== true
+      ) {
+        throw new ReloadSurvivalError(
+          'pi_bg_reload_owner_protocol_incompatible',
+          'activation claim contains an incompatible reload shell execution',
+        );
+      }
+      if (ids.has(execution.task.id) || this.tasks.has(execution.task.id)) {
+        throw new ReloadSurvivalError(
+          'pi_bg_reload_owner_activation_conflict',
+          `claimed task id ${execution.task.id} conflicts with the fresh registry`,
+        );
+      }
+      ids.add(execution.task.id);
+    }
+
+    try {
+      for (const execution of claim.executions) {
+        const task = execution.task;
+        task.reloadHostDeliveryInFlight = false;
+        task.reloadHostDeliverySettled = false;
+        task.reloadHostNotificationSettled = false;
+        execution.updateLeaseAudit(
+          claim.generation,
+          (task.reloadSurvival?.handoffCount ?? 0) + 1,
+        );
+        this.tasks.set(task.id, task);
+        // 导入即结算:携带终态跨 reload 的旧任务帧在本次导入时结算 waiter 通道
+        this.settleTaskWaiters(task);
+        staged.push(execution);
+      }
+      await Promise.all(
+        staged.map(async (execution) => this.writeMetadata(execution.task)),
+      );
+    } catch (error) {
+      for (const execution of staged) this.tasks.delete(execution.task.id);
+      throw error;
+    }
+
+    let boundLease: ReloadShellActivationLeaseV1 | undefined;
+    return {
+      activationNonce: claim.activationNonce,
+      onBound: (lease) => {
+        if (
+          lease.activationNonce !== claim.activationNonce ||
+          lease.generation !== claim.generation ||
+          lease.identityKey !== claim.identityKey
+        ) {
+          throw new ReloadSurvivalError(
+            'pi_bg_reload_owner_stale_claim',
+            'committed lease does not match its staged activation claim',
+          );
+        }
+        boundLease = lease;
+        this.reloadShellLease = lease;
+        this.reloadShellIdentity = claim.identity;
+      },
+      onChanged: (execution) => {
+        const lease = boundLease;
+        if (!this.ownsReloadExecution(execution, lease)) return;
+        this.onChange();
+      },
+      onTerminal: (execution) => {
+        const lease = boundLease;
+        if (!this.ownsReloadExecution(execution, lease)) return;
+        void this.deliverReloadTerminal(execution, lease);
+      },
+    };
+  }
+
+  abortReloadActivation(claim: ReloadShellActivationClaimV1): void {
+    for (const execution of claim.executions) {
+      const task = execution.task;
+      if (this.tasks.get(task.id) !== task) continue;
+      if (task.terminalPublishRetryHandle !== undefined) {
+        clearTimeout(task.terminalPublishRetryHandle);
+        task.terminalPublishRetryHandle = undefined;
+      }
+      task.terminalPublicationGate = undefined;
+      task.terminalPublishInFlight = false;
+      this.tasks.delete(task.id);
+      // 中止导入与 remove 等价:结算两类 waiter(未达终态 → undefined)
+      this.resolveTerminalWaiters(task.id, undefined);
+      this.resolveBackgroundRequestWaiters(task.id, undefined);
+    }
+    if (this.reloadShellLease?.activationNonce === claim.activationNonce) {
+      this.reloadShellLease = undefined;
+      this.reloadShellIdentity = undefined;
+    }
+  }
+
+  prepareReloadHandoff(lease: ReloadShellActivationLeaseV1): readonly BgTask[] {
+    if (
+      this.reloadShellOwner === undefined ||
+      this.reloadShellLease !== lease
+    ) {
+      throw new ReloadSurvivalError(
+        'pi_bg_reload_owner_stale_claim',
+        'registry does not own the requested reload activation lease',
+      );
+    }
+    const executions = this.reloadShellOwner.beginReloadHandoff(lease);
+    const tasks: BgTask[] = [];
+    for (const execution of executions) {
+      const task = execution.task;
+      if (this.tasks.get(task.id) !== task) {
+        throw new ReloadSurvivalError(
+          'pi_bg_reload_owner_stale_claim',
+          `registry no longer owns survivor ${task.id}`,
+        );
+      }
+      if (task.terminalPublishRetryHandle !== undefined) {
+        clearTimeout(task.terminalPublishRetryHandle);
+        task.terminalPublishRetryHandle = undefined;
+      }
+      task.terminalPublicationGate = undefined;
+      task.terminalPublishInFlight = false;
+      task.reloadHostDeliveryInFlight = false;
+      task.reloadHostDeliverySettled = false;
+      task.reloadHostNotificationSettled = false;
+      this.tasks.delete(task.id);
+      // 让渡即结算:本注册表不再持有该任务,挂起 waiter 以 undefined 收尾
+      this.resolveTerminalWaiters(task.id, undefined);
+      this.resolveBackgroundRequestWaiters(task.id, undefined);
+      tasks.push(task);
+    }
+    this.reloadShellLease = undefined;
+    this.reloadShellIdentity = undefined;
+    return Object.freeze(tasks);
+  }
+
+  async waitForReloadHostSettlement(
+    timeoutMs = this.stopWaitMs,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const unsettled = [...this.tasks.values()].filter(
+        (task) =>
+          task.reloadExecution?.phase === 'terminal' &&
+          (task.reloadHostNotificationSettled !== true ||
+            task.terminalPublicationState === 'pending'),
+      );
+      if (unsettled.length === 0) return;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `Timed out waiting for reload shell host settlement: ${unsettled.map((task) => task.id).join(', ')}`,
+        );
+      }
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, Math.min(10, remaining)),
+      );
+    }
+  }
+
+  releaseReloadActivation(lease: ReloadShellActivationLeaseV1): void {
+    if (this.reloadShellOwner === undefined) return;
+    if (
+      this.reloadShellLease !== lease ||
+      !this.reloadShellOwner.isCurrentLease(lease)
+    )
+      return;
+    this.reloadShellOwner.releaseActivation(lease);
+    this.reloadShellLease = undefined;
+    this.reloadShellIdentity = undefined;
+  }
+
+  currentReloadLease(): ReloadShellActivationLeaseV1 | undefined {
+    return this.hasCurrentReloadLease() ? this.reloadShellLease : undefined;
+  }
+
+  private ownsReloadExecution(
+    execution: ReloadableShellExecutionV1,
+    lease: ReloadShellActivationLeaseV1 | undefined,
+  ): lease is ReloadShellActivationLeaseV1 {
+    return (
+      lease !== undefined &&
+      this.reloadShellLease === lease &&
+      this.reloadShellOwner?.isCurrentLease(lease) === true &&
+      this.tasks.get(execution.task.id) === execution.task &&
+      execution.task.reloadExecution === execution
+    );
+  }
+
+  async ensureRuntimeDir(ctx: BackgroundTaskContext): Promise<RuntimeDir> {
+    if (this.runtimeDir) return this.runtimeDir;
+    const sessionId = sanitizePathSegment(
+      ctx.sessionId ?? `session-${String(process.pid)}`,
+    );
+    const runId = `${sessionId}-${String(process.pid)}`;
+    const runtimeDirAbs = join(ctx.cwd, '.pi', 'tasks', runId);
+    const runtimeDirDisplay = join('.pi', 'tasks', runId);
+    await mkdir(runtimeDirAbs, { recursive: true });
+    this.runtimeDir = { abs: runtimeDirAbs, display: runtimeDirDisplay };
+    return this.runtimeDir;
+  }
+
+  /**
+   * 启动审计:扩展激活路径遍历 `.pi/tasks/<runId>/` 目录(目录层 runId、文件层
+   * `<task-id>.json`),`status=running` 遗留记录一律更新为 `lost`
+   * (writeFileDurable 落盘);输出文件保留、不复活进程。当前注册表内活动的
+   * `running` 任务(含 reload 让渡的存活执行)不触碰。
+   * 返回被改写为 lost 的记录数。
+   */
+  async auditStartupRecords(ctx: BackgroundTaskContext): Promise<number> {
+    if (this.runtimeDir === undefined) await this.ensureRuntimeDir(ctx);
+    const dir = this.runtimeDir;
+    if (dir === undefined) return 0;
+    const liveIds = new Set(
+      [...this.tasks.values()]
+        .filter((task) => task.status === 'running')
+        .map((task) => task.id),
+    );
+    const entries = await readdir(dir.abs, { withFileTypes: true });
+    let audited = 0;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const id = entry.name.slice(0, -'.json'.length);
+      if (liveIds.has(id)) continue;
+      const record = await readFile(join(dir.abs, entry.name), 'utf8').catch(
+        () => undefined,
+      );
+      if (record === undefined) continue;
+      let parsed: unknown;
+      try {
+        parsed = parseJsonText(record);
+      } catch {
+        // 无法解析的残留文件不具可审计状态,跳过
+        continue;
+      }
+      if (!isJsonObject(parsed)) continue;
+      // 兼容性:旧记录缺失新字段(如 stopInitiator/branchGeneration/failedReason)
+      // 按类型默认处理,只按 status 字段判定
+      if (parsed['status'] !== 'running') continue;
+      await writeFileDurable(
+        join(dir.abs, entry.name),
+        JSON.stringify({
+          ...parsed,
+          status: 'lost',
+          endTime: this.now(),
+          error: STARTUP_AUDIT_ERROR,
+        }),
+      );
+      audited++;
+    }
+    return audited;
+  }
+
+  private async destroyTaskStream(task: BgTask): Promise<void> {
+    // M3 force-exit:先释放插件持有的子进程输出读端(pipe 读端)。组长/组已死而
+    // 孙进程直接持有写端时,读端不销毁则管道永不 EOF,子进程 'close' 永不触发,
+    // 任务永久悬挂、宿主被孤儿保活;销毁读端后孤儿后续写入触发 EPIPE/SIGPIPE。
+    this.destroyTaskChildOutputSources(task);
+    const stream = task.stream;
+    if (stream === undefined || stream.closed) return;
+    await new Promise<void>((resolve) => {
+      const closed = () => {
+        stream.off('close', closed);
+        resolve();
+      };
+      stream.once('close', closed);
+      if (!stream.destroyed) stream.destroy();
+      if (stream.closed) closed();
+    });
+  }
+
+  /** M3:尽力而为地销毁 child 的 stdout/stderr 读端(Node ReadStream 幂等,失败仅记日志)。 */
+  private destroyTaskChildOutputSources(task: BgTask): void {
+    const child = task.child;
+    if (child === undefined) return;
+    const sources: Array<OutputEventSource | null | undefined> = [
+      child.stdout,
+      child.stderr,
+    ];
+    for (const source of sources) {
+      if (source?.destroy === undefined) continue;
+      try {
+        source.destroy();
+      } catch (error) {
+        this.logger.error(
+          `[background-tasks] failed to destroy output source for ${task.id}:`,
+          error,
+        );
+      }
+    }
+  }
+
+  private async discardUnspawnedTask(
+    task: BgTask,
+    paths: readonly string[],
+  ): Promise<void> {
+    this.tasks.delete(task.id);
+    task.finalized = true;
+    task.status = 'failed';
+    if (task.timeoutHandle !== undefined) clearTimeout(task.timeoutHandle);
+    if (task.killEscalationTimer !== undefined)
+      clearTimeout(task.killEscalationTimer);
+    await this.destroyTaskStream(task);
+    const removals = await Promise.allSettled(
+      paths.map((path) => rm(path, { force: true })),
+    );
+    const failures: Error[] = [];
+    for (let index = 0; index < removals.length; index++) {
+      const result = removals[index];
+      if (result?.status !== 'rejected') continue;
+      const path = paths[index] ?? '<unknown admission artifact>';
+      failures.push(
+        new Error(
+          `Failed to remove interrupted admission artifact ${path}: ${BackgroundTaskRegistry.errorMessage(result.reason)}`,
+        ),
+      );
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        'Interrupted task admission artifact cleanup failed',
+      );
+    }
+  }
+
+  private captureSpawnedChild(
+    task: BgTask,
+    child: BackgroundTaskChildProcess,
+  ): void {
+    task.child = child;
+    task.pid = child.pid;
+    if (
+      this.platform !== 'win32' &&
+      child.pid !== undefined &&
+      Number.isSafeInteger(child.pid) &&
+      child.pid > 0
+    ) {
+      // Capture detached-group ownership once, directly from this spawn. Never
+      // reconstruct signal authority from mutable task metadata or a later PID.
+      task.ownedPosixProcessGroupId = child.pid;
+    }
+  }
+
+  private bindOwnedTaskToAdmission(
+    task: BgTask,
+    admission: TaskAdmission,
+  ): () => void {
+    const cancelOwnedTask = (): void => {
+      this.stopOwnedTaskAfterAdmissionCancellation(
+        task,
+        this.taskAdmissionError(admission),
+      );
+    };
+    admission.controller.signal.addEventListener('abort', cancelOwnedTask, {
+      once: true,
+    });
+    if (admission.controller.signal.aborted) cancelOwnedTask();
+    return () => {
+      admission.controller.signal.removeEventListener('abort', cancelOwnedTask);
+    };
+  }
+
+  private stopOwnedTaskAfterAdmissionCancellation(
+    task: BgTask,
+    error: Error,
+  ): void {
+    if (task.status !== 'running') return;
+    task.killKind =
+      error instanceof BackgroundTaskAdmissionTimeoutError
+        ? 'timeout'
+        : 'shutdown';
+    task.error = error.message;
+    try {
+      this.requestKill(task, 'SIGTERM');
+    } catch (killError) {
+      this.logger.error(
+        `[background-tasks] failed to stop ${task.id} after admission cancellation:`,
+        killError,
+      );
+    }
+  }
+
+  async startTask(
+    ctx: BackgroundTaskContext,
+    command: string,
+    options: StartTaskOptions = {},
+  ): Promise<BgTask> {
+    const hasSurvival = Object.prototype.hasOwnProperty.call(
+      options,
+      'surviveReload',
+    );
+    if (hasSurvival && typeof options.surviveReload !== 'boolean') {
+      throw new ReloadSurvivalError(
+        'pi_bg_survive_reload_invalid',
+        'surviveReload must be a boolean when present',
+      );
+    }
+    const surviveReload = options.surviveReload === true;
+    if (surviveReload && options.isAgent === true) {
+      throw new ReloadSurvivalError(
+        'pi_bg_survive_reload_requires_non_agent',
+        'surviveReload requires isAgent:false',
+      );
+    }
+    const reloadLease = surviveReload ? this.currentReloadLease() : undefined;
+    if (surviveReload && reloadLease === undefined) {
+      throw new ReloadSurvivalError(
+        'pi_bg_reload_owner_unavailable',
+        'no successfully bound same-process reload owner activation is available',
+      );
+    }
+
+    const admission = this.beginTaskAdmission('a background task');
+    try {
+      if (surviveReload && reloadLease !== undefined) {
+        return await this.startReloadableTaskAdmitted(
+          ctx,
+          command,
+          options,
+          admission,
+          reloadLease,
+        );
+      }
+      return await this.startTaskAdmitted(ctx, command, options, admission);
+    } finally {
+      this.releaseTaskAdmission(admission);
+    }
+  }
+
+  private async startReloadableTaskAdmitted(
+    ctx: BackgroundTaskContext,
+    command: string,
+    options: StartTaskOptions,
+    admission: TaskAdmission,
+    lease: ReloadShellActivationLeaseV1,
+  ): Promise<BgTask> {
+    const normalizedCommand = command.trim();
+    if (!normalizedCommand) throw new Error('Background command is empty');
+    if (options.isAgent === true) {
+      throw new ReloadSurvivalError(
+        'pi_bg_survive_reload_requires_non_agent',
+        'surviveReload requires isAgent:false',
+      );
+    }
+    if (
+      this.reloadShellOwner === undefined ||
+      this.reloadShellIdentity === undefined ||
+      this.reloadShellLease !== lease ||
+      !this.reloadShellOwner.isCurrentLease(lease)
+    ) {
+      throw new ReloadSurvivalError(
+        'pi_bg_reload_owner_unavailable',
+        'reload owner activation became unavailable before launch',
+      );
+    }
+    if (ctx.sessionId !== this.reloadShellIdentity.sessionId) {
+      throw new ReloadSurvivalError(
+        'pi_bg_reload_owner_stale_claim',
+        'launch context session id does not match the bound reload owner identity',
+      );
+    }
+    this.assertTaskAdmissionOpen('a background task', admission);
+
+    const shellPolicy = this.resolvedShellPolicy();
+    const invocation = shellInvocationForPolicy(normalizedCommand, shellPolicy);
+    const dir = await this.awaitTaskAdmissionBoundary(
+      this.ensureRuntimeDir(ctx),
+      admission,
+    );
+    this.assertTaskAdmissionOpen('a background task', admission);
+    if (
+      this.reloadShellLease !== lease ||
+      !this.reloadShellOwner.isCurrentLease(lease)
+    ) {
+      throw new ReloadSurvivalError(
+        'pi_bg_reload_owner_stale_claim',
+        'reload owner activation changed during task preflight',
+      );
+    }
+
+    const id = this.makeTaskIdFn();
+    const outputAbsPath = join(dir.abs, `${id}.output`);
+    const metadataAbsPath = join(dir.abs, `${id}.json`);
+    const outputPath = join(dir.display, `${id}.output`);
+    const timeoutSeconds =
+      typeof options.timeoutSeconds === 'number' &&
+      Number.isFinite(options.timeoutSeconds) &&
+      options.timeoutSeconds > 0
+        ? Math.floor(options.timeoutSeconds)
+        : undefined;
+    const taskName =
+      normalizeTaskName(options.name) ??
+      normalizeTaskName(options.description) ??
+      deriveTaskNameFromCommand(normalizedCommand);
+    const trimmedDescription = options.description?.trim();
+    const description =
+      trimmedDescription && trimmedDescription.length > 0
+        ? trimmedDescription
+        : undefined;
+    const task: BgTask = {
+      id,
+      name: taskName,
+      command: normalizedCommand,
+      description,
+      status: 'running',
+      outputPath,
+      outputAbsPath,
+      metadataAbsPath,
+      cwd: ctx.cwd,
+      startTime: this.now(),
+      exitCode: undefined,
+      pid: undefined,
+      bytesWritten: 0,
+      isAgent: false,
+      surviveReload: true,
+      notified: false,
+      notifyOnCompletion: options.notifyOnCompletion ?? true,
+      // 唤醒默认值按入口语义:模型入口缺省 notify+trigger;其余入口缺省仅通知
+      triggerOnCompletion:
+        options.triggerOnCompletion ?? (options.entrySource === 'model'),
+      timeoutSeconds,
+      terminalPublished: false,
+      terminalPublicationState: 'pending',
+      terminalPublishAttempts: 0,
+      terminalPublicationGate: options.terminalPublicationGate,
+      shellPolicy: shellPolicySnapshot(shellPolicy),
+      waiters: [],
+      branchGeneration: this.activeBranchGeneration,
+      entrySource: options.entrySource,
+    };
+    const launchNonce = randomBytes(16).toString('hex');
+    this.assertTaskAdmissionOpen('a background task', admission);
+    this.tasks.set(id, task);
+
+    let execution: ReloadableShellExecutionV1 | undefined;
+    let registered = false;
+    let committed = false;
+    let abortListener: (() => void) | undefined;
+    try {
+      execution = createReloadableShellExecutionV1({
+        task,
+        identity: this.reloadShellIdentity,
+        lease,
+        launchNonce,
+        invocation,
+        spawn: this.spawn,
+        killProcess: this.killProcess,
+        killTree: this.killTree,
+        platform: this.platform,
+        env: this.env,
+        maxOutputBytes: this.maxOutputBytes,
+        softOutputBytes: this.softOutputBytes,
+        killGraceMs: this.killGraceMs,
+        stopWaitMs: this.stopWaitMs,
+        now: this.now,
+        logger: this.logger,
+      });
+      this.reloadShellOwner.registerExecution(lease, execution);
+      registered = true;
+      abortListener = () => {
+        if (execution === undefined) return;
+        const error = this.taskAdmissionError(admission);
+        execution.failAdmission(error);
+        const kind: KillKind =
+          error instanceof BackgroundTaskAdmissionTimeoutError
+            ? 'timeout'
+            : 'shutdown';
+        void execution
+          .requestStop(kind, error.message)
+          .catch((stopError: unknown) => {
+            this.logger.error(
+              `[background-tasks] failed to stop reloadable task ${task.id} after admission cancellation:`,
+              stopError,
+            );
+          });
+      };
+      admission.controller.signal.addEventListener('abort', abortListener, {
+        once: true,
+      });
+      if (admission.controller.signal.aborted) abortListener();
+
+      await this.awaitTaskAdmissionBoundary(
+        execution.commitInitialMetadata(admission.controller.signal),
+        admission,
+      );
+      this.assertTaskAdmissionOpen('a background task', admission);
+      if (
+        this.reloadShellLease !== lease ||
+        !this.reloadShellOwner.isCurrentLease(lease)
+      ) {
+        throw new ReloadSurvivalError(
+          'pi_bg_reload_owner_stale_claim',
+          'reload owner activation changed before admission commit',
+        );
+      }
+      this.reloadShellOwner.markAdmissionCommitted(lease, execution);
+      committed = true;
+      this.onChange();
+      return task;
+    } catch (error) {
+      const primary = admission.controller.signal.aborted
+        ? this.taskAdmissionError(admission)
+        : error instanceof Error
+          ? error
+          : new Error(String(error));
+      execution?.failAdmission(primary);
+      let cleanupError: unknown;
+      if (execution !== undefined) {
+        try {
+          if (task.status === 'running') {
+            await execution.requestStop(
+              admission.controller.signal.aborted &&
+                primary instanceof BackgroundTaskAdmissionTimeoutError
+                ? 'timeout'
+                : 'shutdown',
+              primary.message,
+            );
+          }
+        } catch (stopError) {
+          cleanupError = stopError;
+        }
+      }
+      if (registered && !committed && execution !== undefined) {
+        if (this.reloadShellOwner.isCurrentLease(lease)) {
+          this.reloadShellOwner.releaseExecution(lease, execution);
+        }
+      }
+      this.tasks.delete(task.id);
+      if (execution === undefined) {
+        const removals = await Promise.allSettled([
+          rm(outputAbsPath, { force: true }),
+          rm(metadataAbsPath, { force: true }),
+        ]);
+        const removalFailure = removals.find(
+          (result) => result.status === 'rejected',
+        );
+        if (removalFailure?.status === 'rejected')
+          cleanupError = removalFailure.reason;
+      }
+      if (admission.controller.signal.aborted) {
+        throw this.surfacedTaskAdmissionError(admission, error, cleanupError);
+      }
+      if (cleanupError !== undefined) {
+        throw new AggregateError(
+          [primary, cleanupError],
+          `Failed to start reloadable background task and cleanup also failed: ${BackgroundTaskRegistry.errorMessage(cleanupError)}`,
+        );
+      }
+      throw new Error(`Failed to start background task: ${primary.message}`);
+    } finally {
+      if (abortListener !== undefined) {
+        admission.controller.signal.removeEventListener('abort', abortListener);
+      }
+    }
+  }
+
+  private async startTaskAdmitted(
+    ctx: BackgroundTaskContext,
+    command: string,
+    options: StartTaskOptions,
+    admission: TaskAdmission,
+  ): Promise<BgTask> {
+    const normalizedCommand = command.trim();
+    if (!normalizedCommand) throw new Error('Background command is empty');
+    this.assertTaskAdmissionOpen('a background task', admission);
+
+    const isAgent = options.isAgent ?? false;
+    const shellPolicy = this.resolvedShellPolicy();
+    const baseInvocation = shellInvocationForPolicy(
+      normalizedCommand,
+      shellPolicy,
+    );
+    const piTelemetryRequested =
+      isAgent && commandMayLaunchPiAgent(normalizedCommand, this.env);
+    const piTelemetryLaunch =
+      piTelemetryRequested && shellPolicy.supportsPosixFunctionWrapper
+        ? resolvePiLaunch({ platform: this.platform })
+        : undefined;
+
+    const dir = await this.awaitTaskAdmissionBoundary(
+      this.ensureRuntimeDir(ctx),
+      admission,
+    );
+    this.assertTaskAdmissionOpen('a background task', admission);
+    const id = this.makeTaskIdFn();
+    const outputAbsPath = join(dir.abs, `${id}.output`);
+    const metadataAbsPath = join(dir.abs, `${id}.json`);
+    const outputPath = join(dir.display, `${id}.output`);
+    let commandToSpawn = normalizedCommand;
+    let wrapperAbsPath: string | undefined;
+    try {
+      if (piTelemetryRequested && shellPolicy.supportsPosixFunctionWrapper) {
+        if (piTelemetryLaunch === undefined)
+          throw new Error('Pi telemetry launch spec was not resolved');
+        wrapperAbsPath = join(dir.abs, `${id}.pi-telemetry-wrapper.cjs`);
+        try {
+          await writeFile(
+            wrapperAbsPath,
+            createPiTelemetryWrapperSource(
+              buildModelWindowIndex(ctx),
+              piTelemetryLaunch,
+            ),
+            { encoding: 'utf8', signal: admission.controller.signal },
+          );
+        } catch (error) {
+          if (admission.controller.signal.aborted)
+            throw this.taskAdmissionError(admission);
+          throw error;
+        }
+        this.assertTaskAdmissionOpen('a background task', admission);
+        commandToSpawn = `pi() { ${shellQuote(process.execPath)} ${shellQuote(wrapperAbsPath)} "$@"; }\n${normalizedCommand}`;
+      }
+    } catch (error) {
+      if (wrapperAbsPath !== undefined)
+        await rm(wrapperAbsPath, { force: true });
+      throw error;
+    }
+    const invocation =
+      commandToSpawn === normalizedCommand
+        ? baseInvocation
+        : shellInvocationForPolicy(commandToSpawn, shellPolicy);
+    const timeoutSeconds =
+      typeof options.timeoutSeconds === 'number' &&
+      Number.isFinite(options.timeoutSeconds) &&
+      options.timeoutSeconds > 0
+        ? Math.floor(options.timeoutSeconds)
+        : undefined;
+    const taskName =
+      normalizeTaskName(options.name) ??
+      normalizeTaskName(options.description) ??
+      deriveTaskNameFromCommand(normalizedCommand);
+    const trimmedDescription = options.description?.trim();
+    const description =
+      trimmedDescription && trimmedDescription.length > 0
+        ? trimmedDescription
+        : undefined;
+
+    const task: BgTask = {
+      id,
+      name: taskName,
+      command: normalizedCommand,
+      description,
+      status: 'running',
+      outputPath,
+      outputAbsPath,
+      metadataAbsPath,
+      cwd: ctx.cwd,
+      startTime: this.now(),
+      exitCode: undefined,
+      pid: undefined,
+      bytesWritten: 0,
+      isAgent,
+      surviveReload: false,
+      notified: false,
+      notifyOnCompletion: options.notifyOnCompletion ?? true,
+      // 唤醒默认值按入口语义:模型入口缺省 notify+trigger;其余入口缺省仅通知
+      triggerOnCompletion:
+        options.triggerOnCompletion ?? (options.entrySource === 'model'),
+      timeoutSeconds,
+      terminalPublished: false,
+      terminalPublicationState: 'pending',
+      terminalPublishAttempts: 0,
+      terminalPublicationGate: options.terminalPublicationGate,
+      shellPolicy: shellPolicySnapshot(shellPolicy),
+      waiters: [],
+      branchGeneration: this.activeBranchGeneration,
+      entrySource: options.entrySource,
+    };
+    if (commandToSpawn !== normalizedCommand) task.telemetryWrapped = true;
+    if (piTelemetryRequested && !shellPolicy.supportsPosixFunctionWrapper) {
+      task.telemetryUnavailableReason =
+        shellPolicy.dialect === 'cmd'
+          ? WIN32_CMD_PI_TELEMETRY_UNAVAILABLE_REASON
+          : NON_POSIX_SHELL_PI_TELEMETRY_UNAVAILABLE_REASON;
+    }
+    this.assertTaskAdmissionOpen('a background task', admission);
+    this.tasks.set(id, task);
+
+    const stream = createWriteStream(outputAbsPath, {
+      flags: 'a',
+      encoding: 'utf8',
+    });
+    task.stream = stream;
+    stream.on('error', (error) => {
+      // M3 force-exit:终止流程已锁存(finalized)或销毁引发的尾写错误
+      // (ERR_STREAM_DESTROYED)时,不得覆盖权威失败文案(如 Descendant
+      // processes may have leaked)与锁存状态;终态化阶段的真实耐久性错误
+      // 由 finalizeTask 自身捕获并追加。
+      if (task.finalized === true) return;
+      if (Reflect.get(error, 'code') === 'ERR_STREAM_DESTROYED') return;
+      task.error = `Output file write failed: ${error.message}`;
+      if (task.status === 'running') {
+        const diskFull = isEnospcError(error);
+        task.killKind = diskFull ? 'disk_full' : 'output_cap';
+        if (diskFull) task.failedReason = 'disk_full';
+        try {
+          this.requestKill(task, 'SIGTERM');
+        } catch (killError) {
+          void this.finalizeTask(
+            task,
+            'failed',
+            null,
+            undefined,
+            `${task.error}; kill failed: ${killError instanceof Error ? killError.message : String(killError)}`,
+          );
+        }
+      }
+    });
+
+    let unbindAdmissionCancellation = (): void => undefined;
+    try {
+      this.assertTaskAdmissionOpen('a background task', admission);
+      const child = this.spawn(invocation.shell, invocation.args, {
+        cwd: ctx.cwd,
+        detached: this.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: this.env,
+        windowsHide: true,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      });
+
+      this.captureSpawnedChild(task, child);
+
+      child.stdout?.on('data', (data) => {
+        this.appendChildOutput(task, data, 'stdout');
+      });
+      child.stderr?.on('data', (data) => {
+        this.appendChildOutput(task, data, 'stderr');
+      });
+
+      child.on('error', (error) => {
+        this.writeNotice(
+          task,
+          `\n[background task spawn error: ${error.message}]\n`,
+        );
+        task.failedReason = 'spawn_error';
+        void this.finalizeTask(task, 'failed', null, undefined, error.message);
+      });
+
+      child.on('close', (code, signalName) => {
+        // M2 状态迁移表:user/model 停止 → cancelled;system 关闭 → killed;
+        // 退出码非 0 / timeout / output_limit / spawn_error / ENOSPC → failed(带 reason)
+        let status: TaskStatus;
+        let error: string | undefined;
+        if (task.killKind === 'user') {
+          status = 'cancelled';
+        } else if (task.killKind === 'shutdown') {
+          status = 'killed';
+        } else if (task.killKind === 'timeout') {
+          status = 'failed';
+          task.failedReason = 'timed_out';
+          error = task.error ?? `Timed out after ${String(timeoutSeconds)}s`;
+        } else if (task.killKind === 'output_cap') {
+          status = 'failed';
+          task.failedReason = 'output_limit';
+          error =
+            task.error ??
+            `Output exceeded cap of ${formatSize(this.maxOutputBytes)}`;
+        } else if (task.killKind === 'disk_full') {
+          // 磁盘满终止:已写输出文件保留,便于审计
+          status = 'failed';
+          task.failedReason = 'disk_full';
+          error =
+            task.error ??
+            `Output file write failed because the disk is full (ENOSPC); partial output is retained at ${task.outputPath}`;
+        } else if ((code ?? 0) === 0) {
+          status = 'completed';
+        } else {
+          status = 'failed';
+          task.failedReason = 'exit_error';
+          const exitCode = code === null ? 'null' : String(code);
+          error = `Exited with code ${exitCode}${signalName ? ` (${signalName})` : ''}`;
+        }
+        void this.finalizeTask(task, status, code, signalName, error);
+      });
+
+      if (timeoutSeconds !== undefined) {
+        task.timeoutHandle = setTimeout(() => {
+          if (task.status !== 'running') return;
+          task.killKind = 'timeout';
+          task.error = `Timed out after ${String(timeoutSeconds)}s`;
+          this.writeNotice(
+            task,
+            `\n[background task timeout: ${task.error}]\n`,
+          );
+          try {
+            this.requestKill(task, 'SIGTERM');
+          } catch (error) {
+            void this.finalizeTask(
+              task,
+              'failed',
+              null,
+              undefined,
+              `${task.error}; kill failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }, timeoutSeconds * 1000);
+      }
+
+      unbindAdmissionCancellation = this.bindOwnedTaskToAdmission(
+        task,
+        admission,
+      );
+      await this.awaitTaskAdmissionBoundary(
+        this.writeMetadata(task, admission.controller.signal),
+        admission,
+      );
+      this.assertTaskAdmissionOpen('a background task', admission);
+      this.onChange();
+      return task;
+    } catch (error) {
+      if (admission.controller.signal.aborted) {
+        const admissionError = this.taskAdmissionError(admission);
+        let cleanupError: unknown;
+        if (task.child === undefined) {
+          try {
+            await this.discardUnspawnedTask(task, [
+              outputAbsPath,
+              metadataAbsPath,
+              ...(wrapperAbsPath === undefined ? [] : [wrapperAbsPath]),
+            ]);
+          } catch (cleanupFailure) {
+            cleanupError = cleanupFailure;
+          }
+        } else {
+          this.stopOwnedTaskAfterAdmissionCancellation(task, admissionError);
+        }
+        throw this.surfacedTaskAdmissionError(admission, error, cleanupError);
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.writeNotice(
+        task,
+        `\n[background task spawn exception: ${message}]\n`,
+      );
+      await this.finalizeTask(task, 'failed', null, undefined, message);
+      throw new Error(`Failed to start background task: ${message}`);
+    } finally {
+      unbindAdmissionCancellation();
+    }
+  }
+
+  resolveTask(idOrPrefix: string): BgTask {
+    const id = idOrPrefix.trim();
+    if (!id) throw new Error('Task ID is required');
+    const exact = this.tasks.get(id);
+    if (exact) return exact;
+    const matches = [...this.tasks.values()].filter((task) =>
+      task.id.startsWith(id),
+    );
+    const onlyMatch = matches[0];
+    if (matches.length === 1 && onlyMatch) return onlyMatch;
+    if (matches.length > 1)
+      throw new Error(
+        `Ambiguous task ID prefix "${id}": ${matches.map((task) => task.id).join(', ')}`,
+      );
+    throw new Error(`Unknown background task ID: ${id}`);
+  }
+
+  async stopTask(
+    task: BgTask,
+    kind: KillKind,
+    reason?: string,
+    initiator?: StopInitiator,
+  ): Promise<BgTask> {
+    if (task.status !== 'running') {
+      throw new Error(`Task ${task.id} is ${task.status}, not running`);
+    }
+    // 停止分派按发起者记录,冲突优先级 user > model > system(参照 ZCode background.ts)
+    this.recordStopInitiator(task, initiator);
+    if (task.reloadExecution !== undefined) {
+      return task.reloadExecution.requestStop(kind, reason);
+    }
+    const stopWaitMs = this.stopWaitMs;
+    if (
+      this.platform !== 'win32' &&
+      task.posixProcessGroupSignalAuthorityReleased === true &&
+      this.posixProcessGroupKillStates.get(task) === undefined
+    ) {
+      const finalized = await this.waitForEnd(task, stopWaitMs);
+      if (!finalized) {
+        // M3 force-exit:过程组信号权已释放但任务仍未终态化(典型场景:组已死、
+        // 孙进程持有管道写端保活宿主),先销毁插件持有的输出读端,再报错。
+        await this.destroyTaskStream(task);
+        throw new Error(
+          `Task ${task.id} did not finish terminalization within ${formatDuration(stopWaitMs)} after its process group signal authority was released`,
+        );
+      }
+      return task;
+    }
+    task.killKind = kind;
+    if (reason) task.error = reason;
+    this.requestKill(task, 'SIGTERM');
+    let stopped: boolean;
+    try {
+      stopped =
+        this.platform === 'win32'
+          ? await this.waitForEndOrWindowsForceFailure(task, stopWaitMs)
+          : await this.waitForEndOrPosixForceFailure(task, stopWaitMs);
+    } catch (error) {
+      // M3 force-exit:证明性失败(reject 路径)同样先释放输出读端,防孤儿
+      // 保活宿主,再保持原抛出语义。
+      await this.destroyTaskStream(task);
+      throw error;
+    }
+    const posixForceFailure =
+      this.posixProcessGroupKillStates.get(task)?.failure;
+    if (posixForceFailure !== undefined) {
+      // M3 force-exit:防御性复查(waiter 未 reject 但失败已锁存),先释放再抛。
+      await this.destroyTaskStream(task);
+      throw posixForceFailure;
+    }
+    const windowsForceFailure = this.windowsKillStates.get(task)?.forceFailure;
+    if (windowsForceFailure !== undefined) {
+      // M3 force-exit:Windows taskkill 强制失败的同步路径,先释放输出读端再抛错。
+      await this.destroyTaskStream(task);
+      throw windowsForceFailure;
+    }
+    if (!stopped) {
+      // M3 force-exit:STOP_WAIT_MS 超时仍未退出,释放插件持有的输出读端后报错。
+      await this.destroyTaskStream(task);
+      throw new Error(
+        `Task ${task.id} did not exit within ${formatDuration(stopWaitMs)} after cancellation`,
+      );
+    }
+    return task;
+  }
+
+  /** 记录停止发起者:仅当新发起者优先级高于既有记录时覆盖(user > model > system)。 */
+  private recordStopInitiator(task: BgTask, initiator?: StopInitiator): void {
+    if (initiator === undefined) return;
+    if (
+      stopInitiatorPriority(task.stopInitiator) <
+      stopInitiatorPriority(initiator)
+    ) {
+      task.stopInitiator = initiator;
+      this.onChange();
+    }
+  }
+
+  async stopAllRunning(
+    kind: KillKind,
+    reason?: string,
+    initiator?: StopInitiator,
+  ): Promise<{ stopped: number; failures: string[] }> {
+    const running = this.allTasks().filter((task) => task.status === 'running');
+    const failures: string[] = [];
+    let stopped = 0;
+    await Promise.all(
+      running.map(async (task) => {
+        try {
+          await this.stopTask(task, kind, reason, initiator);
+          stopped++;
+        } catch (error) {
+          failures.push(
+            `${taskDisplayName(task)} (${task.id}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }),
+    );
+    return { stopped, failures };
+  }
+
+  async getTaskLogs(
+    task: BgTask,
+    maxBytes: number,
+    tail: boolean,
+  ): Promise<{ text: string; details: BgLogsDetails }> {
+    if (!existsSync(task.outputAbsPath)) {
+      throw new Error(
+        `Output file does not exist for ${task.id}: ${task.outputPath}`,
+      );
+    }
+    const read = await boundedRead(task.outputAbsPath, maxBytes, tail);
+    const direction = tail ? 'tail' : 'head';
+    let text = read.content.length > 0 ? read.content : '(no output yet)';
+    if (read.truncated) {
+      const omitted = read.totalBytes - read.bytesRead;
+      const notice = `\n\n[Showing ${direction} ${formatSize(read.bytesRead)} of ${formatSize(read.totalBytes)}; ${formatSize(omitted)} omitted. Full output: ${task.outputPath}]`;
+      text = tail ? `${notice}\n\n${text}` : `${text}${notice}`;
+    } else {
+      text += `\n\n[Full output: ${task.outputPath}]`;
+    }
+    return {
+      text,
+      details: {
+        task: snapshot(task),
+        path: task.outputPath,
+        bytesRead: read.bytesRead,
+        totalBytes: read.totalBytes,
+        truncated: read.truncated,
+        tail,
+      },
+    };
+  }
+
+  private async writeMetadata(
+    task: BgTask,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.writeMetadataSnapshot(task, snapshot(task), signal);
+  }
+
+  private async writeMetadataSnapshot(
+    task: BgTask,
+    value: BgTaskSnapshot,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const write = async () => {
+      await writeJsonAtomic(task.metadataAbsPath, value, signal);
+    };
+    const previous = task.metadataWriteChain ?? Promise.resolve();
+    const next = previous.then(write, write);
+    task.metadataWriteChain = next.catch(() => undefined);
+    await next;
+  }
+
+  private ingestTelemetry(task: BgTask, text: string): void {
+    if (!text) return;
+    const telemetryText = `${task.contextUsageBuffer ?? ''}${text}`;
+    let latestContext = task.contextUsage;
+    let latestTokens = task.tokenUsage;
+    let latestTools = task.toolUsage;
+    let latestModel = task.model;
+    for (const line of telemetryText.split(/\r?\n/)) {
+      if (!line.includes('background-task-')) continue;
+      const trimmed = line.trim();
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        try {
+          const parsed = parseJsonText(trimmed);
+          if (!isJsonObject(parsed)) continue;
+          const payload: TelemetryControlPayload = parsed;
+          if (payload.type === 'background-task-context-usage') {
+            latestContext = normalizeContextUsage(payload) ?? latestContext;
+          } else if (payload.type === 'background-task-telemetry') {
+            latestContext =
+              normalizeContextUsage(payload.contextUsage) ?? latestContext;
+            latestTokens =
+              normalizeTokenUsage(payload.tokenUsage) ?? latestTokens;
+            latestTools = normalizeToolUsage(payload.toolUsage) ?? latestTools;
+            latestModel = normalizeModel(payload.model) ?? latestModel;
+          }
+        } catch {
+          // Ignore malformed optional telemetry; task output remains authoritative for debugging.
+        }
+      }
+    }
+    const xmlMatches = telemetryText.matchAll(
+      /<background-task-context-usage>[\s\S]*?<\/background-task-context-usage>/gi,
+    );
+    for (const match of xmlMatches)
+      latestContext = parseContextUsageXml(match[0]) ?? latestContext;
+
+    const lastNewline = Math.max(
+      telemetryText.lastIndexOf('\n'),
+      telemetryText.lastIndexOf('\r'),
+    );
+    let retained =
+      lastNewline >= 0 ? telemetryText.slice(lastNewline + 1) : telemetryText;
+    const lastXmlOpen = telemetryText
+      .toLowerCase()
+      .lastIndexOf('<background-task-context-usage');
+    const lastXmlClose = telemetryText
+      .toLowerCase()
+      .lastIndexOf('</background-task-context-usage>');
+    if (lastXmlOpen > lastXmlClose) retained = telemetryText.slice(lastXmlOpen);
+    task.contextUsageBuffer = retained.slice(-TELEMETRY_BUFFER_CHARS);
+
+    this.commitTelemetry(task, {
+      context: latestContext,
+      tokens: latestTokens,
+      tools: latestTools,
+      model: latestModel,
+    });
+  }
+
+  /** Apply the latest parsed telemetry to a task, persisting metadata and notifying the UI only on change. */
+  private commitTelemetry(task: BgTask, next: TelemetryDelta): void {
+    const before = JSON.stringify({
+      contextUsage: task.contextUsage,
+      tokenUsage: task.tokenUsage,
+      toolUsage: task.toolUsage,
+      model: task.model,
+    });
+    if (next.context !== undefined) task.contextUsage = next.context;
+    if (next.tokens !== undefined) task.tokenUsage = next.tokens;
+    if (next.tools !== undefined) task.toolUsage = next.tools;
+    if (next.model !== undefined) task.model = next.model;
+    const after = JSON.stringify({
+      contextUsage: task.contextUsage,
+      tokenUsage: task.tokenUsage,
+      toolUsage: task.toolUsage,
+      model: task.model,
+    });
+    if (before !== after) {
+      this.onChange();
+      void this.writeMetadata(task).catch((error: unknown) => {
+        this.logger.error(
+          `[background-tasks] failed to write telemetry metadata for ${task.id}:`,
+          error,
+        );
+      });
+    }
+  }
+
+  /** 全量持久化输出流的汇聚器。跨越软阈值时写入一次软告警(不杀任务、不改
+   * 任务状态);达到硬阈值时终止任务。 */
+  private writeToStream(task: BgTask, buffer: Buffer): void {
+    if (!task.stream || task.stream.destroyed) return;
+    if (buffer.length === 0) return;
+
+    const nextBytes = task.bytesWritten + buffer.length;
+    if (nextBytes > this.softOutputBytes && !task.softCapWarned) {
+      task.softCapWarned = true;
+      const warning =
+        `\n\n[background task warning: output exceeded soft limit of ` +
+        `${formatSize(this.softOutputBytes)}; task continues running]\n`;
+      // 软告警是内部诊断提示,不计入任务累计输出字节,避免提示文本自身触发硬阈值
+      task.stream.write(warning);
+      this.onChange();
+    }
+
+    if (nextBytes <= this.maxOutputBytes) {
+      task.stream.write(buffer);
+      task.bytesWritten = nextBytes;
+      return;
+    }
+
+    const remaining = Math.max(0, this.maxOutputBytes - task.bytesWritten);
+    if (remaining > 0) {
+      task.stream.write(buffer.subarray(0, remaining));
+      task.bytesWritten += remaining;
+    }
+
+    if (!task.capExceeded) {
+      task.capExceeded = true;
+      task.error = `Output exceeded cap of ${formatSize(this.maxOutputBytes)}; terminating task`;
+      const notice = `\n\n[background task error: ${task.error}]\n`;
+      task.stream.write(notice);
+      task.bytesWritten += Buffer.byteLength(notice, 'utf8');
+      task.killKind = 'output_cap';
+      task.failedReason = 'output_limit';
+      try {
+        this.requestKill(task, 'SIGTERM');
+      } catch (error) {
+        task.error = `${task.error}; kill failed: ${error instanceof Error ? error.message : String(error)}`;
+        void this.finalizeTask(task, 'failed', null, undefined, task.error);
+      }
+    }
+  }
+
+  /** Persist an internally generated notice (spawn/timeout/cap diagnostics) verbatim. */
+  private writeNotice(task: BgTask, text: string): void {
+    if (!text) return;
+    this.writeToStream(task, Buffer.from(text, 'utf8'));
+  }
+
+  private appendChildOutput(
+    task: BgTask,
+    data: Buffer | string,
+    source: 'stdout' | 'stderr',
+  ): void {
+    if (!task.stream || task.stream.destroyed) return;
+    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
+    if (buffer.length === 0) return;
+    if (task.telemetryWrapped) {
+      // Wrapped Pi agents stream control lines on stdout (telemetry + activity); child
+      // stderr is raw diagnostics and is always passed through to the transcript verbatim.
+      if (source === 'stdout')
+        this.processAgentStdout(task, buffer.toString('utf8'));
+      else this.writeToStream(task, buffer);
+      return;
+    }
+    this.ingestTelemetry(task, buffer.toString('utf8'));
+    this.writeToStream(task, buffer);
+  }
+
+  /** Reconstruct wrapped-agent stdout into whole control lines, routing telemetry to metrics and activity to the transcript. */
+  private processAgentStdout(task: BgTask, text: string): void {
+    const buffered = `${task.agentStdoutBuffer ?? ''}${text}`;
+    const lastNewline = buffered.lastIndexOf('\n');
+    task.agentStdoutBuffer =
+      lastNewline >= 0 ? buffered.slice(lastNewline + 1) : buffered;
+    if (lastNewline < 0) return;
+    const latest: TelemetryDelta = {};
+    for (const line of buffered.slice(0, lastNewline).split('\n'))
+      this.consumeAgentLine(task, line, latest);
+    this.commitTelemetry(task, latest);
+  }
+
+  /** Flush a trailing partial wrapped-agent line on finalize so the last transcript fragment is never lost. */
+  private flushAgentStdout(task: BgTask): void {
+    const remainder = task.agentStdoutBuffer;
+    if (!remainder) return;
+    task.agentStdoutBuffer = '';
+    const latest: TelemetryDelta = {};
+    this.consumeAgentLine(task, remainder, latest);
+    this.commitTelemetry(task, latest);
+  }
+
+  private consumeAgentLine(
+    task: BgTask,
+    rawLine: string,
+    latest: TelemetryDelta,
+  ): void {
+    const line = rawLine.replace(/\r$/, '');
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+      this.writeNotice(task, `${line}\n`);
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = parseJsonText(trimmed);
+    } catch {
+      this.writeNotice(task, `${line}\n`);
+      return;
+    }
+    if (!isJsonObject(parsed)) {
+      this.writeNotice(task, `${line}\n`);
+      return;
+    }
+    const record: TelemetryControlPayload = parsed;
+    const type = record.type;
+    if (type === 'background-task-context-usage') {
+      const context = normalizeContextUsage(record);
+      if (context) latest.context = context;
+      return;
+    }
+    if (type === 'background-task-telemetry') {
+      const context = normalizeContextUsage(record.contextUsage);
+      if (context) latest.context = context;
+      const tokens = normalizeTokenUsage(record.tokenUsage);
+      if (tokens) latest.tokens = tokens;
+      const tools = normalizeToolUsage(record.toolUsage);
+      if (tools) latest.tools = tools;
+      const model = normalizeModel(record.model);
+      if (model) latest.model = model;
+      return;
+    }
+    const activity = parseAgentActivity(parsed);
+    if (activity) {
+      const formatted = formatAgentActivityLine(activity);
+      if (formatted) this.writeNotice(task, `${formatted}\n`);
+      return;
+    }
+    // Unknown JSON object: pass through to the transcript rather than silently dropping it.
+    this.writeNotice(task, `${line}\n`);
+  }
+
+  private beginPosixProcessGroupKill(
+    task: BgTask,
+    armGrace: boolean,
+  ): PosixProcessGroupKillState {
+    const existing = this.posixProcessGroupKillStates.get(task);
+    if (existing !== undefined) return existing;
+    if (task.posixProcessGroupSignalAuthorityReleased === true) {
+      throw new Error(
+        `Task ${task.id} has released its POSIX process-group signal authority`,
+      );
+    }
+    const groupId = task.ownedPosixProcessGroupId;
+    if (groupId === undefined) {
+      throw new Error(`Task ${task.id} has no owned POSIX process group`);
+    }
+
+    let resolveCompletion = (): void => undefined;
+    const completion = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    // Finish ownership slightly before stopTask's waiter so a force/proof
+    // failure is observed as that specific loud error instead of a generic
+    // cancellation timeout.
+    const reserveMs = Math.min(
+      25,
+      Math.max(1, Math.floor(this.stopWaitMs / 4)),
+    );
+    const ownershipMs = Math.max(1, this.stopWaitMs - reserveMs);
+    const state: PosixProcessGroupKillState = {
+      groupId,
+      completion,
+      resolveCompletion,
+      deadlineAt: Date.now() + ownershipMs,
+      forceAttempted: false,
+      settled: false,
+    };
+    this.posixProcessGroupKillStates.set(task, state);
+
+    if (armGrace) {
+      // Publish the sole force owner before TERM. An injected signal can emit
+      // close reentrantly; that close must see and await this exact state.
+      task.killEscalationTimer = setTimeout(
+        () => {
+          task.killEscalationTimer = undefined;
+          this.forceOwnedPosixProcessGroup(task, state);
+        },
+        Math.min(this.killGraceMs, ownershipMs),
+      );
+      // Unlike ordinary housekeeping timers, this owner stays referenced: a
+      // departed leader must not let the host exit and strand its owned group.
+      // M3:同在 grace 窗口内(生产为 TERM 后 1500ms)安排一次 ps 后代收集,
+      // 供 force 阶段对逃逸出组的孙进程逐个补杀;失败退化到组信号路径。
+      this.schedulePosixDescendantCollection(state, ownershipMs);
+    }
+    return state;
+  }
+
+  private finishPosixProcessGroupKill(
+    task: BgTask,
+    state: PosixProcessGroupKillState,
+    releaseOwnership: boolean,
+  ): void {
+    if (state.settled) return;
+    state.settled = true;
+    this.clearKillEscalationTimer(task);
+    this.clearPosixDescendantCollectTimer(state);
+    if (state.verificationTimer !== undefined) {
+      clearTimeout(state.verificationTimer);
+      state.verificationTimer = undefined;
+    }
+    task.posixProcessGroupSignalAuthorityReleased = true;
+    if (releaseOwnership && task.ownedPosixProcessGroupId === state.groupId) {
+      delete task.ownedPosixProcessGroupId;
+    }
+    state.resolveCompletion();
+    const failure = state.failure;
+    const listeners = state.failureListeners;
+    if (listeners !== undefined) {
+      delete state.failureListeners;
+      if (failure !== undefined) {
+        for (const listener of listeners) listener(failure);
+      }
+    }
+  }
+
+  private observeOwnedPosixProcessGroupGone(
+    task: BgTask,
+    state: PosixProcessGroupKillState,
+  ): boolean {
+    if (state.settled) return state.failure === undefined;
+    try {
+      const exists = this.killProcess(-state.groupId, 0);
+      state.lastProbeError = exists
+        ? undefined
+        : new Error(
+            `process-group probe for ${String(state.groupId)} returned false`,
+          );
+      return false;
+    } catch (error) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        Reflect.get(error, 'code') === 'ESRCH'
+      ) {
+        this.finishPosixProcessGroupKill(task, state, true);
+        return true;
+      }
+      state.lastProbeError =
+        error instanceof Error
+          ? error
+          : new Error(BackgroundTaskRegistry.errorMessage(error));
+      return false;
+    }
+  }
+
+  private recordPosixProcessGroupForceFailure(
+    task: BgTask,
+    state: PosixProcessGroupKillState,
+    error: Error,
+  ): void {
+    if (state.settled) return;
+    state.failure = error;
+    this.finishPosixProcessGroupKill(task, state, false);
+    task.error = BackgroundTaskRegistry.appendTaskError(
+      task.error,
+      error.message,
+    );
+    this.writeNotice(
+      task,
+      `\n[background task POSIX termination: ${error.message}]\n`,
+    );
+    this.onChange();
+    void this.writeMetadata(task).catch((metadataError: unknown) => {
+      this.logger.error(
+        `[background-tasks] failed to write POSIX process-group failure metadata for ${task.id}:`,
+        metadataError,
+      );
+    });
+  }
+
+  private schedulePosixProcessGroupVerification(
+    task: BgTask,
+    state: PosixProcessGroupKillState,
+  ): void {
+    if (state.settled) return;
+    const remainingMs = state.deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      const probeDetail =
+        state.lastProbeError === undefined
+          ? ''
+          : `; last group probe failed: ${state.lastProbeError.message}`;
+      this.recordPosixProcessGroupForceFailure(
+        task,
+        state,
+        new Error(
+          `POSIX process group ${String(state.groupId)} remained present after SIGKILL${probeDetail}. Descendant processes may have leaked.`,
+        ),
+      );
+      return;
+    }
+    state.verificationTimer = setTimeout(
+      () => {
+        state.verificationTimer = undefined;
+        if (this.observeOwnedPosixProcessGroupGone(task, state)) return;
+        this.schedulePosixProcessGroupVerification(task, state);
+      },
+      Math.min(10, remainingMs),
+    );
+  }
+
+  private forceOwnedPosixProcessGroup(
+    task: BgTask,
+    state: PosixProcessGroupKillState,
+  ): void {
+    if (state.settled || state.forceAttempted) return;
+    // Latch before either probe or signal: both are injected boundaries that can
+    // reentrantly emit root close, and no continuation may launch a second KILL.
+    state.forceAttempted = true;
+    this.clearKillEscalationTimer(task);
+    this.clearPosixDescendantCollectTimer(state);
+    if (this.observeOwnedPosixProcessGroupGone(task, state)) return;
+
+    let groupFailure: Error | undefined;
+    try {
+      const forced = this.killProcess(-state.groupId, 'SIGKILL');
+      if (!forced) {
+        groupFailure = new Error(
+          `POSIX process-group SIGKILL returned false for task ${task.id} group ${String(state.groupId)}. Descendant processes may have leaked.`,
+        );
+      }
+    } catch (error) {
+      if (BackgroundTaskRegistry.isEsrchError(error)) {
+        this.finishPosixProcessGroupKill(task, state, true);
+        return;
+      }
+      groupFailure = new Error(
+        `POSIX process-group SIGKILL failed for task ${task.id} group ${String(state.groupId)}: ${BackgroundTaskRegistry.errorMessage(error)}. Descendant processes may have leaked.`,
+      );
+    }
+
+    // M3:组信号后对窗口内收集到的后代逐个补杀。组内未退者已被组 SIGKILL 覆盖,
+    // 逐个补杀专为 setsid / 双 fork 逃逸出组的孙进程收网;与 ZCode 参照一致地
+    // 吞掉 ESRCH(自然死亡或被组信号回收),非 ESRCH 失败仅记 notice 并追加到
+    // task.error,不替代组存在的证明性结论(组证明仍是权威终止证明)。
+    const descendantFailures = this.forceKillCollectedPosixDescendants(state);
+    if (descendantFailures.length > 0) {
+      const message =
+        `POSIX descendant SIGKILL failed for task ${task.id} group ${String(state.groupId)}: ` +
+        `${descendantFailures.join('; ')}. Descendant processes may have leaked.`;
+      task.error = BackgroundTaskRegistry.appendTaskError(task.error, message);
+      this.writeNotice(task, `\n[background task POSIX termination: ${message}]\n`);
+      this.onChange();
+      void this.writeMetadata(task).catch((metadataError: unknown) => {
+        this.logger.error(
+          `[background-tasks] failed to write POSIX descendant-kill failure metadata for ${task.id}:`,
+          metadataError,
+        );
+      });
+    }
+
+    if (groupFailure !== undefined) {
+      this.recordPosixProcessGroupForceFailure(task, state, groupFailure);
+      return;
+    }
+    if (this.observeOwnedPosixProcessGroupGone(task, state)) return;
+    this.schedulePosixProcessGroupVerification(task, state);
+  }
+
+  /** M3:在 grace 窗口内(生产为 TERM 后 1500ms)安排一次 ps 后代收集。 */
+  private schedulePosixDescendantCollection(
+    state: PosixProcessGroupKillState,
+    ownershipMs: number,
+  ): void {
+    if (state.settled || state.forceAttempted) return;
+    const delayMs = Math.min(
+      POSIX_DESCENDANT_COLLECT_DELAY_MS,
+      Math.floor(this.killGraceMs / 2),
+      ownershipMs,
+    );
+    state.descendantCollectTimer = setTimeout(
+      () => {
+        state.descendantCollectTimer = undefined;
+        if (state.settled || state.forceAttempted) return;
+        void this.collectPosixDescendantPids(state.groupId)
+          .then((pids) => {
+            if (state.settled || state.forceAttempted) return;
+            state.descendantPids = pids;
+          })
+          .catch(() => {
+            // 收集失败不改变终止流程,退化到组信号路径。
+          });
+      },
+      delayMs,
+    ).unref();
+  }
+
+  private clearPosixDescendantCollectTimer(
+    state: PosixProcessGroupKillState,
+  ): void {
+    if (state.descendantCollectTimer !== undefined) {
+      clearTimeout(state.descendantCollectTimer);
+      state.descendantCollectTimer = undefined;
+    }
+  }
+
+  /**
+   * 对收集到的后代逐个 SIGKILL;返回非 ESRCH 失败明细。
+   * ESRCH(后代已自然退出或被同组信号回收)属正常路径,不加失败。
+   */
+  private forceKillCollectedPosixDescendants(
+    state: PosixProcessGroupKillState,
+  ): string[] {
+    const descendants = state.descendantPids;
+    if (descendants === undefined || descendants.size === 0) return [];
+    const failures: string[] = [];
+    for (const pid of descendants) {
+      try {
+        const forced = this.killProcess(pid, 'SIGKILL');
+        if (!forced) {
+          failures.push(`pid ${String(pid)} SIGKILL returned false`);
+        }
+      } catch (error) {
+        if (BackgroundTaskRegistry.isEsrchError(error)) continue;
+        failures.push(
+          `pid ${String(pid)} ${BackgroundTaskRegistry.errorMessage(error)}`,
+        );
+      }
+    }
+    return failures;
+  }
+
+  private requestPosixKill(task: BgTask, signal: NodeJS.Signals): void {
+    const state = this.beginPosixProcessGroupKill(task, signal !== 'SIGKILL');
+    if (signal === 'SIGKILL') {
+      task.killSignalSent = true;
+      this.forceOwnedPosixProcessGroup(task, state);
+      return;
+    }
+    if (task.killSignalSent) return;
+    // Publish de-duplication before the signal boundary for the same reason the
+    // state/timer is published above: close may be emitted synchronously.
+    task.killSignalSent = true;
+
+    const errors: string[] = [];
+    let killed = false;
+    try {
+      killed = this.killProcess(-state.groupId, signal);
+      if (!killed) errors.push(`process group ${signal} returned false`);
+    } catch (error) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        Reflect.get(error, 'code') === 'ESRCH'
+      ) {
+        this.finishPosixProcessGroupKill(task, state, true);
+      } else {
+        errors.push(
+          `process group kill failed: ${BackgroundTaskRegistry.errorMessage(error)}`,
+        );
+      }
+    }
+
+    if (!killed) {
+      try {
+        killed = task.child?.kill(signal) === true;
+        if (!killed) errors.push(`child ${signal} returned false`);
+      } catch (error) {
+        errors.push(
+          `child kill failed: ${BackgroundTaskRegistry.errorMessage(error)}`,
+        );
+      }
+    }
+
+    if (!killed) {
+      // If TERM reached neither target, waiting out grace has no benefit. Keep
+      // the same owner but attempt its one force phase immediately.
+      if (!state.settled) this.forceOwnedPosixProcessGroup(task, state);
+      throw new Error(`Could not kill task ${task.id}: ${errors.join('; ')}`);
+    }
+  }
+
+  private async awaitPosixProcessGroupBeforeTerminal(
+    task: BgTask,
+  ): Promise<Error | undefined> {
+    if (this.platform === 'win32') return undefined;
+    const state = this.posixProcessGroupKillStates.get(task);
+    if (state === undefined) {
+      // No tree stop won the race before direct-child finalization. Release
+      // signal authority synchronously so a concurrent late stop waits for this
+      // terminalization instead of targeting a potentially reused group id.
+      task.posixProcessGroupSignalAuthorityReleased = true;
+      delete task.ownedPosixProcessGroupId;
+      return undefined;
+    }
+    this.observeOwnedPosixProcessGroupGone(task, state);
+    await state.completion;
+    return state.failure;
+  }
+
+  private waitForEndOrPosixForceFailure(
+    task: BgTask,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const state = this.posixProcessGroupKillStates.get(task);
+    if (state === undefined) return this.waitForEnd(task, timeoutMs);
+    if (state.failure !== undefined) return Promise.reject(state.failure);
+    if (task.status !== 'running') return Promise.resolve(true);
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timeout);
+        const waiterIndex = task.waiters.indexOf(done);
+        if (waiterIndex >= 0) task.waiters.splice(waiterIndex, 1);
+        const listeners = state.failureListeners;
+        if (listeners !== undefined) {
+          const listenerIndex = listeners.indexOf(failed);
+          if (listenerIndex >= 0) listeners.splice(listenerIndex, 1);
+          if (listeners.length === 0) delete state.failureListeners;
+        }
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        resolve(false);
+      }, timeoutMs);
+      const done = () => {
+        cleanup();
+        resolve(true);
+      };
+      const failed = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      task.waiters.push(done);
+      if (state.failureListeners === undefined) state.failureListeners = [];
+      state.failureListeners.push(failed);
+    });
+  }
+
+  private getWindowsKillState(task: BgTask): WindowsKillState {
+    let state = this.windowsKillStates.get(task);
+    if (state === undefined) {
+      state = {};
+      this.windowsKillStates.set(task, state);
+    }
+    return state;
+  }
+
+  private static errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  /** 判定错误是否进程不存在(errno ESRCH),用于 sig-0 证明与逐后代补杀的吞错边界。 */
+  private static isEsrchError(error: unknown): boolean {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      Reflect.get(error, 'code') === 'ESRCH'
+    );
+  }
+
+  private static appendTaskError(
+    existing: string | undefined,
+    next: string,
+  ): string {
+    if (existing === undefined || existing.length === 0) return next;
+    if (existing.includes(next)) return existing;
+    return `${existing}; ${next}`;
+  }
+
+  private static describeTaskkillOutcome(outcome: TaskkillOutcome): string {
+    const exitCode =
+      outcome.exitCode === null ? 'null' : String(outcome.exitCode);
+    const signal = outcome.signal === null ? 'null' : outcome.signal;
+    const stdout =
+      outcome.stdout.length > 0
+        ? ` stdout=${JSON.stringify(outcome.stdout)}`
+        : '';
+    const stderr =
+      outcome.stderr.length > 0
+        ? ` stderr=${JSON.stringify(outcome.stderr)}`
+        : '';
+    const stdoutTruncated = outcome.stdoutTruncated
+      ? ' stdout_truncated=true'
+      : '';
+    const stderrTruncated = outcome.stderrTruncated
+      ? ' stderr_truncated=true'
+      : '';
+    return `exit=${exitCode} signal=${signal}${stdout}${stderr}${stdoutTruncated}${stderrTruncated}`;
+  }
+
+  private isWindowsTaskkillTerminalRace(task: BgTask): boolean {
+    return task.status !== 'running' || task.finalized === true;
+  }
+
+  private clearKillEscalationTimer(task: BgTask): void {
+    if (task.killEscalationTimer !== undefined) {
+      clearTimeout(task.killEscalationTimer);
+      task.killEscalationTimer = undefined;
+    }
+  }
+
+  private recordWindowsTaskkillNotice(task: BgTask, message: string): void {
+    this.writeNotice(
+      task,
+      `\n[background task Windows termination: ${message}]\n`,
+    );
+  }
+
+  private recordWindowsSoftFailure(
+    task: BgTask,
+    pid: number,
+    detail: string,
+  ): void {
+    const message =
+      `Windows taskkill /T logical termination request failed for task ${task.id} pid ${String(pid)}: ` +
+      `${detail}; force escalation remains scheduled`;
+    task.error = BackgroundTaskRegistry.appendTaskError(task.error, message);
+    this.recordWindowsTaskkillNotice(task, message);
+    this.onChange();
+    void this.writeMetadata(task).catch((metadataError: unknown) => {
+      this.logger.error(
+        `[background-tasks] failed to write Windows taskkill soft-failure metadata for ${task.id}:`,
+        metadataError,
+      );
+    });
+  }
+
+  private makeWindowsForceFailure(
+    task: BgTask,
+    pid: number,
+    detail: string,
+  ): Error {
+    return new Error(
+      `Windows taskkill /T /F force termination failed for task ${task.id} pid ${String(pid)}: ${detail}. Descendant processes may have leaked.`,
+    );
+  }
+
+  private recordWindowsForceFailure(task: BgTask, error: Error): void {
+    const state = this.getWindowsKillState(task);
+    state.forceFailure = error;
+    task.error = BackgroundTaskRegistry.appendTaskError(
+      task.error,
+      error.message,
+    );
+    this.recordWindowsTaskkillNotice(task, error.message);
+    this.onChange();
+    void this.writeMetadata(task).catch((metadataError: unknown) => {
+      this.logger.error(
+        `[background-tasks] failed to write Windows taskkill force-failure metadata for ${task.id}:`,
+        metadataError,
+      );
+    });
+    const listeners = state.forceFailureListeners;
+    if (listeners !== undefined) {
+      delete state.forceFailureListeners;
+      for (const listener of listeners) listener(error);
+    }
+  }
+
+  private evaluateWindowsTaskkillOutcome(
+    task: BgTask,
+    pid: number,
+    phase: WindowsKillPhase,
+    outcome: TaskkillOutcome,
+  ): Error | undefined {
+    if (outcome.exitCode === 0) return undefined;
+    const detail = BackgroundTaskRegistry.describeTaskkillOutcome(outcome);
+    if (outcome.exitCode === 128) {
+      this.recordWindowsTaskkillNotice(
+        task,
+        `taskkill ${phase} reported process not found for pid ${String(pid)} (${detail}); treating as an already-exited race`,
+      );
+      return undefined;
+    }
+    if (this.isWindowsTaskkillTerminalRace(task)) {
+      this.recordWindowsTaskkillNotice(
+        task,
+        `taskkill ${phase} finished after the task became terminal for pid ${String(pid)} (${detail}); treating as a terminal race`,
+      );
+      return undefined;
+    }
+    if (phase === 'terminate') {
+      this.recordWindowsSoftFailure(task, pid, detail);
+      return undefined;
+    }
+    return this.makeWindowsForceFailure(task, pid, detail);
+  }
+
+  private handleWindowsSoftException(
+    task: BgTask,
+    pid: number,
+    error: unknown,
+    state: WindowsKillState,
+  ): void {
+    const message = BackgroundTaskRegistry.errorMessage(error);
+    if (
+      state.forcePromise !== undefined ||
+      this.isWindowsTaskkillTerminalRace(task)
+    )
+      return;
+    this.recordWindowsSoftFailure(task, pid, message);
+  }
+
+  private startWindowsSoftKill(task: BgTask, pid: number): Promise<void> {
+    const state = this.getWindowsKillState(task);
+    if (state.softPromise !== undefined) return state.softPromise;
+    const controller = new AbortController();
+    state.softController = controller;
+
+    let launched: Promise<TaskkillOutcome>;
+    try {
+      launched = this.killTree(pid, 'terminate', controller.signal);
+    } catch (error) {
+      delete state.softController;
+      throw new Error(
+        `Could not kill task ${task.id}: Windows taskkill /T failed to start: ${BackgroundTaskRegistry.errorMessage(error)}`,
+      );
+    }
+
+    const promise = launched
+      .then((outcome) => {
+        if (
+          state.forcePromise !== undefined ||
+          this.isWindowsTaskkillTerminalRace(task)
+        )
+          return;
+        const failure = this.evaluateWindowsTaskkillOutcome(
+          task,
+          pid,
+          'terminate',
+          outcome,
+        );
+        if (failure !== undefined) throw failure;
+      })
+      .catch((error: unknown) => {
+        this.handleWindowsSoftException(task, pid, error, state);
+      })
+      .finally(() => {
+        if (state.softController === controller) delete state.softController;
+      });
+    state.softPromise = promise;
+    return promise;
+  }
+
+  private startWindowsForceKill(task: BgTask, pid: number): Promise<void> {
+    const state = this.getWindowsKillState(task);
+    if (state.forcePromise !== undefined) return state.forcePromise;
+
+    let resolveForce: (() => void) | undefined;
+    let rejectForce: ((error: unknown) => void) | undefined;
+    const forcePromise = new Promise<void>((resolve, reject) => {
+      resolveForce = resolve;
+      rejectForce = reject;
+    });
+    if (resolveForce === undefined || rejectForce === undefined) {
+      throw new Error(
+        'Windows force termination promise could not be initialized',
+      );
+    }
+    const resolveForceReady = resolveForce;
+    const rejectForceReady = rejectForce;
+    state.forcePromise = forcePromise;
+    void forcePromise.catch((error: unknown) => {
+      this.logger.error(
+        `[background-tasks] Windows force tree termination failed for ${task.id}:`,
+        error,
+      );
+    });
+
+    this.clearKillEscalationTimer(task);
+    if (
+      state.softController !== undefined &&
+      !state.softController.signal.aborted
+    ) {
+      state.softController.abort();
+    }
+
+    let launched: Promise<TaskkillOutcome>;
+    try {
+      launched = this.killTree(pid, 'force');
+    } catch (error) {
+      const failure = this.makeWindowsForceFailure(
+        task,
+        pid,
+        `helper failed to start: ${BackgroundTaskRegistry.errorMessage(error)}`,
+      );
+      delete state.forcePromise;
+      this.recordWindowsForceFailure(task, failure);
+      rejectForceReady(failure);
+      throw failure;
+    }
+
+    launched.then(
+      (outcome) => {
+        const failure = this.evaluateWindowsTaskkillOutcome(
+          task,
+          pid,
+          'force',
+          outcome,
+        );
+        if (failure !== undefined) {
+          this.recordWindowsForceFailure(task, failure);
+          rejectForceReady(failure);
+          return;
+        }
+        resolveForceReady();
+      },
+      (error: unknown) => {
+        if (this.isWindowsTaskkillTerminalRace(task)) {
+          this.recordWindowsTaskkillNotice(
+            task,
+            `taskkill force rejected after the task became terminal for pid ${String(pid)} (${BackgroundTaskRegistry.errorMessage(error)}); treating as a terminal race`,
+          );
+          resolveForceReady();
+          return;
+        }
+        const failure = this.makeWindowsForceFailure(
+          task,
+          pid,
+          BackgroundTaskRegistry.errorMessage(error),
+        );
+        this.recordWindowsForceFailure(task, failure);
+        rejectForceReady(failure);
+      },
+    );
+
+    return forcePromise;
+  }
+
+  private requestWindowsKill(
+    task: BgTask,
+    pid: number,
+    signal: NodeJS.Signals,
+  ): void {
+    if (signal === 'SIGKILL') {
+      this.startWindowsForceKill(task, pid);
+      task.killSignalSent = true;
+      return;
+    }
+
+    this.startWindowsSoftKill(task, pid);
+    task.killSignalSent = true;
+    if (task.killEscalationTimer !== undefined) return;
+    task.killEscalationTimer = setTimeout(() => {
+      task.killEscalationTimer = undefined;
+      if (task.status !== 'running') return;
+      try {
+        this.requestKill(task, 'SIGKILL');
+      } catch (error) {
+        task.error = BackgroundTaskRegistry.appendTaskError(
+          task.error,
+          `SIGKILL failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        void this.writeMetadata(task).catch((metadataError: unknown) => {
+          this.logger.error(
+            `[background-tasks] failed to write metadata for ${task.id}:`,
+            metadataError,
+          );
+        });
+      }
+    }, this.killGraceMs).unref();
+  }
+
+  private requestKill(task: BgTask, signal: NodeJS.Signals = 'SIGTERM'): void {
+    if (task.status !== 'running') {
+      throw new Error(`Task ${task.id} is ${task.status}, not running`);
+    }
+    if (!task.child) {
+      throw new Error(`Task ${task.id} has no child process handle`);
+    }
+    if (task.killSignalSent && signal === 'SIGTERM') return;
+
+    if (this.platform === 'win32') {
+      if (!task.pid) throw new Error(`Task ${task.id} has no process id`);
+      this.requestWindowsKill(task, task.pid, signal);
+      return;
+    }
+
+    this.requestPosixKill(task, signal);
+  }
+
+  private waitForEnd(task: BgTask, timeoutMs: number): Promise<boolean> {
+    if (task.status !== 'running') return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        const idx = task.waiters.indexOf(done);
+        if (idx >= 0) task.waiters.splice(idx, 1);
+        resolve(false);
+      }, timeoutMs);
+      const done = () => {
+        clearTimeout(timeout);
+        resolve(true);
+      };
+      task.waiters.push(done);
+    });
+  }
+
+  private waitForEndOrWindowsForceFailure(
+    task: BgTask,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const state = this.getWindowsKillState(task);
+    if (state.forceFailure !== undefined)
+      return Promise.reject(state.forceFailure);
+    if (task.status !== 'running') return Promise.resolve(true);
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timeout);
+        const waiterIndex = task.waiters.indexOf(done);
+        if (waiterIndex >= 0) task.waiters.splice(waiterIndex, 1);
+        const listeners = state.forceFailureListeners;
+        if (listeners !== undefined) {
+          const listenerIndex = listeners.indexOf(failed);
+          if (listenerIndex >= 0) listeners.splice(listenerIndex, 1);
+          if (listeners.length === 0) delete state.forceFailureListeners;
+        }
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        resolve(false);
+      }, timeoutMs);
+      const done = () => {
+        cleanup();
+        resolve(true);
+      };
+      const failed = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      task.waiters.push(done);
+      if (state.forceFailureListeners === undefined)
+        state.forceFailureListeners = [];
+      state.forceFailureListeners.push(failed);
+    });
+  }
+
+  private async awaitWindowsForceBeforeTerminal(
+    task: BgTask,
+  ): Promise<Error | undefined> {
+    const state = this.windowsKillStates.get(task);
+    if (state === undefined) return undefined;
+    const forcePromise = state.forcePromise;
+    if (forcePromise === undefined) return state.forceFailure;
+    try {
+      await forcePromise;
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+    return state.forceFailure;
+  }
+
+  private async deliverReloadTerminal(
+    execution: ReloadableShellExecutionV1,
+    lease: ReloadShellActivationLeaseV1,
+  ): Promise<void> {
+    const task = execution.task;
+    if (task.reloadHostDeliveryInFlight || task.reloadHostDeliverySettled) {
+      this.maybeReleaseReloadExecution(task);
+      return;
+    }
+    task.reloadHostDeliveryInFlight = true;
+    try {
+      if (!this.ownsReloadExecution(execution, lease)) return;
+      // reload 路径的迟到结算 fence:旧代次帧标陈旧(不触发唤醒),waiter 双通道结算
+      this.applyBranchGenerationFence(task);
+      this.settleTaskWaiters(task);
+      this.onChange();
+      this.publishTerminal(task);
+      const deliveryGate = await this.waitForTerminalPublicationGate(task);
+      if (!this.ownsReloadExecution(execution, lease)) return;
+      if (deliveryGate.kind === 'rejected') {
+        this.logger.error(
+          `[background-tasks] completion delivery gate failed for ${task.id}: ${this.terminalPublicationError(deliveryGate.error)}`,
+        );
+      } else if (
+        task.notifyOnCompletion &&
+        !task.notified &&
+        !this.shuttingDown &&
+        execution.notificationState === 'pending'
+      ) {
+        const token = execution.beginNotification(lease);
+        if (token !== undefined) {
+          try {
+            this.notifyCompletion(task);
+            execution.finishNotification(token, task.notified);
+          } catch (error) {
+            execution.finishNotification(token, false);
+            this.logger.error(
+              `[background-tasks] notification failed for ${task.id}:`,
+              error,
+            );
+          }
+        }
+      }
+      if (!this.ownsReloadExecution(execution, lease)) return;
+      task.reloadHostNotificationSettled = true;
+      task.reloadHostDeliverySettled = true;
+      try {
+        await this.writeMetadata(task);
+      } catch (error) {
+        this.logger.error(
+          `[background-tasks] failed to update survivor notification metadata for ${task.id}:`,
+          error,
+        );
+      }
+    } finally {
+      task.reloadHostDeliveryInFlight = false;
+      this.maybeReleaseReloadExecution(task);
+    }
+  }
+
+  private maybeReleaseReloadExecution(task: BgTask): void {
+    const execution = task.reloadExecution;
+    const lease = this.reloadShellLease;
+    if (
+      execution === undefined ||
+      execution.phase !== 'terminal' ||
+      task.reloadHostNotificationSettled !== true ||
+      task.terminalPublicationState === 'pending' ||
+      !this.ownsReloadExecution(execution, lease) ||
+      this.reloadShellOwner === undefined ||
+      lease === undefined
+    ) {
+      return;
+    }
+    try {
+      this.reloadShellOwner.releaseExecution(lease, execution);
+    } catch (error) {
+      if (
+        typeof error !== 'object' ||
+        error === null ||
+        Reflect.get(error, 'code') !== 'pi_bg_reload_owner_stale_claim'
+      ) {
+        this.logger.error(
+          `[background-tasks] failed to release reload shell execution ${task.id}:`,
+          error,
+        );
+      }
+    }
+  }
+
+  private terminalPublicationAbandonSignal(
+    task: BgTask,
+  ): TerminalPublicationAbandonSignal {
+    const existing = this.terminalPublicationAbandonSignals.get(task);
+    if (existing !== undefined) return existing;
+    let resolveSignal: (
+      reason: TerminalPublicationAbandonReason,
+    ) => void = () => {};
+    const promise = new Promise<TerminalPublicationAbandonReason>((resolve) => {
+      resolveSignal = resolve;
+    });
+    const signal = { promise, resolve: resolveSignal };
+    this.terminalPublicationAbandonSignals.set(task, signal);
+    return signal;
+  }
+
+  private publishTerminal(task: BgTask): void {
+    if (task.reloadExecution !== undefined && this.tasks.get(task.id) !== task)
+      return;
+    if (
+      task.terminalPublicationState !== 'pending' ||
+      task.terminalPublishInFlight
+    )
+      return;
+    if (this.terminalPublicationClosed) {
+      this.abandonTerminalPublication(
+        task,
+        this.terminalPublicationCloseReason ?? 'registry_shutdown',
+      );
+      return;
+    }
+    task.terminalPublishInFlight = true;
+    if (task.terminalPublicationGate === undefined) {
+      this.tryPublishTerminalNow(task);
+      return;
+    }
+    void this.publishTerminalWhenReady(task);
+  }
+
+  private async publishTerminalWhenReady(task: BgTask): Promise<void> {
+    const outcome = await this.waitForTerminalPublicationGate(task);
+    if (
+      task.reloadExecution !== undefined &&
+      this.tasks.get(task.id) !== task
+    ) {
+      task.terminalPublishInFlight = false;
+      return;
+    }
+    if (outcome.kind === 'closed') {
+      this.abandonTerminalPublication(task, outcome.reason);
+      return;
+    }
+    if (outcome.kind === 'rejected') {
+      this.abandonTerminalPublication(task, 'gate_rejected', outcome.error);
+      return;
+    }
+    // The gate and registry closure can settle in the same microtask turn.
+    // Re-check after the await so a late gate cannot publish into a disposed
+    // activation or revive a task already abandoned by shutdown.
+    if (
+      this.terminalPublicationClosed ||
+      task.terminalPublicationState !== 'pending'
+    ) {
+      this.abandonTerminalPublication(
+        task,
+        this.terminalPublicationCloseReason ?? 'registry_shutdown',
+      );
+      return;
+    }
+    this.tryPublishTerminalNow(task);
+  }
+
+  private async waitForTerminalPublicationGate(
+    task: BgTask,
+  ): Promise<TerminalPublicationGateOutcome> {
+    if (this.terminalPublicationClosed) {
+      return {
+        kind: 'closed',
+        reason: this.terminalPublicationCloseReason ?? 'registry_shutdown',
+      };
+    }
+    if (task.terminalPublicationState === 'abandoned') {
+      if (task.terminalPublicationAbandonReason === 'gate_rejected') {
+        return {
+          kind: 'rejected',
+          error: new Error('terminal publication gate rejected'),
+        };
+      }
+      return {
+        kind: 'closed',
+        reason: task.terminalPublicationAbandonReason ?? 'registry_shutdown',
+      };
+    }
+    const gate = task.terminalPublicationGate;
+    if (gate === undefined) return { kind: 'released' };
+
+    const gateOutcome: Promise<TerminalPublicationGateOutcome> = gate.then(
+      () => ({ kind: 'released' }),
+      (error: unknown) => ({ kind: 'rejected', error }),
+    );
+    const closureOutcome: Promise<TerminalPublicationGateOutcome> =
+      this.terminalPublicationClosedSignal.then((reason) => ({
+        kind: 'closed',
+        reason,
+      }));
+    const abandonmentOutcome: Promise<TerminalPublicationGateOutcome> =
+      this.terminalPublicationAbandonSignal(task).promise.then((reason) => ({
+        kind: 'closed',
+        reason,
+      }));
+    const outcome = await Promise.race([
+      gateOutcome,
+      closureOutcome,
+      abandonmentOutcome,
+    ]);
+
+    // Closure wins if it happened before this continuation resumed, regardless
+    // of which promise queued its reaction first.
+    if (this.terminalPublicationClosed) {
+      return {
+        kind: 'closed',
+        reason: this.terminalPublicationCloseReason ?? 'registry_shutdown',
+      };
+    }
+    return outcome;
+  }
+
+  private tryPublishTerminalNow(task: BgTask): void {
+    if (
+      task.reloadExecution !== undefined &&
+      this.tasks.get(task.id) !== task
+    ) {
+      task.terminalPublishInFlight = false;
+      return;
+    }
+    if (task.terminalPublicationState !== 'pending') {
+      task.terminalPublishInFlight = false;
+      return;
+    }
+    if (this.terminalPublicationClosed) {
+      task.terminalPublishInFlight = false;
+      this.abandonTerminalPublication(
+        task,
+        this.terminalPublicationCloseReason ?? 'registry_shutdown',
+      );
+      this.pruneOldTasks();
+      return;
+    }
+
+    task.terminalPublishAttempts += 1;
+    task.terminalEmitInFlight = true;
+    let emitFailed = false;
+    let emitError: unknown;
+    try {
+      this.publishTerminalSnapshot(snapshot(task));
+    } catch (error) {
+      emitFailed = true;
+      emitError = error;
+    }
+    task.terminalEmitInFlight = false;
+    task.terminalPublishInFlight = false;
+
+    if (emitFailed) {
+      const execution = task.reloadExecution;
+      if (
+        execution !== undefined &&
+        !this.ownsReloadExecution(execution, this.reloadShellLease)
+      ) {
+        // The emitter synchronously detached this task into a reload handoff
+        // before throwing. Attempt 1 is consumed, but only the fresh owner may
+        // retry or decide abandonment on the shared publication ledger.
+        return;
+      }
+      this.handleTerminalPublishFailure(task, emitError);
+    } else {
+      this.markTerminalPublicationDelivered(task);
+    }
+    this.pruneOldTasks();
+  }
+
+  private markTerminalPublicationDelivered(task: BgTask): void {
+    if (task.terminalPublishRetryHandle !== undefined) {
+      clearTimeout(task.terminalPublishRetryHandle);
+      task.terminalPublishRetryHandle = undefined;
+    }
+    task.terminalPublicationGate = undefined;
+    task.terminalEmitInFlight = false;
+    task.terminalPublishInFlight = false;
+    task.terminalPublicationState = 'delivered';
+    delete task.terminalPublicationAbandonReason;
+    task.terminalPublished = true;
+    this.maybeReleaseReloadExecution(task);
+  }
+
+  private abandonTerminalPublication(
+    task: BgTask,
+    reason: TerminalPublicationAbandonReason,
+    error?: unknown,
+    log = true,
+  ): void {
+    if (task.terminalPublishRetryHandle !== undefined) {
+      clearTimeout(task.terminalPublishRetryHandle);
+      task.terminalPublishRetryHandle = undefined;
+    }
+    task.terminalPublicationGate = undefined;
+    if (task.terminalEmitInFlight !== true)
+      task.terminalPublishInFlight = false;
+    if (task.terminalPublicationState === 'delivered') return;
+    if (task.terminalPublicationState === 'abandoned') return;
+
+    task.terminalPublicationState = 'abandoned';
+    task.terminalPublicationAbandonReason = reason;
+    task.terminalPublished = false;
+    this.terminalPublicationAbandonSignal(task).resolve(reason);
+    if (log) {
+      const detail =
+        error === undefined ? '' : `: ${this.terminalPublicationError(error)}`;
+      this.logger.error(
+        `[background-tasks] terminal publication abandoned for ${task.id} (${reason}) after ${String(task.terminalPublishAttempts)}/${String(TERMINAL_PUBLICATION_MAX_ATTEMPTS)} emit attempts${detail}`,
+      );
+    }
+    this.maybeReleaseReloadExecution(task);
+  }
+
+  private terminalPublicationError(error: unknown): string {
+    const compact = BackgroundTaskRegistry.errorMessage(error)
+      .replace(/\s+/gu, ' ')
+      .trim();
+    if (compact.length <= TERMINAL_PUBLICATION_DIAGNOSTIC_CHARS) return compact;
+    return `${compact.slice(0, TERMINAL_PUBLICATION_DIAGNOSTIC_CHARS - 1)}…`;
+  }
+
+  private handleTerminalPublishFailure(task: BgTask, error: unknown): void {
+    task.terminalPublishInFlight = false;
+    if (task.terminalPublicationState !== 'pending') return;
+    if (error instanceof BackgroundTaskExtensionServiceClosedError) {
+      this.closeTerminalPublication('publisher_closed');
+      return;
+    }
+    if (this.terminalPublicationClosed) {
+      this.abandonTerminalPublication(
+        task,
+        this.terminalPublicationCloseReason ?? 'registry_shutdown',
+        error,
+      );
+      this.pruneOldTasks();
+      return;
+    }
+    if (task.terminalPublishAttempts >= TERMINAL_PUBLICATION_MAX_ATTEMPTS) {
+      this.abandonTerminalPublication(task, 'retry_exhausted', error);
+      this.pruneOldTasks();
+      return;
+    }
+
+    this.logger.error(
+      `[background-tasks] terminal publication failed for ${task.id} (attempt ${String(task.terminalPublishAttempts)}/${String(TERMINAL_PUBLICATION_MAX_ATTEMPTS)}; retrying): ${this.terminalPublicationError(error)}`,
+    );
+    if (task.terminalPublishRetryHandle !== undefined) return;
+    task.terminalPublishRetryHandle = setTimeout(() => {
+      task.terminalPublishRetryHandle = undefined;
+      if (
+        this.terminalPublicationClosed ||
+        task.terminalPublicationState !== 'pending' ||
+        (task.reloadExecution !== undefined && this.tasks.get(task.id) !== task)
+      )
+        return;
+      this.publishTerminal(task);
+    }, TERMINAL_PUBLICATION_RETRY_MS);
+    task.terminalPublishRetryHandle.unref();
+  }
+
+  private notifyCompletion(task: BgTask): void {
+    if (!task.notifyOnCompletion || task.notified || this.shuttingDown) return;
+    task.notified = true;
+    const exit =
+      task.exitCode === undefined
+        ? ''
+        : `\n  <exit-code>${String(task.exitCode)}</exit-code>`;
+    const error = task.error
+      ? `\n  <error>${escapeXml(task.error)}</error>`
+      : '';
+    const taskName = taskDisplayName(task);
+    const guidance =
+      'Terminal state and output metadata are durable. Do not call bg_status to reconfirm; use bg_logs only if output is needed.';
+    const content = [
+      '<background-task-notification>',
+      `  <task-id>${task.id}</task-id>`,
+      `  <task-name>${escapeXml(taskName)}</task-name>`,
+      `  <status>${task.status}</status>`,
+      exit,
+      error,
+      `  <output-file>${escapeXml(task.outputPath)}</output-file>`,
+      `  <summary>${escapeXml(`Background task ${JSON.stringify(taskName)} ${task.status}`)}</summary>`,
+      `  <guidance>${escapeXml(guidance)}</guidance>`,
+      '</background-task-notification>',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    try {
+      this.sendCompletionNotification(
+        {
+          customType: 'background-task-notification',
+          content,
+          display: true,
+          details: snapshot(task),
+        },
+        {
+          deliverAs: 'followUp',
+          // 迟到结算 fence:旧代次帧只通知、不触发唤醒
+          triggerTurn:
+            task.triggerOnCompletion === true && task.staleBranchFrame !== true,
+        },
+      );
+    } catch (error) {
+      task.notified = false;
+      throw new Error(
+        `Failed to send background task notification for ${task.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private async finalizeTask(
+    task: BgTask,
+    status: TaskStatus,
+    exitCode: number | null,
+    signal?: string | null,
+    error?: string,
+  ): Promise<void> {
+    if (task.finalized) return;
+    task.finalized = true;
+    if (task.timeoutHandle) clearTimeout(task.timeoutHandle);
+    if (this.platform === 'win32') this.clearKillEscalationTimer(task);
+    let finalStatus = status;
+    let finalError = error;
+    const posixForceFailure =
+      await this.awaitPosixProcessGroupBeforeTerminal(task);
+    if (posixForceFailure !== undefined) {
+      finalStatus = 'failed';
+      finalError = BackgroundTaskRegistry.appendTaskError(
+        finalError,
+        posixForceFailure.message,
+      );
+    }
+    const windowsForceFailure =
+      await this.awaitWindowsForceBeforeTerminal(task);
+    if (windowsForceFailure !== undefined) {
+      finalStatus = 'failed';
+      finalError = BackgroundTaskRegistry.appendTaskError(
+        finalError,
+        windowsForceFailure.message,
+      );
+    }
+    task.exitCode = exitCode;
+    task.signal = signal ?? null;
+
+    // Keep status="running" until the final wrapped-agent fragment has been
+    // consumed and the output plus terminal metadata are durable. Publishing a
+    // terminal state earlier lets bg_status observe the previous assistant
+    // turn's context snapshot and recreates the same false-completion race
+    // early terminal publication is required to prevent.
+    try {
+      if (task.telemetryWrapped) {
+        // Child-process close can be observed before the wrapper stdout listener has
+        // committed its last parsed telemetry batch. Wait for a short quiet window,
+        // then flush the trailing partial line, so completed status never races
+        // ahead of the final assistant-turn context/token/tool snapshot.
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        this.flushAgentStdout(task);
+      }
+      if (task.stream && !task.stream.destroyed)
+        await closeAndFsyncOutputStream(task.stream);
+    } catch (finalizeError) {
+      finalStatus = 'failed';
+      const message =
+        finalizeError instanceof Error
+          ? finalizeError.message
+          : String(finalizeError);
+      finalError = finalError
+        ? `${finalError}; final output durability failed: ${message}`
+        : `Final output durability failed: ${message}`;
+    }
+
+    task.endTime = this.now();
+    if (finalError) task.error = finalError;
+    try {
+      await this.writeMetadataSnapshot(task, {
+        ...snapshot(task),
+        status: finalStatus,
+      });
+      task.status = finalStatus;
+    } catch (metadataError) {
+      finalStatus = 'failed';
+      task.status = 'failed';
+      task.error = `Terminal metadata write failed: ${metadataError instanceof Error ? metadataError.message : String(metadataError)}`;
+      this.logger.error(
+        `[background-tasks] failed to write metadata for ${task.id}:`,
+        metadataError,
+      );
+      await this.writeMetadata(task).catch((retryError: unknown) => {
+        this.logger.error(
+          `[background-tasks] failed to write failed terminal metadata for ${task.id}:`,
+          retryError,
+        );
+      });
+    }
+
+    // M2:迟到结算 fence(旧代次帧标陈旧、不触发唤醒)与 waiter 双通道结算
+    this.applyBranchGenerationFence(task);
+    this.settleTaskWaiters(task);
+
+    for (const waiter of task.waiters.splice(0)) waiter();
+    this.onChange();
+    this.publishTerminal(task);
+    const deliveryGate = await this.waitForTerminalPublicationGate(task);
+    if (deliveryGate.kind === 'rejected') {
+      this.logger.error(
+        `[background-tasks] completion delivery gate failed for ${task.id}: ${this.terminalPublicationError(deliveryGate.error)}`,
+      );
+    } else {
+      // EventBus disposal abandons only EventBus publication. Notification truth
+      // remains independent; notifyCompletion itself suppresses session shutdown.
+      try {
+        this.notifyCompletion(task);
+      } catch (notificationError) {
+        this.logger.error(
+          `[background-tasks] notification failed for ${task.id}:`,
+          notificationError,
+        );
+      }
+    }
+    try {
+      await this.writeMetadata(task);
+    } catch (metadataError) {
+      this.logger.error(
+        `[background-tasks] failed to update notification metadata for ${task.id}:`,
+        metadataError,
+      );
+    }
+    this.pruneOldTasks();
+  }
+
+  private pruneOldTasks(): void {
+    if (this.tasks.size <= this.maxRecentTasks) return;
+    const removable = [...this.tasks.values()]
+      .filter(
+        (task) =>
+          task.status !== 'running' && task.terminalEmitInFlight !== true,
+      )
+      .sort((a, b) => (a.endTime ?? a.startTime) - (b.endTime ?? b.startTime));
+    while (this.tasks.size > this.maxRecentTasks && removable.length > 0) {
+      const task = removable.shift();
+      if (task === undefined) continue;
+      if (task.terminalPublicationState === 'pending') {
+        this.abandonTerminalPublication(task, 'retention_limit');
+      }
+      this.tasks.delete(task.id);
+    }
+  }
+}

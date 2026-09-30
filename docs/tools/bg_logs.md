@@ -7,11 +7,12 @@ stability: stable
 covers_surfaces: [tool:bg_logs]
 covers_sources: []
 ---
+
 # `bg_logs`
 
 <!-- pi-docs:begin name="tool-contract-bg_logs" generator="scripts/docs/generate.mjs" -->
 - Label: **Background Logs**
-- Source: `src/extension.ts:1136`
+- Source: `src/extension.ts:850`
 - Availability: `always`
 - Available by default: **yes**
 - Description: Read bounded output from a background task for deliberate inspection; this is not a waiting primitive. Output is capped at 50.0KB for model safety and points to the full output file when truncated.
@@ -57,14 +58,13 @@ Read bounded output from a background task.
 
 ## Schema
 
-
 Required fields:
 
 - `taskId: string` — exact task id or unambiguous prefix.
 
 Optional fields:
 
-- `maxBytes: number` — normalized to `[1, MAX_LOG_BYTES]`, with a current cap of up to 50 KiB.
+- `maxBytes: number` — normalized to `[1, MAX_LOG_BYTES]`, with a current cap of the host-provided `DEFAULT_MAX_BYTES` (currently 50 KiB), never above 64 KiB.
 - `tail: boolean` — `true` reads the tail; `false` reads the head. Default `true`.
 
 ## When to use
@@ -75,7 +75,7 @@ Do **not** repeatedly call `bg_logs` to wait for completion while a notification
 
 ## Defaults
 
-- `maxBytes`: default bounded log size, currently up to 50 KiB.
+- `maxBytes`: default bounded log size, the host-provided model-safe default (currently 50 KiB), never above 64 KiB.
 - `tail`: `true`.
 
 ## Lifecycle
@@ -85,11 +85,11 @@ Do **not** repeatedly call `bg_logs` to wait for completion while a notification
 ## Examples
 
 ```json
-{"taskId":"b12345678"}
+{ "taskId": "b12345678" }
 ```
 
 ```json
-{"taskId":"b1234","maxBytes":4096,"tail":false}
+{ "taskId": "b1234", "maxBytes": 4096, "tail": false }
 ```
 
 ## Output/result
@@ -102,10 +102,10 @@ Text content is the selected output slice plus a full-output notice. If truncate
 If not truncated, the result appends `[Full output: <path>]`. Structured details:
 
 ```ts
-{ task: BgTaskSnapshot, path: string, bytesRead: number, truncated: boolean, tail: boolean }
+{ task: BgTaskSnapshot, path: string, bytesRead: number, totalBytes: number, truncated: boolean, tail: boolean }
 ```
 
-The `path` is the full output path relative to the task cwd, preserved for opening the complete file.
+`totalBytes` is the current on-disk output file size, so callers can observe the full output volume even when only a bounded slice is returned. The `path` is the full output path relative to the task cwd, preserved for opening the complete file.
 
 ## Errors
 
@@ -120,13 +120,13 @@ Reads `.pi/tasks/<session-id>-<pid>/<task-id>.output`; does not modify output or
 
 ## Safety boundaries
 
-Read-only, bounded, model-safe inspection. It is not a polling primitive. For the larger interactive tail buffer, use the [`/tasks`](../commands/task-manager.md) detail view.
+Read-only, bounded, model-safe inspection. It is not a polling primitive. Use the `/bg-logs` command for the interactive detail view.
 
 ## Related docs
 
-- [`/logs`](../commands/logs.md)
+- [`/bg-logs`](../commands/bg-logs.md)
 - [`bg_status`](bg_status.md)
-- [`bg_run`](bg_run.md)
+- [`bash`(覆盖版)](bash.md)
 - [Completion delivery](../concepts/completion-delivery.md)
 - [Background task runtime](../subsystems/background-task-runtime.md)
 

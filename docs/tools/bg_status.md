@@ -7,11 +7,12 @@ stability: stable
 covers_surfaces: [tool:bg_status]
 covers_sources: []
 ---
+
 # `bg_status`
 
 <!-- pi-docs:begin name="tool-contract-bg_status" generator="scripts/docs/generate.mjs" -->
 - Label: **Background Status**
-- Source: `src/extension.ts:1105`
+- Source: `src/extension.ts:817`
 - Availability: `always`
 - Available by default: **yes**
 - Description: Inspect one background task or list all running/recent background tasks. This is a point-in-time inspection tool, not a waiting primitive.
@@ -45,7 +46,6 @@ Inspect one background task or list all running/recent tasks.
 
 ## Schema
 
-
 Optional fields:
 
 - `taskId: string` — exact task id or unambiguous prefix. If omitted, all retained tasks are returned.
@@ -71,12 +71,12 @@ Returns current snapshots. Status values are exactly `running`, `completed`, `fa
 ```
 
 ```json
-{"taskId":"b1234"}
+{ "taskId": "b1234" }
 ```
 
 ## Output/result
 
-Text content uses the same snapshot formatting as [`/jobs`](../commands/jobs.md), including output path. Structured details are:
+Text content uses the same snapshot formatting as [`/bg-jobs`](../commands/bg-jobs.md), including output path. Structured details are:
 
 ```ts
 { tasks: BgTaskSnapshot[] }
@@ -102,9 +102,9 @@ Inspection only. Not a polling primitive, not a wait loop, and not a task-contro
 
 ## Related docs
 
-- [`/jobs`](../commands/jobs.md)
+- [`/bg-jobs`](../commands/bg-jobs.md)
 - [`bg_logs`](bg_logs.md)
-- [`bg_run`](bg_run.md)
+- [`bash`(覆盖版)](bash.md)
 - [Completion delivery](../concepts/completion-delivery.md)
 - [Background task runtime](../subsystems/background-task-runtime.md)
 

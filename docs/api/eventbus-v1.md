@@ -7,6 +7,7 @@ stability: evolving
 covers_surfaces: [eventbus:background-task-v1]
 covers_sources: [src/core/extension-api.ts]
 ---
+
 # EventBus API v1
 
 <!-- pi-docs:begin name="eventbus-contract" generator="scripts/docs/generate.mjs" -->
@@ -45,10 +46,10 @@ Bare `createAgentSession()` does not initialize this context, and an empty or mo
 
 ## Channels and schema ids
 
-| Purpose | Channel | `schema_version` |
-|---|---|---|
-| Requests | `pi-background-tasks:request:v1` | `pi-background-tasks.extension-request.v1` |
-| Responses | `pi-background-tasks:response:v1` | `pi-background-tasks.extension-response.v1` |
+| Purpose         | Channel                           | `schema_version`                            |
+| --------------- | --------------------------------- | ------------------------------------------- |
+| Requests        | `pi-background-tasks:request:v1`  | `pi-background-tasks.extension-request.v1`  |
+| Responses       | `pi-background-tasks:response:v1` | `pi-background-tasks.extension-response.v1` |
 | Terminal events | `pi-background-tasks:terminal:v1` | `pi-background-tasks.extension-terminal.v1` |
 
 ## Request frame
@@ -124,11 +125,17 @@ Terminal events are emitted on `pi-background-tasks:terminal:v1`:
 ```ts
 {
   schema_version: 'pi-background-tasks.extension-terminal.v1',
-  task: BgTaskSnapshot
+  task: BgTaskSnapshot,
+  status?: 'completed' | 'failed' | 'cancelled' | 'killed' | 'lost',
+  failedReason?: 'exit_error' | 'timed_out' | 'output_limit' | 'spawn_error' | 'disk_full',
+  initiator?: 'user' | 'model' | 'system',
+  originMeta?: { backgroundSource: 'bash' },
+  summaryTail?: string,      // bounded tail summary, ≤64 KiB, complete logs never resend
+  usage?: { durationMs?, modelUsage?, toolUseCount?, totalTokens? }
 }
 ```
 
-The terminal event carries no request id; consumers correlate by `task.id` returned from `run`/`kill`/`status`. The additive task snapshot can include `surviveReload` and `reloadSurvival` when a task was launched through `bg_run` or `/bg`; the request side remains unchanged. A fresh activation may emit that survivor's pending terminal on this same v1 channel.
+The terminal event carries no request id; consumers correlate by `task.id` returned from `run`/`kill`/`status`. All M5 frame fields are optional and backward compatible; the v1 frame shape (schema_version + task) is unchanged. `status` mirrors the task's terminal status (new terminal values `cancelled` and `lost` are unknown to older consumers, which must degrade them as failed/killed — the runtime does not enforce this on consumers); `failedReason` mirrors `task.failedReason`; `initiator` mirrors stop dispatch (user/model stops finalize `cancelled`, host shutdown `killed`); `originMeta` is fixed `{ backgroundSource: 'bash' }` for every background launch; `summaryTail` is a bounded (≤64 KiB) tail of the terminal output file, never the complete log — the frame's task already carries the output path; `usage` is the unified task-owned telemetry snapshot in the same shape as dock telemetry (`durationMs` from start/end times, `modelUsage` token projection, `toolUseCount` tool total, `totalTokens`), with missing telemetry reported as absent fields rather than fabricated zeros. The additive task snapshot can include `surviveReload` and `reloadSurvival` when a task opted in through a reload-capable launch (dock rerun of an already-opted task; covered `bash` does not expose the flag); the request side remains unchanged. A fresh activation may emit that survivor's pending terminal on this same v1 channel.
 
 ## Ordering and durability barrier
 
@@ -174,8 +181,8 @@ events.emit('pi-background-tasks:request:v1', {
     command: 'printf eventbus-ok',
     isAgent: false,
     notifyOnCompletion: true,
-    triggerOnCompletion: true
-  }
+    triggerOnCompletion: true,
+  },
 });
 ```
 

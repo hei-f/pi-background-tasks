@@ -1,10 +1,4 @@
-export const PI_BG_FEATURE_VALUES = Object.freeze([
-    'process',
-    'delegate',
-    'fusion',
-    'attested',
-    'attribution',
-]);
+export const PI_BG_FEATURE_VALUES = Object.freeze(['process']);
 export const PI_BG_DEFAULT_FEATURES = PI_BG_FEATURE_VALUES;
 export const PI_BG_DOCK_SHORTCUT_VALUES = Object.freeze([
     'shift+down',
@@ -21,39 +15,9 @@ function boundedConfigValue(value) {
 function invalidConfig(variable, reason, value) {
     throw new Error(`pi_bg_config_invalid: ${variable} ${reason}; received ${boundedConfigValue(value)}`);
 }
-function parseFeatures(rawValue) {
-    const raw = rawValue ?? PI_BG_DEFAULT_FEATURES.join(',');
-    const accepted = PI_BG_FEATURE_VALUES.join(',');
-    if (raw.length === 0) {
-        invalidConfig('PI_BG_FEATURES', `must not be empty; accepted tokens: ${accepted}`, raw);
-    }
-    if (/\s/u.test(raw)) {
-        invalidConfig('PI_BG_FEATURES', `must contain no whitespace; accepted tokens: ${accepted}`, raw);
-    }
-    const tokens = raw.split(',');
-    if (tokens.some((token) => token.length === 0)) {
-        invalidConfig('PI_BG_FEATURES', `contains a blank comma token; accepted tokens: ${accepted}`, raw);
-    }
-    const selected = new Set();
-    for (const token of tokens) {
-        if (!PI_BG_FEATURE_VALUES.includes(token)) {
-            invalidConfig('PI_BG_FEATURES', `contains unknown token ${boundedConfigValue(token)}; accepted tokens: ${accepted}; bg_result is derived from delegate or fusion`, raw);
-        }
-        const feature = token;
-        if (selected.has(feature)) {
-            invalidConfig('PI_BG_FEATURES', `contains duplicate token ${feature}`, raw);
-        }
-        selected.add(feature);
-    }
-    if (!selected.has('process')) {
-        invalidConfig('PI_BG_FEATURES', 'must include mandatory token process', raw);
-    }
+function parseFeatures() {
     return Object.freeze({
         process: true,
-        delegate: selected.has('delegate'),
-        fusion: selected.has('fusion'),
-        attested: selected.has('attested'),
-        attribution: selected.has('attribution'),
     });
 }
 function parseDockShortcut(rawValue) {
@@ -64,7 +28,7 @@ function parseDockShortcut(rawValue) {
     return raw;
 }
 export function parseBackgroundTasksConfig(env = process.env) {
-    const features = parseFeatures(env['PI_BG_FEATURES']);
+    const features = parseFeatures();
     const dockShortcut = parseDockShortcut(env['PI_BG_DOCK_SHORTCUT']);
     return Object.freeze({ features, dockShortcut });
 }
@@ -73,6 +37,6 @@ export function dockShortcutFooterHint(shortcut) {
         return 'Shift↓';
     if (shortcut === 'ctrl+alt+b')
         return 'CtrlAltB';
-    return '/tasks';
+    return '/bg-jobs';
 }
 //# sourceMappingURL=config.js.map
