@@ -23,7 +23,7 @@ Every registration-owning function, imported registrar, and supported activation
 - Public surfaces available by default: 12
 - Finite feature values: `process`
 - Finite dock shortcut values: `shift+down`, `ctrl+alt+b`, `off`
-- Governed production sources: 18
+- Governed production sources: 19
 - Tool contracts extracted: 4
 - Schema IDs extracted: 5
 - Environment variable references extracted: 18

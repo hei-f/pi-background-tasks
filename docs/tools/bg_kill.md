@@ -12,7 +12,7 @@ covers_sources: []
 
 <!-- pi-docs:begin name="tool-contract-bg_kill" generator="scripts/docs/generate.mjs" -->
 - Label: **Background Kill**
-- Source: `src/extension.ts:898`
+- Source: `src/extension.ts:925`
 - Availability: `always`
 - Available by default: **yes**
 - Description: Stop a running background task by ID. Fails loudly if the task is unknown or already finished.
@@ -79,7 +79,7 @@ A successful kill records stop initiator `model` and sets the task terminal stat
 Text result:
 
 ```text
-Killed background task <name> (<id>). Output: .pi/tasks/.../<id>.output
+Killed background task <name> (<id>). Output: <agent-dir>/tasks/.../<id>.output
 ```
 
 Structured details:
@@ -98,7 +98,7 @@ Structured details:
 
 ## Runtime artifacts
 
-Output and metadata remain under `.pi/tasks/...`. Termination diagnostics may be written into the output file and `error` metadata.
+Output and metadata remain under `<agent-dir>/tasks/...` (`~/.pi/agent/tasks/` by default). Termination diagnostics may be written into the output file and `error` metadata.
 
 ## Safety boundaries
 

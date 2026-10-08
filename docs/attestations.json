@@ -2,13 +2,13 @@
   "schema_version": "pi-background-tasks.docs-attestations.v1",
   "receipts": [
     {
-      "authored_body_sha256": "sha256:d9ced14aefea77298dad14bd20826dd050c393b6b931ce8e9a542b6d2a5ac286",
+      "authored_body_sha256": "sha256:7e688a86bbd58d6066550adda08f5b805fb7d00641bcb0642a81a5ca4d880598",
       "covers_sources": [
         "src/core/extension-api.ts"
       ],
       "doc_id": "api/eventbus-v1",
-      "notes": "REVIEW fixes: bounded seenRequestIds dedupe ledger (4096 cap with oldest eviction); boundedBackgroundTaskError converges to shared boundedErrorMessage",
-      "reviewer": "re-view-executor",
+      "notes": "S3 P5 运行时目录迁宿主私有 getAgentDir()/tasks:eventbus-v1 的 logs 全量输出路径描述同步为 <agent-dir>/tasks/...;(P4)对外路径绝对化",
+      "reviewer": "P1-P9修复实施agent(代码实测+单测+docs门禁复核)",
       "schema_version": "pi-background-tasks.docs-attestation.v1",
       "source_sha256": {
         "src/core/extension-api.ts": "sha256:8ed8679aa1b2bdd9712efa55adb0f5c392418fb6f66404591910b7ef2913616b"
@@ -16,9 +16,10 @@
       "verdict": "PASS"
     },
     {
-      "authored_body_sha256": "sha256:a23e21bfcec0c9464d9931597c7dbdd5330b54b20aad3968b8f36e68ce7de446",
+      "authored_body_sha256": "sha256:18ac797b23f5950119af219faecac3868d8b4a1d8dcacb61756cb7970854d5e2",
       "covers_sources": [
         "src/core/common.ts",
+        "src/core/host-settings.ts",
         "src/core/process-tree.ts",
         "src/core/registry.ts",
         "src/core/reload-shell-owner.ts",
@@ -27,15 +28,16 @@
         "src/core/windows-taskkill.ts"
       ],
       "doc_id": "subsystems/background-task-runtime",
-      "notes": "REVIEW fixes: reload survivor stop path gains ps descendant scan plus individual descendant SIGKILL; stop-timeout destroys output read ends; shared telemetry/output/migration helpers",
-      "reviewer": "re-view-executor",
+      "notes": "Q3 null退出码语义统一(exitCode===0判completed,外部信号杀死不再误判completed);R2删除零引用deriveTaskNameFromCommand;N4 formatSnapshotList exitCode严格判空;R3/R4 host-settings file://边界注释与parseJsonText复用;Q2 warn留痕注释如实化",
+      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
       "schema_version": "pi-background-tasks.docs-attestation.v1",
       "source_sha256": {
-        "src/core/common.ts": "sha256:3fc6846182d1fae408dd3d2bd2a054eb2e86a039aeebb9ca83b3b656b56907af",
+        "src/core/common.ts": "sha256:916e5f9ee87139943b8ba16153eeb608882bdc171f3d42ef78984fbca11b4fa2",
+        "src/core/host-settings.ts": "sha256:4588ad3f49b6dc7b4d1dc20cb9c14369d85426d8685ddec54e77bcf4ca8a10bc",
         "src/core/process-tree.ts": "sha256:c65b59f7c92593dd118f2161cb8ce4a99cf854538b3117a707b515a0bb389f7a",
-        "src/core/registry.ts": "sha256:4fa7ddc28998af40132e71507dc0314171ac55b44dbfbfb71479ebad50d976d9",
+        "src/core/registry.ts": "sha256:3c1ffcc28908fdef46c27f85d791741e21474caf1f82c760f0d2c6d86c780066",
         "src/core/reload-shell-owner.ts": "sha256:156695a6f60f508e90392c34d13ebb75466bfc5f559857f1fd7825f3b9a186b4",
-        "src/core/shell-policy.ts": "sha256:83ca301e8c39bd2efc26b24d169a1cf13dd331e1ff9ac8ab6f32971d920422dc",
+        "src/core/shell-policy.ts": "sha256:777c1a4662237bf4b839943556166f0c08e9f0197461ab0e4c0a80fdcb2741e9",
         "src/core/telemetry.ts": "sha256:a2f315e3e0cf54c4046d487dc0ccce85e4f359bf76bc841bd6415831741d213b",
         "src/core/windows-taskkill.ts": "sha256:d8e21e077720f408a5b181b200924363ad75fd7b3acbafeabb6a2662a9d1fad1"
       },
@@ -71,29 +73,29 @@
         "src/ui/background-tasks-manager.ts"
       ],
       "doc_id": "subsystems/host-ui-and-telemetry",
-      "notes": "REVIEW fixes: session_shutdown handler keeps running-task cleanup and handle release even when reload handoff throws; killKind first-stop latch; dock compose q/x letters never close",
-      "reviewer": "re-view-executor",
+      "notes": "N1 dock转后台与rerun经startTask helper统一前置hostCommandPrefix(换行拼接);N2 rerun仅显式name透传,无显式名任务沿完整command原样兜底",
+      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
       "schema_version": "pi-background-tasks.docs-attestation.v1",
       "source_sha256": {
         "extensions/background-tasks.ts": "sha256:468def605480f61ebf35a6520ed8499b99e24ec090b115add39cec4573fe501c",
         "src/core/config.ts": "sha256:f2668a161a6f293a405ed26493ac81580dd028cbcfa1a7e91c4588d35d5b7505",
         "src/core/lazy-module.ts": "sha256:cc58caaa48b734134574683f2eceba980885b9c98cefd689c87df5f42bccd82a",
-        "src/extension.ts": "sha256:6adf2f44781208f275b7b8dc909c0e2b1952be4726026ca5abcacb6281c50106",
-        "src/ui/background-tasks-manager.ts": "sha256:1d41b8ed4903a7a417c1db6873499011882b9a27b449934af2d02ceb42ec6017"
+        "src/extension.ts": "sha256:4c0547a33298f654b41431d73bbe66324f0935cc40dde0fae618d56650930b0a",
+        "src/ui/background-tasks-manager.ts": "sha256:a3321bcb5185af72151425d8fe8347d7e955cc9479bc41a9e0169c176ce98939"
       },
       "verdict": "PASS"
     },
     {
-      "authored_body_sha256": "sha256:a2ee21bded53008bd9a10a8eb531ee137095e7bafba226dbc33f49634a42d72b",
+      "authored_body_sha256": "sha256:4242018e608d1e2a6f8c679286e3efc731130180bd16b0bc4242fc097a488682",
       "covers_sources": [
         "src/bash-override.ts"
       ],
       "doc_id": "tools/bash",
-      "notes": "M4 final: covered bash tool page; foreground host reuse, background entrySource model, bg_run retired",
-      "reviewer": "m4-executor",
+      "notes": "Q1前台分流剔除task_name防泄漏宿主透传;R1文件头注释更新为S1宿主settings自读生效现行为;N1抽prependCommandPrefix助手统一后台与dock两入口前缀前置",
+      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
       "schema_version": "pi-background-tasks.docs-attestation.v1",
       "source_sha256": {
-        "src/bash-override.ts": "sha256:c9bb46df8c8cb0bf1888412f45f021c04f5c7bca0e425f5fb9140d8aecc106b2"
+        "src/bash-override.ts": "sha256:902a2b932bcf20ceffc5a5c387f3711c89eb5fb1bd4a8b153a48910efd616880"
       },
       "verdict": "PASS"
     }

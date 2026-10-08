@@ -13,7 +13,7 @@ covers_sources: []
 <!-- pi-docs:begin name="command-contract-bg-kill" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-kill` | `always` | yes | Stop a running background task: /bg-kill <id> | `src/extension.ts:747` |
+| `/bg-kill` | `always` | yes | Stop a running background task: /bg-kill <id> | `src/extension.ts:769` |
 <!-- pi-docs:end name="command-contract-bg-kill" -->
 
 Stop a running background task.
@@ -44,7 +44,7 @@ Only `running` tasks can be killed. A successful user kill is recorded with stop
 ## Output/result
 
 ```text
-Killed <task-name> (<task-id>). Output: .pi/tasks/.../<task-id>.output
+Killed <task-name> (<task-id>). Output: <agent-dir>/tasks/.../<task-id>.output
 ```
 
 ## Errors
@@ -59,7 +59,7 @@ Errors are shown as `Background kill error: ...`.
 
 ## Runtime artifacts
 
-The task's output file and metadata remain in `.pi/tasks/...`. Termination notices and errors may be appended to the output and metadata.
+The task's output file and metadata remain in `<agent-dir>/tasks/...` (`~/.pi/agent/tasks/` by default). Termination notices and errors may be appended to the output and metadata.
 
 ## Safety boundaries
 

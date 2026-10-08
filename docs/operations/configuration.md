@@ -43,6 +43,15 @@ Reload survival is a per-launch field, not a global environment setting:
 
 New launch entries no longer expose `surviveReload` — opt-in survival is inherited only by legacy records and dock reruns. Omitted/false `run_in_background` keeps default foreground behavior. Survival is supported only for ordinary shell tasks across a real same-process Pi reload with the exact session id and canonical cwd. Agent-launched and EventBus-v1 paths do not opt in. The live execution retains its launch-time shell policy, timeout deadline, output cap, and cumulative bytes even if environment/config changes before reload; a dock rerun is new work and uses current configuration.
 
+## Host settings self-read (S1 P2)
+
+On activation the extension reads the **user-level** `settings.json` at `getAgentDir()/settings.json` (default `~/.pi/agent/settings.json`) and consumes two host fields:
+
+- `shellPath`: normalized with the host's own `normalizePath` semantics (`~` expansion, Git-Bash drive-path conversion). It feeds the background POSIX shell chain below; the foreground path passes it through `createBashToolDefinition(cwd, { shellPath })`, exactly like the host runner.
+- `shellCommandPrefix`: prepended to both foreground and background commands with the host's `` `${prefix}\n${command}` `` splice.
+
+Any read failure (missing file, malformed JSON, missing/non-string field) or a `shellPath` that does not resolve (invalid path on POSIX; no Git Bash/no `bash.exe` on Windows) silently degrades to defaults — the extension still activates, the background chain falls back to `$SHELL`. **Only user-level settings are read; the host's project-level settings merge is not part of this package's read surface.**
+
 ## Shell selection
 
 ### POSIX
@@ -72,6 +81,22 @@ Windows defaults to `cmd.exe`/`ComSpec`. The generic `SHELL` variable is ignored
 
 Invalid Windows shell settings fail loudly instead of falling back. `bash` is invoked with `-c`, not `-lc`. `PI_BG_POSIX_SHELL` and `PI_BG_POSIX_SHELL_PATH` are ignored on Windows, even when present, so they cannot change existing cmd/Bash/ComSpec selection or structured argv behavior.
 
+### Host-sourced shell chain (background, POSIX)
+
+The background `inherit` branch resolves in this order (S1 P1):
+
+1. explicit `PI_BG_POSIX_SHELL=bash|sh` (`PI_BG_POSIX_SHELL_PATH` optional);
+2. user-level `settings.shellPath` (host `normalizePath` normalized);
+3. host foreground `getShellConfig()` result (`/bin/bash` → PATH bash → `sh` on POSIX);
+4. `$SHELL`;
+5. `/bin/sh`.
+
+`hostShellPath` (items 2–3) is injected at extension activation by the host-shell resolution and is intentionally consumed only by the POSIX `inherit` branch. **Win32 boundary:** the Windows branch never consumes `settings.shellPath`/host shell resolution — foreground honors it (host behavior), background does not; the platforms are intentionally asymmetric for the background chain. This environment is the tested macOS case.
+
+### Background timeout semantics
+
+With `run_in_background:true`, `timeout` is a hard-kill deadline in seconds: `0` or omitted means no deadline (never force-terminated by timeout); `> 0` sets the kill deadline. Foreground `timeout` semantics are unchanged (host built-in behavior).
+
 ## Output and log caps
 
 | Setting/surface                                 | Value/behavior                                                                                                                        |
@@ -79,7 +104,7 @@ Invalid Windows shell settings fail loudly instead of falling back. `bash` is in
 | `PI_BG_MAX_OUTPUT_BYTES`                        | Optional environment override for the hard task output cap. Default is 2 GiB. Reaching it terminates the task as `failed` (output_limit) instead of claiming success. |
 | `PI_BG_SOFT_OUTPUT_BYTES`                       | Optional environment override for the soft output warning threshold. Default is 256 MiB. Crossing it appends a warning notice and continues the task without killing it. |
 | `bg_logs.maxBytes` / `/bg-logs <id> [maxBytes]` | Bounded model-visible read. The package cap is the host-provided `DEFAULT_MAX_BYTES` (currently 50 KiB), never above 64 KiB.      |
-| Full output                                     | Written under `.pi/tasks/<session-id>-<pid>/<task-id>.output`.                                                                        |
+| Full output                                     | Written under `<getAgentDir()>/tasks/<session-id>-<pid>/<task-id>.output` (host-private agent dir, default `~/.pi/agent/tasks/`; project-local `.pi/tasks` is not migrated and can be removed manually).                                                      |
 
 Bounded logs are for context safety; they point to the full local output file when more bytes exist.
 

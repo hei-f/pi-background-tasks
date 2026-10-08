@@ -1,21 +1,22 @@
 {
   "attestation_state": [
     {
-      "authored_body_sha256": "sha256:d9ced14aefea77298dad14bd20826dd050c393b6b931ce8e9a542b6d2a5ac286",
+      "authored_body_sha256": "sha256:7e688a86bbd58d6066550adda08f5b805fb7d00641bcb0642a81a5ca4d880598",
       "covers_sources": [
         "src/core/extension-api.ts"
       ],
       "doc_id": "api/eventbus-v1",
-      "notes": "REVIEW fixes: bounded seenRequestIds dedupe ledger (4096 cap with oldest eviction); boundedBackgroundTaskError converges to shared boundedErrorMessage",
+      "notes": "S3 P5 运行时目录迁宿主私有 getAgentDir()/tasks:eventbus-v1 的 logs 全量输出路径描述同步为 <agent-dir>/tasks/...;(P4)对外路径绝对化",
       "rel": "docs/api/eventbus-v1.md",
       "required": true,
-      "reviewer": "re-view-executor",
+      "reviewer": "P1-P9修复实施agent(代码实测+单测+docs门禁复核)",
       "state": "pass"
     },
     {
-      "authored_body_sha256": "sha256:a23e21bfcec0c9464d9931597c7dbdd5330b54b20aad3968b8f36e68ce7de446",
+      "authored_body_sha256": "sha256:18ac797b23f5950119af219faecac3868d8b4a1d8dcacb61756cb7970854d5e2",
       "covers_sources": [
         "src/core/common.ts",
+        "src/core/host-settings.ts",
         "src/core/process-tree.ts",
         "src/core/registry.ts",
         "src/core/reload-shell-owner.ts",
@@ -24,10 +25,10 @@
         "src/core/windows-taskkill.ts"
       ],
       "doc_id": "subsystems/background-task-runtime",
-      "notes": "REVIEW fixes: reload survivor stop path gains ps descendant scan plus individual descendant SIGKILL; stop-timeout destroys output read ends; shared telemetry/output/migration helpers",
+      "notes": "Q3 null退出码语义统一(exitCode===0判completed,外部信号杀死不再误判completed);R2删除零引用deriveTaskNameFromCommand;N4 formatSnapshotList exitCode严格判空;R3/R4 host-settings file://边界注释与parseJsonText复用;Q2 warn留痕注释如实化",
       "rel": "docs/subsystems/background-task-runtime.md",
       "required": true,
-      "reviewer": "re-view-executor",
+      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
       "state": "pass"
     },
     {
@@ -55,22 +56,22 @@
         "src/ui/background-tasks-manager.ts"
       ],
       "doc_id": "subsystems/host-ui-and-telemetry",
-      "notes": "REVIEW fixes: session_shutdown handler keeps running-task cleanup and handle release even when reload handoff throws; killKind first-stop latch; dock compose q/x letters never close",
+      "notes": "N1 dock转后台与rerun经startTask helper统一前置hostCommandPrefix(换行拼接);N2 rerun仅显式name透传,无显式名任务沿完整command原样兜底",
       "rel": "docs/subsystems/host-ui-and-telemetry.md",
       "required": true,
-      "reviewer": "re-view-executor",
+      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
       "state": "pass"
     },
     {
-      "authored_body_sha256": "sha256:a2ee21bded53008bd9a10a8eb531ee137095e7bafba226dbc33f49634a42d72b",
+      "authored_body_sha256": "sha256:4242018e608d1e2a6f8c679286e3efc731130180bd16b0bc4242fc097a488682",
       "covers_sources": [
         "src/bash-override.ts"
       ],
       "doc_id": "tools/bash",
-      "notes": "M4 final: covered bash tool page; foreground host reuse, background entrySource model, bg_run retired",
+      "notes": "Q1前台分流剔除task_name防泄漏宿主透传;R1文件头注释更新为S1宿主settings自读生效现行为;N1抽prependCommandPrefix助手统一后台与dock两入口前缀前置",
       "rel": "docs/tools/bash.md",
       "required": true,
-      "reviewer": "m4-executor",
+      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
       "state": "pass"
     }
   ],
@@ -270,6 +271,7 @@
       "audience": "maintainer",
       "covers_sources": [
         "src/core/common.ts",
+        "src/core/host-settings.ts",
         "src/core/process-tree.ts",
         "src/core/registry.ts",
         "src/core/reload-shell-owner.ts",
@@ -506,7 +508,7 @@
         "id": "command:bg-clear",
         "kind": "command",
         "name": "bg-clear",
-        "source": "src/extension.ts:666"
+        "source": "src/extension.ts:688"
       },
       {
         "availability": "always",
@@ -515,7 +517,7 @@
         "id": "command:bg-jobs",
         "kind": "command",
         "name": "bg-jobs",
-        "source": "src/extension.ts:700"
+        "source": "src/extension.ts:722"
       },
       {
         "availability": "always",
@@ -524,7 +526,7 @@
         "id": "command:bg-kill",
         "kind": "command",
         "name": "bg-kill",
-        "source": "src/extension.ts:747"
+        "source": "src/extension.ts:769"
       },
       {
         "availability": "always",
@@ -533,7 +535,7 @@
         "id": "command:bg-logs",
         "kind": "command",
         "name": "bg-logs",
-        "source": "src/extension.ts:715"
+        "source": "src/extension.ts:737"
       }
     ],
     "eventbus": [
@@ -565,7 +567,7 @@
         "id": "renderer:background-task-notification",
         "kind": "renderer",
         "name": "background-task-notification",
-        "source": "src/extension.ts:524"
+        "source": "src/extension.ts:546"
       }
     ],
     "shortcut": [
@@ -576,7 +578,7 @@
         "id": "shortcut:ctrl+alt+b",
         "kind": "shortcut",
         "name": "ctrl+alt+b",
-        "source": "src/extension.ts:684"
+        "source": "src/extension.ts:706"
       },
       {
         "availability": "always",
@@ -585,7 +587,7 @@
         "id": "shortcut:ctrl+alt+c",
         "kind": "shortcut",
         "name": "ctrl+alt+c",
-        "source": "src/extension.ts:692"
+        "source": "src/extension.ts:714"
       },
       {
         "availability": "dock:shift+down",
@@ -594,7 +596,7 @@
         "id": "shortcut:shift+down",
         "kind": "shortcut",
         "name": "shift+down",
-        "source": "src/extension.ts:675"
+        "source": "src/extension.ts:697"
       }
     ],
     "tool": [
@@ -620,8 +622,13 @@
               "type": "string"
             },
             "run_in_background": {
-              "description": "Optional. Set true to detach this command into the durable background task stack: the call returns immediately with a task id and output path, and terminal state is delivered automatically as <background-task-notification> which also starts a follow-up agent turn. Omit or set false for normal foreground execution identical to the built-in bash tool.",
+              "description": "Optional. Set true to detach this command into the durable background task stack: the call returns immediately with a task id and output path, and terminal state is delivered automatically as <background-task-notification> which also starts a follow-up agent turn. In background mode timeout is a hard-kill deadline in seconds after which the task is force-terminated (0 or omitted = no deadline); foreground timeout semantics are unchanged. Omit or set false for normal foreground execution identical to the built-in bash tool.",
               "type": "boolean"
+            },
+            "task_name": {
+              "description": "Optional explicit task name shown in the dock, /bg-jobs, the startup receipt, and the completion notification (max 200 characters). Omitted names fall back to the full command.",
+              "maxLength": 200,
+              "type": "string"
             },
             "timeout": {
               "description": "Timeout in seconds (optional, no default timeout)",
@@ -633,7 +640,7 @@
           ],
           "type": "object"
         },
-        "source": "src/extension.ts:797"
+        "source": "src/extension.ts:824"
       },
       {
         "availability": "always",
@@ -659,7 +666,7 @@
           ],
           "type": "object"
         },
-        "source": "src/extension.ts:898"
+        "source": "src/extension.ts:925"
       },
       {
         "availability": "always",
@@ -695,7 +702,7 @@
           ],
           "type": "object"
         },
-        "source": "src/extension.ts:850"
+        "source": "src/extension.ts:877"
       },
       {
         "availability": "always",
@@ -721,7 +728,7 @@
           "required": [],
           "type": "object"
         },
-        "source": "src/extension.ts:817"
+        "source": "src/extension.ts:844"
       }
     ],
     "workflow": []
@@ -748,6 +755,9 @@
     ],
     "src/core/extension-api.ts": [
       "api/eventbus-v1"
+    ],
+    "src/core/host-settings.ts": [
+      "subsystems/background-task-runtime"
     ],
     "src/core/lazy-module.ts": [
       "subsystems/host-ui-and-telemetry"
