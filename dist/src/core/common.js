@@ -1,28 +1,28 @@
-import { accessSync, constants, existsSync, statSync } from 'node:fs';
-import { open } from 'node:fs/promises';
-import { basename, delimiter, extname, isAbsolute, join, resolve, win32, } from 'node:path';
-import { DEFAULT_MAX_BYTES, formatSize } from '@earendil-works/pi-coding-agent';
+import { accessSync, constants, existsSync, statSync, } from "node:fs";
+import { open } from "node:fs/promises";
+import { basename, delimiter, extname, isAbsolute, join, resolve, win32, } from "node:path";
+import { DEFAULT_MAX_BYTES, formatSize } from "@earendil-works/pi-coding-agent";
 export const TASK_STATUS_VALUES = [
-    'running',
-    'completed',
-    'failed',
-    'cancelled',
-    'killed',
-    'lost',
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+    "killed",
+    "lost",
 ];
 export const TERMINAL_TASK_STATUS_VALUES = [
-    'completed',
-    'failed',
-    'cancelled',
-    'killed',
-    'lost',
+    "completed",
+    "failed",
+    "cancelled",
+    "killed",
+    "lost",
 ];
 export class ReloadSurvivalError extends Error {
     code;
     constructor(code, message) {
         super(`${code}: ${message}`);
         this.code = code;
-        this.name = 'ReloadSurvivalError';
+        this.name = "ReloadSurvivalError";
     }
 }
 /**
@@ -33,39 +33,39 @@ export class ReloadSurvivalError extends Error {
 export function deriveCompletionDeliveryGuidance(notifyOnCompletion, triggerOnCompletion) {
     if (notifyOnCompletion && triggerOnCompletion) {
         return {
-            mode: 'notification-and-wake',
+            mode: "notification-and-wake",
             notificationEnabled: true,
             automaticWakeEnabled: true,
             text: [
-                'Terminal notification: enabled.',
-                'Automatic follow-up turn: enabled.',
-                'Next action: do not poll or sleep merely to wait; continue only independent useful work, otherwise end this turn and wait for <background-task-notification>.',
-            ].join('\n'),
+                "Terminal notification: enabled.",
+                "Automatic follow-up turn: enabled.",
+                "Next action: do not poll or sleep merely to wait; continue only independent useful work, otherwise end this turn and wait for <background-task-notification>.",
+            ].join("\n"),
         };
     }
     if (notifyOnCompletion) {
         return {
-            mode: 'notification-only',
+            mode: "notification-only",
             notificationEnabled: true,
             automaticWakeEnabled: false,
             text: [
-                'Terminal notification: enabled.',
-                'Automatic follow-up turn: disabled. The terminal notification will be delivered, but it will not start an agent turn.',
-                'Next action: automatic wake-up was explicitly disabled; use bg_status/bg_logs only when deliberate monitoring is required, without tight polling.',
-            ].join('\n'),
+                "Terminal notification: enabled.",
+                "Automatic follow-up turn: disabled. The terminal notification will be delivered, but it will not start an agent turn.",
+                "Next action: automatic wake-up was explicitly disabled; use bg_status/bg_logs only when deliberate monitoring is required, without tight polling.",
+            ].join("\n"),
         };
     }
     return {
-        mode: 'manual-monitoring',
+        mode: "manual-monitoring",
         notificationEnabled: false,
         automaticWakeEnabled: false,
         text: [
-            'Terminal notification: disabled.',
+            "Terminal notification: disabled.",
             triggerOnCompletion
-                ? 'Automatic follow-up turn: disabled because terminal notifications are disabled. triggerOnCompletion has no effect while notifyOnCompletion is false.'
-                : 'Automatic follow-up turn: disabled.',
-            'Next action: completion delivery was explicitly disabled; use bg_status/bg_logs only for deliberate manual monitoring, without tight polling.',
-        ].join('\n'),
+                ? "Automatic follow-up turn: disabled because terminal notifications are disabled. triggerOnCompletion has no effect while notifyOnCompletion is false."
+                : "Automatic follow-up turn: disabled.",
+            "Next action: completion delivery was explicitly disabled; use bg_status/bg_logs only for deliberate manual monitoring, without tight polling.",
+        ].join("\n"),
     };
 }
 /** 模型视图 64KiB 有界上限:模型可见日志读取默认与上限取宿主导入的
@@ -79,22 +79,22 @@ export const MAX_LOG_BYTES = Math.min(DEFAULT_MAX_BYTES, MODEL_VIEW_BYTES_CAP);
 export const COMMAND_PREVIEW_CHARS = 90;
 const parseJsonValue = globalThis.JSON.parse;
 export function isJsonObject(value) {
-    return typeof value === 'object' && value !== null;
+    return typeof value === "object" && value !== null;
 }
 /** 判别输出流错误是否由磁盘空间耗尽(ENOSPC)引发,用于终止分支选择。 */
 export function isEnospcError(error) {
-    return (typeof error === 'object' &&
+    return (typeof error === "object" &&
         error !== null &&
-        Reflect.get(error, 'code') === 'ENOSPC');
+        Reflect.get(error, "code") === "ENOSPC");
 }
 export function parseJsonText(text) {
     return parseJsonValue(text);
 }
 export function sanitizePathSegment(value) {
     const sanitized = value
-        .replace(/[^a-zA-Z0-9_.-]+/g, '-')
-        .replace(/^-+|-+$/g, '');
-    return sanitized || 'session';
+        .replace(/[^a-zA-Z0-9_.-]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    return sanitized || "session";
 }
 export function stripMatchingQuotes(value) {
     const trimmed = value.trim();
@@ -108,7 +108,7 @@ export function stripMatchingQuotes(value) {
     return trimmed;
 }
 export function compactWhitespace(value) {
-    return value.replace(/\s+/g, ' ').trim();
+    return value.replace(/\s+/g, " ").trim();
 }
 export function truncateChars(value, maxChars) {
     if (value.length <= maxChars)
@@ -116,36 +116,34 @@ export function truncateChars(value, maxChars) {
     return `${value.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 export function normalizeTaskName(value) {
-    if (typeof value !== 'string')
+    if (typeof value !== "string")
         return undefined;
     const normalized = compactWhitespace(stripMatchingQuotes(value));
     if (!normalized)
         return undefined;
     return truncateChars(normalized, 80);
 }
-export function deriveTaskNameFromCommand(command) {
-    const normalized = compactWhitespace(stripMatchingQuotes(command));
-    if (!normalized)
-        return 'Background task';
-    const packageScript = /^(npm|pnpm|yarn|bun)\s+(?:(run)\s+)?([^\s;&|]+)/.exec(normalized);
-    if (packageScript) {
-        const runner = packageScript[1] ?? 'npm';
-        const run = packageScript[2] !== undefined ? ' run' : '';
-        const script = packageScript[3] ?? '';
-        return truncateChars(`${runner}${run} ${script}`, 48);
-    }
-    const words = normalized.split(/\s+/).slice(0, 5).join(' ');
-    return truncateChars(words.length > 0 ? words : normalized, 48);
+/** 防病态超长命令的显示护栏:仅作用于 `taskDisplayName` 的完整命令兜底分支,
+ * 4KiB 内命令保持原样(不 compactWhitespace、不按词截断、不剥前缀);显式
+ * name/description 已由 normalizeTaskName 归一到 80 字符,不触达本护栏。 */
+export const TASK_DISPLAY_NAME_MAX_CHARS = 4 * 1024;
+/** 完整 `task.command` 原样兜底(ZCode 命名方案):空/纯空白命令视为无兜底,
+ * 超长命令仅在 4KiB 护栏内裁剪。 */
+function fullCommandDisplayName(command) {
+    if (command === undefined || command.length === 0)
+        return undefined;
+    if (command.trim().length === 0)
+        return undefined;
+    if (command.length <= TASK_DISPLAY_NAME_MAX_CHARS)
+        return command;
+    return truncateChars(command, TASK_DISPLAY_NAME_MAX_CHARS);
 }
 export function taskDisplayName(task) {
-    const commandName = task.command && task.command.length > 0
-        ? deriveTaskNameFromCommand(task.command)
-        : undefined;
     return (normalizeTaskName(task.name) ??
         normalizeTaskName(task.description) ??
-        commandName ??
+        fullCommandDisplayName(task.command) ??
         task.id ??
-        'Background task');
+        "Background task");
 }
 export function formatDuration(ms) {
     if (ms < 1000)
@@ -156,10 +154,10 @@ export function formatDuration(ms) {
     const minutes = Math.floor(seconds / 60);
     const remSeconds = seconds % 60;
     if (minutes < 60)
-        return `${String(minutes)}m${remSeconds > 0 ? `${String(remSeconds)}s` : ''}`;
+        return `${String(minutes)}m${remSeconds > 0 ? `${String(remSeconds)}s` : ""}`;
     const hours = Math.floor(minutes / 60);
     const remMinutes = minutes % 60;
-    return `${String(hours)}h${remMinutes > 0 ? `${String(remMinutes)}m` : ''}`;
+    return `${String(hours)}h${remMinutes > 0 ? `${String(remMinutes)}m` : ""}`;
 }
 export function formatCompactNumber(count) {
     const normalized = Math.max(0, Math.floor(count));
@@ -189,7 +187,7 @@ export function formatTokenUsageSummary(usage) {
 export function formatToolUsageSummary(usage) {
     if (!usage || (usage.total <= 0 && usage.failed <= 0))
         return undefined;
-    const failed = usage.failed > 0 ? ` failed=${String(usage.failed)}` : '';
+    const failed = usage.failed > 0 ? ` failed=${String(usage.failed)}` : "";
     return `tools=${String(usage.total)}${failed}`;
 }
 export function formatModelSummary(model) {
@@ -206,11 +204,11 @@ export function formatModelSummary(model) {
  * file instead of leaking raw telemetry JSON. Both the parser and the formatter
  * are pure so the visible transcript is fully unit-testable.
  */
-export const AGENT_ACTIVITY_TYPE = 'background-task-activity';
+export const AGENT_ACTIVITY_TYPE = "background-task-activity";
 const AGENT_ACTIVITY_DETAIL_MAX = 80;
 function readActivityString(record, key) {
     const value = record[key];
-    return typeof value === 'string' ? value : undefined;
+    return typeof value === "string" ? value : undefined;
 }
 /** Narrow a parsed `background-task-activity` control payload into a typed {@link AgentActivity}. */
 export function parseAgentActivity(payload) {
@@ -220,24 +218,24 @@ export function parseAgentActivity(payload) {
     if (record.type !== AGENT_ACTIVITY_TYPE)
         return undefined;
     const kind = record.kind;
-    if (kind === 'assistant_text' || kind === 'reasoning') {
-        const text = readActivityString(record, 'text');
+    if (kind === "assistant_text" || kind === "reasoning") {
+        const text = readActivityString(record, "text");
         if (text === undefined)
             return undefined;
         return { kind, text };
     }
-    if (kind === 'tool_start') {
-        const tool = readActivityString(record, 'tool');
+    if (kind === "tool_start") {
+        const tool = readActivityString(record, "tool");
         if (!tool)
             return undefined;
         return {
             kind,
             tool,
-            argsSummary: readActivityString(record, 'argsSummary') ?? '',
+            argsSummary: readActivityString(record, "argsSummary") ?? "",
         };
     }
-    if (kind === 'tool_end') {
-        const tool = readActivityString(record, 'tool');
+    if (kind === "tool_end") {
+        const tool = readActivityString(record, "tool");
         if (!tool)
             return undefined;
         const activity = {
@@ -245,7 +243,7 @@ export function parseAgentActivity(payload) {
             tool,
             isError: record.isError === true,
         };
-        const error = readActivityString(record, 'error');
+        const error = readActivityString(record, "error");
         if (error !== undefined && error.trim().length > 0)
             activity.error = error;
         return activity;
@@ -259,49 +257,49 @@ export function parseAgentActivity(payload) {
  * line already announced the call, and the next line implies completion.
  */
 export function formatAgentActivityLine(activity) {
-    if (activity.kind === 'assistant_text') {
-        const text = activity.text.replace(/\s+$/u, '');
+    if (activity.kind === "assistant_text") {
+        const text = activity.text.replace(/\s+$/u, "");
         return text.trim().length > 0 ? text : undefined;
     }
-    if (activity.kind === 'reasoning') {
-        const text = activity.text.replace(/\s+$/u, '');
+    if (activity.kind === "reasoning") {
+        const text = activity.text.replace(/\s+$/u, "");
         return text.trim().length > 0 ? `\u2026 ${text}` : undefined;
     }
-    if (activity.kind === 'tool_start') {
+    if (activity.kind === "tool_start") {
         const summary = compactWhitespace(activity.argsSummary);
         const suffix = summary.length > 0
             ? ` ${truncateChars(summary, AGENT_ACTIVITY_DETAIL_MAX)}`
-            : '';
+            : "";
         return `\u2192 ${activity.tool}${suffix}`;
     }
     if (!activity.isError)
         return undefined;
     const detail = activity.error
         ? `: ${truncateChars(compactWhitespace(activity.error), AGENT_ACTIVITY_DETAIL_MAX)}`
-        : '';
+        : "";
     return `\u2717 ${activity.tool} failed${detail}`;
 }
 export function shellQuote(value) {
     return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 export class ShellInvocationError extends Error {
-    code = 'pi_bg_shell_invalid';
+    code = "pi_bg_shell_invalid";
     constructor(message) {
         super(`pi_bg_shell_invalid: ${message}`);
-        this.name = 'ShellInvocationError';
+        this.name = "ShellInvocationError";
     }
 }
 const POSIX_FUNCTION_SHELLS = new Set([
-    'sh',
-    'dash',
-    'ash',
-    'ksh',
-    'ksh93',
-    'mksh',
-    'pdksh',
-    'zsh',
-    'yash',
-    'posh',
+    "sh",
+    "dash",
+    "ash",
+    "ksh",
+    "ksh93",
+    "mksh",
+    "pdksh",
+    "zsh",
+    "yash",
+    "posh",
 ]);
 function failShellInvocation(message) {
     throw new ShellInvocationError(message);
@@ -325,7 +323,7 @@ export function shellPolicySnapshot(policy) {
 }
 function isWindowsExecutablePath(path) {
     const extension = extname(path).toLowerCase();
-    return extension === '.exe' || extension === '.com';
+    return extension === ".exe" || extension === ".com";
 }
 function validateWindowsShellPath(path, label) {
     if (path.length === 0)
@@ -362,13 +360,13 @@ function inspectWindowsShellCandidate(path) {
     }
 }
 function windowsPathValue(env) {
-    return env['PATH'] ?? env['Path'] ?? env['path'] ?? '';
+    return env["PATH"] ?? env["Path"] ?? env["path"] ?? "";
 }
 function resolveWindowsBash(env) {
     const pathValue = windowsPathValue(env);
     const diagnostics = [];
-    for (const dir of pathValue.split(';').filter((entry) => entry.length > 0)) {
-        for (const name of ['bash.exe', 'bash.com']) {
+    for (const dir of pathValue.split(";").filter((entry) => entry.length > 0)) {
+        for (const name of ["bash.exe", "bash.com"]) {
             const candidate = join(dir, name);
             const result = inspectWindowsShellCandidate(candidate);
             if (result.found)
@@ -376,7 +374,7 @@ function resolveWindowsBash(env) {
             diagnostics.push(result.diagnostic);
         }
     }
-    const suffix = diagnostics.length > 0 ? `: ${diagnostics.join('; ')}` : '';
+    const suffix = diagnostics.length > 0 ? `: ${diagnostics.join("; ")}` : "";
     failShellInvocation(`PI_BG_SHELL=bash could not resolve bash.exe or bash.com on PATH${suffix}`);
 }
 function validatePosixShellPath(path, label) {
@@ -417,7 +415,7 @@ function resolvePosixExecutable(name, env, activationCwd) {
     const binCandidate = `/bin/${name}`;
     if (inspectPosixShellCandidate(binCandidate))
         return binCandidate;
-    const pathValue = env['PATH'] ?? '';
+    const pathValue = env["PATH"] ?? "";
     for (const entry of pathValue.split(delimiter)) {
         if (entry.length === 0)
             continue;
@@ -430,96 +428,109 @@ function resolvePosixExecutable(name, env, activationCwd) {
 }
 function inheritedPosixDialect(executable) {
     const name = basename(executable).toLowerCase();
-    if (name === 'bash')
-        return 'bash';
-    return POSIX_FUNCTION_SHELLS.has(name) ? 'posix' : 'user-non-posix';
+    if (name === "bash")
+        return "bash";
+    return POSIX_FUNCTION_SHELLS.has(name) ? "posix" : "user-non-posix";
 }
-/** Resolve one activation-stable policy. New POSIX variables are intentionally ignored on Windows. */
-export function resolveShellPolicy(platform = process.platform, env = process.env, activationCwd = process.cwd()) {
-    if (platform === 'win32') {
-        const requestedShell = env['PI_BG_SHELL'];
-        const requestedPath = env['PI_BG_SHELL_PATH'];
+/**
+ * Resolve one activation-stable policy. New POSIX variables are intentionally
+ * ignored on Windows.
+ *
+ * S1 P1 同源化的宿主注入面:`hostShellPath` 为宿主前台 shell 解析结果
+ * (settings.shellPath 或 getShellConfig 默认解析),POSIX `inherit` 分支中
+ * 有效(非空)时优先于 `env.SHELL`;纯函数保持可测,扩展入口把宿主解析结果
+ * 经 `initializeShellPolicy` 注入。Win32 分支不消费该参数(前后台 Win32 对称性
+ * 见 README 平台边界注记)。
+ */
+export function resolveShellPolicy(platform = process.platform, env = process.env, activationCwd = process.cwd(), hostShellPath) {
+    if (platform === "win32") {
+        const requestedShell = env["PI_BG_SHELL"];
+        const requestedPath = env["PI_BG_SHELL_PATH"];
         if (requestedShell === undefined) {
             if (requestedPath !== undefined)
-                failShellInvocation('PI_BG_SHELL_PATH requires PI_BG_SHELL');
-            const comSpec = env['ComSpec'];
+                failShellInvocation("PI_BG_SHELL_PATH requires PI_BG_SHELL");
+            const comSpec = env["ComSpec"];
             return freezeShellPolicy({
-                policy: 'cmd',
-                executable: comSpec && comSpec.length > 0 ? comSpec : 'cmd.exe',
-                argvPrefix: ['/d', '/s', '/c'],
-                dialect: 'cmd',
+                policy: "cmd",
+                executable: comSpec && comSpec.length > 0 ? comSpec : "cmd.exe",
+                argvPrefix: ["/d", "/s", "/c"],
+                dialect: "cmd",
                 supportsPosixFunctionWrapper: false,
                 windowsVerbatimArguments: true,
             });
         }
-        if (requestedShell !== 'cmd' && requestedShell !== 'bash') {
-            failShellInvocation('PI_BG_SHELL must be exactly cmd or bash');
+        if (requestedShell !== "cmd" && requestedShell !== "bash") {
+            failShellInvocation("PI_BG_SHELL must be exactly cmd or bash");
         }
         const explicitPath = requestedPath !== undefined
-            ? validateWindowsShellPath(requestedPath, 'PI_BG_SHELL_PATH')
+            ? validateWindowsShellPath(requestedPath, "PI_BG_SHELL_PATH")
             : undefined;
-        if (requestedShell === 'cmd') {
-            const comSpec = env['ComSpec'];
+        if (requestedShell === "cmd") {
+            const comSpec = env["ComSpec"];
             return freezeShellPolicy({
-                policy: 'cmd',
-                executable: explicitPath ?? (comSpec && comSpec.length > 0 ? comSpec : 'cmd.exe'),
-                argvPrefix: ['/d', '/s', '/c'],
-                dialect: 'cmd',
+                policy: "cmd",
+                executable: explicitPath ?? (comSpec && comSpec.length > 0 ? comSpec : "cmd.exe"),
+                argvPrefix: ["/d", "/s", "/c"],
+                dialect: "cmd",
                 supportsPosixFunctionWrapper: false,
                 windowsVerbatimArguments: true,
             });
         }
         return freezeShellPolicy({
-            policy: 'bash',
+            policy: "bash",
             executable: explicitPath ?? resolveWindowsBash(env),
-            argvPrefix: ['-c'],
-            dialect: 'bash',
+            argvPrefix: ["-c"],
+            dialect: "bash",
             supportsPosixFunctionWrapper: true,
             windowsVerbatimArguments: false,
         });
     }
-    const configuredPolicy = env['PI_BG_POSIX_SHELL'];
+    const configuredPolicy = env["PI_BG_POSIX_SHELL"];
     if (configuredPolicy !== undefined &&
-        configuredPolicy !== 'inherit' &&
-        configuredPolicy !== 'bash' &&
-        configuredPolicy !== 'sh') {
-        failShellInvocation('PI_BG_POSIX_SHELL must be exactly inherit, bash, or sh');
+        configuredPolicy !== "inherit" &&
+        configuredPolicy !== "bash" &&
+        configuredPolicy !== "sh") {
+        failShellInvocation("PI_BG_POSIX_SHELL must be exactly inherit, bash, or sh");
     }
-    const policy = configuredPolicy ?? 'inherit';
-    const configuredPath = env['PI_BG_POSIX_SHELL_PATH'];
-    if (policy === 'inherit') {
+    const policy = configuredPolicy ?? "inherit";
+    const configuredPath = env["PI_BG_POSIX_SHELL_PATH"];
+    if (policy === "inherit") {
         if (configuredPath !== undefined) {
-            failShellInvocation('PI_BG_POSIX_SHELL_PATH requires PI_BG_POSIX_SHELL=bash or PI_BG_POSIX_SHELL=sh');
+            failShellInvocation("PI_BG_POSIX_SHELL_PATH requires PI_BG_POSIX_SHELL=bash or PI_BG_POSIX_SHELL=sh");
         }
-        const inherited = env['SHELL'];
-        const executable = inherited && inherited.length > 0 ? inherited : '/bin/sh';
+        const inherited = env["SHELL"];
+        const executable = hostShellPath !== undefined && hostShellPath.length > 0
+            ? hostShellPath
+            : inherited && inherited.length > 0
+                ? inherited
+                : "/bin/sh";
         const dialect = inheritedPosixDialect(executable);
         return freezeShellPolicy({
             policy,
             executable,
-            argvPrefix: ['-c'],
+            argvPrefix: ["-c"],
             dialect,
-            supportsPosixFunctionWrapper: dialect === 'bash' || dialect === 'posix',
+            supportsPosixFunctionWrapper: dialect === "bash" || dialect === "posix",
             windowsVerbatimArguments: false,
         });
     }
     const executable = configuredPath !== undefined
-        ? validatePosixShellPath(configuredPath, 'PI_BG_POSIX_SHELL_PATH')
+        ? validatePosixShellPath(configuredPath, "PI_BG_POSIX_SHELL_PATH")
         : resolvePosixExecutable(policy, env, activationCwd);
     return freezeShellPolicy({
         policy,
         executable,
-        argvPrefix: ['-c'],
-        dialect: policy === 'bash' ? 'bash' : 'posix',
+        argvPrefix: ["-c"],
+        dialect: policy === "bash" ? "bash" : "posix",
         supportsPosixFunctionWrapper: true,
         windowsVerbatimArguments: false,
     });
 }
 export function shellInvocationForPolicy(command, policy) {
-    const dialect = policy.dialect === 'bash' ? 'posix' : policy.dialect;
+    const dialect = policy.dialect === "bash" ? "posix" : policy.dialect;
     return {
         shell: policy.executable,
-        args: policy.dialect === 'cmd'
+        args: policy.dialect === "cmd"
             ? [...policy.argvPrefix, `"${command}"`]
             : [...policy.argvPrefix, command],
         dialect,
@@ -531,30 +542,33 @@ export function shellInvocation(command, platform = process.platform, env = proc
 }
 /** Windows `.cmd`/`.bat` shim 扩展名集合(shell:false 不能直接 spawn shim)。 */
 const WINDOWS_COMMAND_SHIM_EXTENSIONS = new Set([
-    '.cmd',
-    '.bat',
+    ".cmd",
+    ".bat",
 ]);
 const DEFAULT_WINDOWS_PATHEXT = [
-    '.COM',
-    '.EXE',
-    '.BAT',
-    '.CMD',
+    ".COM",
+    ".EXE",
+    ".BAT",
+    ".CMD",
 ];
 /** Windows 环境变量键存在大小写变体(例如 PATH/Path/path);docs 门禁要求 env
  * 键为字面量,因此显式枚举候选键而不是运行期循环匹配。
  */
 function windowsPathextValue(env) {
-    const value = env['PATHEXT'] ?? env['PathExt'] ?? env['pathext'];
-    return typeof value === 'string' ? value : undefined;
+    const value = env["PATHEXT"] ?? env["PathExt"] ?? env["pathext"];
+    return typeof value === "string" ? value : undefined;
 }
 function windowsComSpecValue(env) {
-    const value = env['ComSpec'] ?? env['COMSPEC'] ?? env['comspec'];
-    return typeof value === 'string' ? value : undefined;
+    const value = env["ComSpec"] ?? env["COMSPEC"] ?? env["comspec"];
+    return typeof value === "string" ? value : undefined;
 }
 function windowsExtensionCandidates(file, pathExts) {
     if (extname(file))
         return [file];
-    return [file, ...pathExts.map((extension) => `${file}${extension.toLowerCase()}`)];
+    return [
+        file,
+        ...pathExts.map((extension) => `${file}${extension.toLowerCase()}`),
+    ];
 }
 function isWindowsCommandShim(path) {
     return WINDOWS_COMMAND_SHIM_EXTENSIONS.has(extname(path).toLowerCase());
@@ -563,13 +577,13 @@ function resolveWindowsDirectExecutionFile(file, options) {
     const raw = windowsPathextValue(options.env);
     const pathExts = raw && raw.length > 0
         ? raw
-            .split(';')
+            .split(";")
             .map((extension) => extension.trim())
             .filter((extension) => extension.length > 0)
         : [...DEFAULT_WINDOWS_PATHEXT];
     const fileCandidates = windowsExtensionCandidates(file, pathExts);
     let candidates;
-    if (file.includes('\\') || file.includes('/') || win32.isAbsolute(file)) {
+    if (file.includes("\\") || file.includes("/") || win32.isAbsolute(file)) {
         const basePath = !win32.isAbsolute(file) && options.cwd
             ? win32.resolve(options.cwd, file)
             : win32.normalize(file);
@@ -589,7 +603,7 @@ function quoteCmdArgument(value) {
         return '""';
     if (!/[\s"%&()<>^|]/.test(value))
         return value;
-    return `"${value.replace(/(["%&()<>^|])/g, '^$1')}"`;
+    return `"${value.replace(/(["%&()<>^|])/g, "^$1")}"`;
 }
 /**
  * 直执行解析(M4,逐行仿 ZCode `execution-command.ts:118-139`):argv[0] 直达
@@ -602,11 +616,11 @@ export function resolveDirectExecution(argv, options = {}) {
     const platform = options.platform ?? process.platform;
     const env = options.env ?? process.env;
     const file = argv[0];
-    if (typeof file !== 'string' || file.trim().length === 0) {
-        throw new Error('Direct execution argv[0] must be a non-empty executable name');
+    if (typeof file !== "string" || file.trim().length === 0) {
+        throw new Error("Direct execution argv[0] must be a non-empty executable name");
     }
     const args = argv.slice(1);
-    if (platform !== 'win32') {
+    if (platform !== "win32") {
         return { file, args, windowsVerbatimArguments: false };
     }
     const resolvedFile = resolveWindowsDirectExecutionFile(file, {
@@ -617,16 +631,16 @@ export function resolveDirectExecution(argv, options = {}) {
     if (!isWindowsCommandShim(resolvedFile)) {
         return { file: resolvedFile, args, windowsVerbatimArguments: false };
     }
-    const commandLine = [resolvedFile, ...args].map(quoteCmdArgument).join(' ');
+    const commandLine = [resolvedFile, ...args].map(quoteCmdArgument).join(" ");
     const comSpec = windowsComSpecValue(env);
     return {
-        file: comSpec && comSpec.length > 0 ? comSpec : 'cmd.exe',
-        args: ['/d', '/s', '/c', commandLine],
+        file: comSpec && comSpec.length > 0 ? comSpec : "cmd.exe",
+        args: ["/d", "/s", "/c", commandLine],
         windowsVerbatimArguments: true,
     };
 }
 export function normalizeMaxBytes(value, fallback = DEFAULT_LOG_BYTES) {
-    const raw = typeof value === 'number' && Number.isFinite(value)
+    const raw = typeof value === "number" && Number.isFinite(value)
         ? Math.floor(value)
         : fallback;
     return Math.max(1, Math.min(MAX_LOG_BYTES, raw));
@@ -648,7 +662,7 @@ export function appendErrorText(existing, next) {
  * 的 boundedBackgroundTaskError 与 reload 的 boundedError、registry 的
  * terminalPublicationError 三处收敛的统一实现)。 */
 export function boundedErrorMessage(error, maxChars) {
-    const text = errorMessage(error).replace(/\s+/gu, ' ').trim();
+    const text = errorMessage(error).replace(/\s+/gu, " ").trim();
     if (text.length <= maxChars)
         return text;
     return `${text.slice(0, maxChars - 1)}…`;
@@ -661,46 +675,49 @@ export function boundedErrorMessage(error, maxChars) {
  * 行为与两处既有实现逐分支等价;failedReason 副作用与既有实现一致。
  */
 export function deriveTerminalStatus(task, killKind, exitCode, signal, maxOutputBytes) {
-    if (killKind === 'user')
-        return { status: 'cancelled' };
-    if (killKind === 'shutdown')
-        return { status: 'killed' };
-    if (killKind === 'timeout') {
-        task.failedReason = 'timed_out';
+    if (killKind === "user")
+        return { status: "cancelled" };
+    if (killKind === "shutdown")
+        return { status: "killed" };
+    if (killKind === "timeout") {
+        task.failedReason = "timed_out";
         return {
-            status: 'failed',
+            status: "failed",
             error: task.error ?? `Timed out after ${String(task.timeoutSeconds)}s`,
         };
     }
-    if (killKind === 'output_cap') {
-        task.failedReason = 'output_limit';
+    if (killKind === "output_cap") {
+        task.failedReason = "output_limit";
         return {
-            status: 'failed',
+            status: "failed",
             error: task.error ?? `Output exceeded cap of ${formatSize(maxOutputBytes)}`,
         };
     }
-    if (killKind === 'disk_full') {
+    if (killKind === "disk_full") {
         // 磁盘满终止:已写输出文件保留,便于审计
-        task.failedReason = 'disk_full';
+        task.failedReason = "disk_full";
         return {
-            status: 'failed',
+            status: "failed",
             error: task.error ??
                 `Output file write failed because the disk is full (ENOSPC); partial output is retained at ${task.outputPath}`,
         };
     }
-    if (killKind === 'handoff_expired') {
+    if (killKind === "handoff_expired") {
         return {
-            status: 'failed',
+            status: "failed",
             error: task.error ??
-                'pi_bg_reload_handoff_expired: reload shell execution was not claimed before its handoff deadline',
+                "pi_bg_reload_handoff_expired: reload shell execution was not claimed before its handoff deadline",
         };
     }
-    if ((exitCode ?? 0) === 0)
-        return { status: 'completed' };
-    task.failedReason = 'exit_error';
+    // REVIEW Q3:仅字面 exitCode === 0 判 completed。被外部信号杀死(close 的
+    // exitCode 为 null、signal 有值、无 killKind)不再是「completed」误判——null
+    // 落入下方失败分支,error 含 signal 信息(`Exited with code null (SIGKILL)`)。
+    if (exitCode === 0)
+        return { status: "completed" };
+    task.failedReason = "exit_error";
     return {
-        status: 'failed',
-        error: `Exited with code ${exitCode === null ? 'null' : String(exitCode)}${signal ? ` (${signal})` : ''}`,
+        status: "failed",
+        error: `Exited with code ${exitCode === null ? "null" : String(exitCode)}${signal ? ` (${signal})` : ""}`,
     };
 }
 /**
@@ -738,7 +755,7 @@ export function writeTaskOutputChunk(task, buffer, options) {
     task.error = `Output exceeded cap of ${formatSize(options.hardBytes)}; terminating task`;
     const notice = `\n\n[background task error: ${task.error}]\n`;
     task.stream.write(notice);
-    task.bytesWritten += Buffer.byteLength(notice, 'utf8');
+    task.bytesWritten += Buffer.byteLength(notice, "utf8");
     return true;
 }
 export function snapshot(task) {
@@ -777,20 +794,22 @@ export function snapshot(task) {
 }
 export function formatSnapshotList(tasks, now = Date.now()) {
     if (tasks.length === 0)
-        return 'No background tasks in this Pi extension runtime.';
+        return "No background tasks in this Pi extension runtime.";
     return tasks
         .map((task) => {
-        const statusIcon = task.status === 'running'
-            ? '▶'
-            : task.status === 'completed'
-                ? '✓'
-                : task.status === 'killed' || task.status === 'cancelled'
-                    ? '■'
-                    : '✗';
+        const statusIcon = task.status === "running"
+            ? "▶"
+            : task.status === "completed"
+                ? "✓"
+                : task.status === "killed" || task.status === "cancelled"
+                    ? "■"
+                    : "✗";
         const age = formatDuration((task.endTime ?? now) - task.startTime);
-        const code = task.exitCode !== undefined ? ` exit=${String(task.exitCode)}` : '';
-        const pid = task.pid !== undefined ? ` pid=${String(task.pid)}` : '';
-        const error = task.error ? ` error=${truncateChars(task.error, 80)}` : '';
+        const code = task.exitCode === undefined || task.exitCode === null
+            ? ""
+            : ` exit=${String(task.exitCode)}`;
+        const pid = task.pid !== undefined ? ` pid=${String(task.pid)}` : "";
+        const error = task.error ? ` error=${truncateChars(task.error, 80)}` : "";
         const telemetry = [
             formatContextUsageSummary(task.contextUsage),
             formatModelSummary(task.model),
@@ -798,25 +817,25 @@ export function formatSnapshotList(tasks, now = Date.now()) {
             formatToolUsageSummary(task.toolUsage),
         ]
             .filter(Boolean)
-            .join(' ');
-        const telemetryText = telemetry ? ` ${telemetry}` : '';
+            .join(" ");
+        const telemetryText = telemetry ? ` ${telemetry}` : "";
         return `${statusIcon} ${task.id} ${task.status} ${age}${code}${pid}${telemetryText} — ${truncateChars(taskDisplayName(task), COMMAND_PREVIEW_CHARS)}${error}\n    output: ${task.outputPath}`;
     })
-        .join('\n');
+        .join("\n");
 }
 export async function boundedRead(filePath, maxBytes, tail) {
     const stats = statSync(filePath);
     const totalBytes = stats.size;
     const bytesToRead = Math.min(totalBytes, maxBytes);
     if (bytesToRead === 0)
-        return { content: '', truncated: false, bytesRead: 0, totalBytes };
-    const file = await open(filePath, 'r');
+        return { content: "", truncated: false, bytesRead: 0, totalBytes };
+    const file = await open(filePath, "r");
     try {
         const buffer = Buffer.alloc(bytesToRead);
         const position = tail ? Math.max(0, totalBytes - bytesToRead) : 0;
         const { bytesRead } = await file.read(buffer, 0, bytesToRead, position);
         return {
-            content: buffer.subarray(0, bytesRead).toString('utf8'),
+            content: buffer.subarray(0, bytesRead).toString("utf8"),
             truncated: totalBytes > bytesRead,
             bytesRead,
             totalBytes,
@@ -828,8 +847,8 @@ export async function boundedRead(filePath, maxBytes, tail) {
 }
 export function escapeXml(value) {
     return value
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
 }
 //# sourceMappingURL=common.js.map

@@ -1,16 +1,17 @@
-import { randomBytes } from 'node:crypto';
-import { realpathSync } from 'node:fs';
-import { formatSize } from '@earendil-works/pi-coding-agent';
-import { Text } from '@earendil-works/pi-tui';
-import { Type } from 'typebox';
-import { DEFAULT_LOG_BYTES, MAX_LOG_BYTES, formatSnapshotList, normalizeMaxBytes, taskDisplayName, truncateChars, ReloadSurvivalError, } from './core/common.js';
-import { BashOverrideParams, bashOverrideRenderCall, bashOverrideRenderResult, createBashOverrideDeps, createBashOverrideExecute, } from './bash-override.js';
-import { BackgroundTaskRegistry, } from './core/registry.js';
-import { getProcessReloadShellOwnerV1, makeReloadShellIdentity, } from './core/reload-shell-owner.js';
-import { createShellPolicyGuidanceHandler, initializeShellPolicy, } from './core/shell-policy.js';
-import { installBackgroundTaskExtensionApi, } from './core/extension-api.js';
-import { dockShortcutFooterHint, parseBackgroundTasksConfig, } from './core/config.js';
-import { LazyModule, SynchronousActivationCloseFence, } from './core/lazy-module.js';
+import { randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { formatSize } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { DEFAULT_LOG_BYTES, MAX_LOG_BYTES, formatSnapshotList, normalizeMaxBytes, taskDisplayName, truncateChars, ReloadSurvivalError, } from "./core/common.js";
+import { BashOverrideParams, bashOverrideRenderCall, bashOverrideRenderResult, createBashOverrideDeps, createBashOverrideExecute, prependCommandPrefix, } from "./bash-override.js";
+import { BackgroundTaskRegistry, } from "./core/registry.js";
+import { getProcessReloadShellOwnerV1, makeReloadShellIdentity, } from "./core/reload-shell-owner.js";
+import { createShellPolicyGuidanceHandler, initializeShellPolicy, } from "./core/shell-policy.js";
+import { readHostShellSettings, resolveHostShellPath, } from "./core/host-settings.js";
+import { installBackgroundTaskExtensionApi, } from "./core/extension-api.js";
+import { dockShortcutFooterHint, parseBackgroundTasksConfig, } from "./core/config.js";
+import { LazyModule, SynchronousActivationCloseFence, } from "./core/lazy-module.js";
 /**
  * Project-local Pi background task manager.
  *
@@ -25,46 +26,53 @@ import { LazyModule, SynchronousActivationCloseFence, } from './core/lazy-module
  * - No PID/file adoption, process-restart survival, or crash recovery.
  */
 const STATUS_INTERVAL_MS = 1000;
-const LIGHT_BLUE_BG = '\x1b[48;2;183;223;255m';
-const LIGHT_BLUE_FG = '\x1b[38;2;11;70;110m';
-const ANSI_RESET = '\x1b[0m';
+const LIGHT_BLUE_BG = "\x1b[48;2;183;223;255m";
+const LIGHT_BLUE_FG = "\x1b[38;2;11;70;110m";
+const ANSI_RESET = "\x1b[0m";
 function lightBlue(value) {
     return `${LIGHT_BLUE_BG}${LIGHT_BLUE_FG}${value}${ANSI_RESET}`;
 }
 function textContent(text) {
-    return [{ type: 'text', text }];
+    return [{ type: "text", text }];
 }
 const BgStatusParams = Type.Object({
     taskId: Type.Optional(Type.String({
-        description: 'Optional task ID or unambiguous prefix. If omitted, all running/recent tasks are returned.',
+        description: "Optional task ID or unambiguous prefix. If omitted, all running/recent tasks are returned.",
     })),
 });
 const BgLogsParams = Type.Object({
-    taskId: Type.String({ description: 'Task ID or unambiguous prefix' }),
+    taskId: Type.String({ description: "Task ID or unambiguous prefix" }),
     maxBytes: Type.Optional(Type.Number({
         description: `Maximum bytes to return, capped at ${formatSize(MAX_LOG_BYTES)}. Default: ${formatSize(DEFAULT_LOG_BYTES)}.`,
     })),
     tail: Type.Optional(Type.Boolean({
-        description: 'Read the tail of the log when true, head when false. Default: true.',
+        description: "Read the tail of the log when true, head when false. Default: true.",
     })),
 });
 const BgKillParams = Type.Object({
-    taskId: Type.String({ description: 'Task ID or unambiguous prefix to stop' }),
+    taskId: Type.String({ description: "Task ID or unambiguous prefix to stop" }),
 });
 function renderPlainResult(result, options, theme) {
     void options;
     void theme;
     const text = result.content
-        ?.map((part) => (part.type === 'text' ? (part.text ?? '') : ''))
-        .join('\n') ?? '';
+        ?.map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+        .join("\n") ?? "";
     return new Text(text, 0, 0);
 }
 export default async function backgroundTasksExtension(pi) {
     const config = parseBackgroundTasksConfig();
     const dockEntryHint = dockShortcutFooterHint(config.dockShortcut);
-    const shellPolicy = initializeShellPolicy();
+    // S1 P1+P2:宿主 settings 自读生效 + 前后台 shell 同源化。整条解析链可能 throw
+    // (customShellPath 不存在;Win32 无 Git Bash/无 bash.exe 时 getShellConfig(undefined)
+    // 同样 throw)→ resolveHostShellPath 内 try/catch 静默降级 → hostShellPath 置
+    // undefined 走 env.SHELL 兜底,插件照常激活(不复现宿主崩溃)。仅读用户级
+    // settings(项目级合并不在读取面)。
+    const hostShellSettings = await readHostShellSettings();
+    const hostShellPath = resolveHostShellPath(hostShellSettings);
+    const shellPolicy = initializeShellPolicy({ hostShellPath });
     const reloadShellOwner = getProcessReloadShellOwnerV1();
-    pi.on('before_agent_start', createShellPolicyGuidanceHandler(shellPolicy));
+    pi.on("before_agent_start", createShellPolicyGuidanceHandler(shellPolicy));
     const seenTaskIds = new Set();
     let currentCtx;
     let currentRegistryCtx;
@@ -76,9 +84,9 @@ export default async function backgroundTasksExtension(pi) {
     let disposed = false;
     let shutdownCleanupStarted = false;
     let reloadHandoffFailed = false;
-    let shutdownReason = 'shutdown';
+    let shutdownReason = "shutdown";
     const activationCloseFence = new SynchronousActivationCloseFence();
-    const taskManagerLoader = new LazyModule('background-task-manager', () => import('./ui/background-tasks-manager.js'));
+    const taskManagerLoader = new LazyModule("background-task-manager", () => import("./ui/background-tasks-manager.js"));
     const registryContext = (ctx) => ({
         cwd: ctx.cwd,
         sessionId: ctx.sessionManager.getSessionId(),
@@ -114,13 +122,13 @@ export default async function backgroundTasksExtension(pi) {
                 pendingActivationClaim = undefined;
                 registry.abortReloadActivation(claim);
                 try {
-                    reloadShellOwner.abortActivation(claim, new ReloadSurvivalError('pi_bg_reload_owner_stale_claim', 'activation shut down while its reload claim was staging'));
+                    reloadShellOwner.abortActivation(claim, new ReloadSurvivalError("pi_bg_reload_owner_stale_claim", "activation shut down while its reload claim was staging"));
                 }
                 catch (error) {
                     handoffError = error;
                 }
             }
-            else if (reason === 'reload' && activationLease !== undefined) {
+            else if (reason === "reload" && activationLease !== undefined) {
                 const lease = activationLease;
                 try {
                     registry.prepareReloadHandoff(lease);
@@ -154,30 +162,30 @@ export default async function backgroundTasksExtension(pi) {
         beginSessionShutdown(shutdownReason);
     });
     activationCloseFence.add(() => {
-        taskManagerLoader.close('session shutdown');
+        taskManagerLoader.close("session shutdown");
     });
-    pi.on('session_shutdown', (event) => {
+    pi.on("session_shutdown", (event) => {
         shutdownReason = event.reason;
         activationCloseFence.close();
     });
     // This is the first session_start callback. Claim synchronously before the
     // first await, stage/import durably, then expose the fresh host adapter.
-    pi.on('session_start', async (event, ctx) => {
+    pi.on("session_start", async (event, ctx) => {
         if (disposed)
             return;
         const nextRegistryCtx = registryContext(ctx);
-        const identity = makeReloadShellIdentity(nextRegistryCtx.sessionId ?? '', realpathSync(ctx.cwd));
+        const identity = makeReloadShellIdentity(nextRegistryCtx.sessionId ?? "", realpathSync(ctx.cwd));
         if (activationLease !== undefined && registry.hasCurrentReloadLease()) {
             if (activationIdentity?.hostPid !== identity.hostPid ||
                 activationIdentity.sessionId !== identity.sessionId ||
                 activationIdentity.cwdRealpath !== identity.cwdRealpath) {
-                throw new ReloadSurvivalError('pi_bg_reload_owner_activation_conflict', 'a repeated session_start changed the bound reload owner identity without shutdown');
+                throw new ReloadSurvivalError("pi_bg_reload_owner_activation_conflict", "a repeated session_start changed the bound reload owner identity without shutdown");
             }
             currentCtx = ctx;
             currentRegistryCtx = nextRegistryCtx;
             return;
         }
-        const activationNonce = randomBytes(16).toString('hex');
+        const activationNonce = randomBytes(16).toString("hex");
         const claim = reloadShellOwner.beginActivation(identity, event.reason, activationNonce);
         pendingActivationClaim = claim;
         // M2 branchGeneration fence:以本激活的 reload 代次推进注册表代次;
@@ -194,7 +202,7 @@ export default async function backgroundTasksExtension(pi) {
             if (disposed) {
                 registry.abortReloadActivation(claim);
                 pendingActivationClaim = undefined;
-                reloadShellOwner.abortActivation(claim, new ReloadSurvivalError('pi_bg_reload_owner_stale_claim', 'activation was disposed before reload claim commit'));
+                reloadShellOwner.abortActivation(claim, new ReloadSurvivalError("pi_bg_reload_owner_stale_claim", "activation was disposed before reload claim commit"));
                 return;
             }
             const lease = reloadShellOwner.commitActivation(claim, adapter);
@@ -212,10 +220,10 @@ export default async function backgroundTasksExtension(pi) {
                 reloadShellOwner.abortActivation(claim, error);
             }
             catch (abortError) {
-                if (typeof abortError !== 'object' ||
+                if (typeof abortError !== "object" ||
                     abortError === null ||
-                    Reflect.get(abortError, 'code') !== 'pi_bg_reload_owner_stale_claim') {
-                    throw new AggregateError([error, abortError], 'Reload activation claim and abort failed');
+                    Reflect.get(abortError, "code") !== "pi_bg_reload_owner_stale_claim") {
+                    throw new AggregateError([error, abortError], "Reload activation claim and abort failed");
                 }
             }
             throw error;
@@ -224,7 +232,7 @@ export default async function backgroundTasksExtension(pi) {
     function unseenFinishedTasks() {
         return registry
             .allTasks()
-            .filter((task) => task.status !== 'running' && !seenTaskIds.has(task.id));
+            .filter((task) => task.status !== "running" && !seenTaskIds.has(task.id));
     }
     function clearFinishedNotices(ctx = currentCtx) {
         const unseen = unseenFinishedTasks();
@@ -239,8 +247,8 @@ export default async function backgroundTasksExtension(pi) {
         if (!ctx.hasUI)
             return;
         ctx.ui.notify(cleared > 0
-            ? `Cleared ${String(cleared)} finished background task notice${cleared === 1 ? '' : 's'}.`
-            : 'No finished background task notices to clear.', cleared > 0 ? 'info' : 'warning');
+            ? `Cleared ${String(cleared)} finished background task notice${cleared === 1 ? "" : "s"}.`
+            : "No finished background task notices to clear.", cleared > 0 ? "info" : "warning");
     }
     function updateUi(ctx = currentCtx) {
         if (registry.isShuttingDown() || !ctx)
@@ -249,15 +257,15 @@ export default async function backgroundTasksExtension(pi) {
             if (!ctx.hasUI)
                 return;
             const allTasks = registry.allTasks();
-            const running = allTasks.filter((task) => task.status === 'running');
-            const unseenFailed = allTasks.filter((task) => task.status === 'failed' && !seenTaskIds.has(task.id));
-            const unseenStopped = allTasks.filter((task) => (task.status === 'killed' || task.status === 'cancelled') &&
+            const running = allTasks.filter((task) => task.status === "running");
+            const unseenFailed = allTasks.filter((task) => task.status === "failed" && !seenTaskIds.has(task.id));
+            const unseenStopped = allTasks.filter((task) => (task.status === "killed" || task.status === "cancelled") &&
                 !seenTaskIds.has(task.id));
-            const unseenDone = allTasks.filter((task) => task.status === 'completed' && !seenTaskIds.has(task.id));
+            const unseenDone = allTasks.filter((task) => task.status === "completed" && !seenTaskIds.has(task.id));
             const unseenFinishedCount = unseenFailed.length + unseenStopped.length + unseenDone.length;
-            ctx.ui.setWidget('background-tasks', undefined);
+            ctx.ui.setWidget("background-tasks", undefined);
             if (running.length === 0 && unseenFinishedCount === 0) {
-                ctx.ui.setStatus('background-tasks', undefined);
+                ctx.ui.setStatus("background-tasks", undefined);
                 return;
             }
             const parts = [];
@@ -270,11 +278,11 @@ export default async function backgroundTasksExtension(pi) {
             if (unseenDone.length > 0)
                 parts.push(`${String(unseenDone.length)} done`);
             const entryHint = dockOpen
-                ? 'focused'
-                : `${dockEntryHint}${unseenFinishedCount > 0 ? ' · /bg-clear' : ''}`;
+                ? "focused"
+                : `${dockEntryHint}${unseenFinishedCount > 0 ? " · /bg-clear" : ""}`;
             const segments = [...parts, entryHint];
-            const label = ` bg ${segments.join(' · ')} `;
-            ctx.ui.setStatus('background-tasks', lightBlue(label));
+            const label = ` bg ${segments.join(" · ")} `;
+            ctx.ui.setStatus("background-tasks", lightBlue(label));
         }
         catch (error) {
             console.error(`[background-tasks] UI update failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -285,12 +293,16 @@ export default async function backgroundTasksExtension(pi) {
         currentCtx = ctx;
         const nextRegistryCtx = registryContext(ctx);
         currentRegistryCtx = nextRegistryCtx;
-        return registry.startTask(nextRegistryCtx, command, options);
+        // REVIEW N1:与覆盖版 bash 后台路径同源(prependCommandPrefix 的 `<prefix>\n
+        // <command>` 换行拼接,宿主前台 bash.ts:251 对齐)——dock「转后台」与 rerun
+        // 两入口统一前置宿主 shellCommandPrefix;无前缀时原样提交。
+        const prefixedCommand = prependCommandPrefix(hostShellSettings.commandPrefix, command);
+        return registry.startTask(nextRegistryCtx, prefixedCommand, options);
     }
     async function openTaskManager(ctx, initialTaskId) {
         currentCtx = ctx;
         if (!ctx.hasUI) {
-            ctx.ui.notify('Background task manager requires an interactive Pi UI. Use /bg-jobs, /bg-logs, or the bg_status/bg_logs tools in non-interactive mode.', 'error');
+            ctx.ui.notify("Background task manager requires an interactive Pi UI. Use /bg-jobs, /bg-logs, or the bg_status/bg_logs tools in non-interactive mode.", "error");
             return;
         }
         const { BackgroundTasksManager } = await taskManagerLoader.run((runtime) => runtime);
@@ -302,22 +314,26 @@ export default async function backgroundTasksExtension(pi) {
                     getTasks: () => registry.allTasks(),
                     stopTask: async (task) => {
                         // dock k 快捷键 → initiator=user
-                        await registry.stopTask(registry.resolveTask(task.id), 'user', undefined, 'user');
+                        await registry.stopTask(registry.resolveTask(task.id), "user", undefined, "user");
                         updateUi(ctx);
                     },
                     stopAllRunning: async () => {
-                        const result = await registry.stopAllRunning('user', undefined, 'user');
+                        const result = await registry.stopAllRunning("user", undefined, "user");
                         updateUi(ctx);
                         return result;
                     },
                     rerunTask: async (task) => {
                         const rerunOptions = {
-                            name: taskDisplayName(task),
                             isAgent: task.isAgent,
                             surviveReload: task.surviveReload,
                             notifyOnCompletion: true,
                             triggerOnCompletion: false,
                         };
+                        // REVIEW N2:仅当任务确有显式 name 时透传;无显式名任务省略 name,
+                        // 新任务(registry 创建点仅显式名赋值)沿完整 command 原样兜底,
+                        // 避免 rerun 后显示名退化为 80 字符截断版。
+                        if (task.name !== undefined)
+                            rerunOptions.name = task.name;
                         if (task.description !== undefined)
                             rerunOptions.description = task.description;
                         if (task.timeoutSeconds !== undefined)
@@ -329,13 +345,13 @@ export default async function backgroundTasksExtension(pi) {
                     startBackgroundTask: async (command) => {
                         // dock「转后台」用户入口 → entrySource:'user':仅通知、不唤醒
                         const task = await startTask(ctx, command, {
-                            entrySource: 'user',
+                            entrySource: "user",
                         });
                         updateUi(ctx);
                         return task;
                     },
                     showOutputPath: (task) => {
-                        ctx.ui.notify(`Output path for ${taskDisplayName(task)} (${task.id}):\n${task.outputPath}`, 'info');
+                        ctx.ui.notify(`Output path for ${taskDisplayName(task)} (${task.id}):\n${task.outputPath}`, "info");
                     },
                     markSeen: (taskId) => {
                         seenTaskIds.add(taskId);
@@ -357,10 +373,10 @@ export default async function backgroundTasksExtension(pi) {
             }, {
                 overlay: true,
                 overlayOptions: {
-                    anchor: 'bottom-center',
-                    width: '96%',
+                    anchor: "bottom-center",
+                    width: "96%",
                     minWidth: 64,
-                    maxHeight: '60%',
+                    maxHeight: "60%",
                     margin: { bottom: 1, left: 1, right: 1 },
                 },
             });
@@ -370,25 +386,25 @@ export default async function backgroundTasksExtension(pi) {
             updateUi(ctx);
         }
     }
-    pi.registerMessageRenderer('background-task-notification', (message, _options, theme) => {
+    pi.registerMessageRenderer("background-task-notification", (message, _options, theme) => {
         const task = message.details;
-        const status = task?.status ?? 'completed';
-        const color = status === 'completed'
-            ? 'success'
-            : status === 'failed'
-                ? 'error'
-                : status === 'killed' || status === 'cancelled' || status === 'lost'
-                    ? 'warning'
-                    : 'accent';
-        const id = task?.id ?? 'background task';
-        const name = task ? taskDisplayName(task) : 'Background task';
+        const status = task?.status ?? "completed";
+        const color = status === "completed"
+            ? "success"
+            : status === "failed"
+                ? "error"
+                : status === "killed" || status === "cancelled" || status === "lost"
+                    ? "warning"
+                    : "accent";
+        const id = task?.id ?? "background task";
+        const name = task ? taskDisplayName(task) : "Background task";
         const output = task?.outputPath
-            ? `\n${theme.fg('dim', `Output: ${task.outputPath}`)}`
-            : '';
-        const error = task?.error ? `\n${theme.fg('error', task.error)}` : '';
-        return new Text(`${theme.fg(color, `[bg ${status}]`)} ${theme.fg('accent', name)} ${theme.fg('dim', `(${id})`)}${output}${error}`, 0, 0);
+            ? `\n${theme.fg("dim", `Output: ${task.outputPath}`)}`
+            : "";
+        const error = task?.error ? `\n${theme.fg("error", task.error)}` : "";
+        return new Text(`${theme.fg(color, `[bg ${status}]`)} ${theme.fg("accent", name)} ${theme.fg("dim", `(${id})`)}${output}${error}`, 0, 0);
     });
-    pi.on('session_start', async (_event, ctx) => {
+    pi.on("session_start", async (_event, ctx) => {
         // Pi replacement binds a fresh extension instance. Never revive this old
         // activation if a late lifecycle dispatch reaches it after shutdown.
         if (disposed)
@@ -423,7 +439,7 @@ export default async function backgroundTasksExtension(pi) {
         }
         statusInterval = nextStatusInterval;
     });
-    pi.on('session_shutdown', async (event, ctx) => {
+    pi.on("session_shutdown", async (event, ctx) => {
         // REVIEW:beginSessionShutdown 在 reload handoff 失败时置位 reloadHandoffFailed
         // 并以 handoffError 抛错。清理块放入 finally,保证 running 任务仍被停止、宿主
         // 句柄仍被释放;原抛错语义在清理完成后还原,不被吞掉(清理自身失败时以
@@ -446,13 +462,13 @@ export default async function backgroundTasksExtension(pi) {
                 await registry.waitForTaskAdmissions();
                 const running = registry
                     .allTasks()
-                    .filter((task) => task.status === 'running');
+                    .filter((task) => task.status === "running");
                 if (running.length === 0)
                     return;
                 const failures = [];
                 await Promise.all(running.map(async (task) => {
                     try {
-                        await registry.stopTask(task, 'shutdown', `Killed during Pi session shutdown (${event.reason})`, 'system');
+                        await registry.stopTask(task, "shutdown", `Killed during Pi session shutdown (${event.reason})`, "system");
                     }
                     catch (error) {
                         const message = `${task.id}: ${error instanceof Error ? error.message : String(error)}`;
@@ -461,18 +477,18 @@ export default async function backgroundTasksExtension(pi) {
                     }
                 }));
                 if (failures.length > 0 && ctx.hasUI) {
-                    ctx.ui.notify(`Background task cleanup failed:\n${failures.join('\n')}`, 'error');
+                    ctx.ui.notify(`Background task cleanup failed:\n${failures.join("\n")}`, "error");
                 }
             }
             finally {
                 eventService.close();
-                if ((event.reason !== 'reload' || reloadHandoffFailed) &&
+                if ((event.reason !== "reload" || reloadHandoffFailed) &&
                     activationLease !== undefined) {
                     try {
                         await registry.waitForReloadHostSettlement();
                     }
                     catch (error) {
-                        console.error('[background-tasks] reload owner host settlement failed during shutdown:', error);
+                        console.error("[background-tasks] reload owner host settlement failed during shutdown:", error);
                     }
                     registry.releaseReloadActivation(activationLease);
                     activationLease = undefined;
@@ -487,52 +503,52 @@ export default async function backgroundTasksExtension(pi) {
             if (shutdownError === undefined)
                 throw error;
             if (shutdownError !== error) {
-                throw new AggregateError([shutdownError, error], 'Session shutdown handoff and cleanup both failed');
+                throw new AggregateError([shutdownError, error], "Session shutdown handoff and cleanup both failed");
             }
         }
         if (shutdownError !== undefined)
             throw shutdownError;
     });
-    pi.registerCommand('bg-clear', {
-        description: 'Clear finished background task footer notices',
+    pi.registerCommand("bg-clear", {
+        description: "Clear finished background task footer notices",
         handler: (_args, ctx) => {
             notifyClearFinishedNotices(ctx);
             return Promise.resolve();
         },
     });
-    if (config.dockShortcut === 'shift+down') {
-        pi.registerShortcut('shift+down', {
-            description: 'Open focused background task footer dock',
+    if (config.dockShortcut === "shift+down") {
+        pi.registerShortcut("shift+down", {
+            description: "Open focused background task footer dock",
             handler: async (ctx) => {
                 await openTaskManager(ctx);
             },
         });
     }
-    if (config.dockShortcut === 'ctrl+alt+b') {
-        pi.registerShortcut('ctrl+alt+b', {
-            description: 'Open focused background task footer dock',
+    if (config.dockShortcut === "ctrl+alt+b") {
+        pi.registerShortcut("ctrl+alt+b", {
+            description: "Open focused background task footer dock",
             handler: async (ctx) => {
                 await openTaskManager(ctx);
             },
         });
     }
-    pi.registerShortcut('ctrl+alt+c', {
-        description: 'Clear finished background task footer notices (terminal-dependent fallback for /bg-clear)',
+    pi.registerShortcut("ctrl+alt+c", {
+        description: "Clear finished background task footer notices (terminal-dependent fallback for /bg-clear)",
         handler: (ctx) => {
             notifyClearFinishedNotices(ctx);
         },
     });
-    pi.registerCommand('bg-jobs', {
-        description: 'List running and recent background tasks: /bg-jobs',
+    pi.registerCommand("bg-jobs", {
+        description: "List running and recent background tasks: /bg-jobs",
         handler: (_args, ctx) => {
             currentCtx = ctx;
-            ctx.ui.notify(formatSnapshotList(registry.allTasks().map((task) => registry.snapshot(task))), 'info');
+            ctx.ui.notify(formatSnapshotList(registry.allTasks().map((task) => registry.snapshot(task))), "info");
             updateUi(ctx);
             return Promise.resolve();
         },
     });
-    pi.registerCommand('bg-logs', {
-        description: 'Show bounded output from a background task: /bg-logs <id> [maxBytes]',
+    pi.registerCommand("bg-logs", {
+        description: "Show bounded output from a background task: /bg-logs <id> [maxBytes]",
         getArgumentCompletions: (prefix) => {
             const matches = registry
                 .allTasks()
@@ -549,22 +565,22 @@ export default async function backgroundTasksExtension(pi) {
             try {
                 currentCtx = ctx;
                 const [id, bytes] = args.trim().split(/\s+/, 2);
-                const task = registry.resolveTask(id ?? '');
+                const task = registry.resolveTask(id ?? "");
                 const maxBytes = normalizeMaxBytes(Number(bytes), DEFAULT_LOG_BYTES);
                 const logs = await registry.getTaskLogs(task, maxBytes, true);
-                ctx.ui.notify(logs.text, 'info');
+                ctx.ui.notify(logs.text, "info");
             }
             catch (error) {
-                ctx.ui.notify(`Background logs error: ${error instanceof Error ? error.message : String(error)}`, 'error');
+                ctx.ui.notify(`Background logs error: ${error instanceof Error ? error.message : String(error)}`, "error");
             }
         },
     });
-    pi.registerCommand('bg-kill', {
-        description: 'Stop a running background task: /bg-kill <id>',
+    pi.registerCommand("bg-kill", {
+        description: "Stop a running background task: /bg-kill <id>",
         getArgumentCompletions: (prefix) => {
             const matches = registry
                 .allTasks()
-                .filter((task) => task.status === 'running' && task.id.startsWith(prefix.trim()))
+                .filter((task) => task.status === "running" && task.id.startsWith(prefix.trim()))
                 .slice(0, 20)
                 .map((task) => ({
                 value: task.id,
@@ -578,12 +594,12 @@ export default async function backgroundTasksExtension(pi) {
                 currentCtx = ctx;
                 const task = registry.resolveTask(args.trim());
                 // /bg-kill 命令 → initiator=user
-                await registry.stopTask(task, 'user', undefined, 'user');
-                ctx.ui.notify(`Killed ${taskDisplayName(task)} (${task.id}). Output: ${task.outputPath}`, 'info');
+                await registry.stopTask(task, "user", undefined, "user");
+                ctx.ui.notify(`Killed ${taskDisplayName(task)} (${task.id}). Output: ${task.outputPath}`, "info");
                 updateUi(ctx);
             }
             catch (error) {
-                ctx.ui.notify(`Background kill error: ${error instanceof Error ? error.message : String(error)}`, 'error');
+                ctx.ui.notify(`Background kill error: ${error instanceof Error ? error.message : String(error)}`, "error");
             }
         },
     });
@@ -594,6 +610,11 @@ export default async function backgroundTasksExtension(pi) {
     // 渲染器沿用宿主 bash 自带渲染,不新增渲染器。
     const bashOverrideDeps = createBashOverrideDeps({
         baseCwd: process.cwd(),
+        // S1 P1+P2 宿主同源注入:前台经 createBashToolDefinition 第二参对齐
+        // 宿主 _buildRuntime(agent-session.ts:3243-3254);后台经 shell 策略链与
+        // commandPrefix 前置生效
+        hostShellPath,
+        hostCommandPrefix: hostShellSettings.commandPrefix,
         startBackgroundTask: async (ctx, command, options) => {
             currentCtx = ctx;
             currentRegistryCtx = registryContext(ctx);
@@ -601,31 +622,31 @@ export default async function backgroundTasksExtension(pi) {
         },
     });
     pi.registerTool({
-        name: 'bash',
-        label: 'bash',
-        description: 'Execute a bash command in the current working directory (identical to the built-in bash tool). Returns stdout and stderr; output is truncated to a bounded tail and the full output path is included when truncated. Optionally provide a timeout in seconds. Set run_in_background:true to detach the command as a durable background task instead: the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification> and starts a follow-up agent turn.',
-        promptSnippet: 'Execute bash commands (ls, grep, find, etc.); set run_in_background:true to detach long-running work',
+        name: "bash",
+        label: "bash",
+        description: "Execute a bash command in the current working directory (identical to the built-in bash tool). Returns stdout and stderr; output is truncated to a bounded tail and the full output path is included when truncated. Optionally provide a timeout in seconds. Set run_in_background:true to detach the command as a durable background task instead: the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification> and starts a follow-up agent turn.",
+        promptSnippet: "Execute bash commands (ls, grep, find, etc.); set run_in_background:true to detach long-running work",
         promptGuidelines: [
-            'Run short commands with bash as usual. Use run_in_background:true for commands expected to run for a long time, such as test suites, dev servers, watchers, or builds.',
-            'With run_in_background:true the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification> and starts a follow-up agent turn, so do not sleep or poll merely to wait.',
-            'Treat <background-task-notification> as durable terminal truth. Do not call bg_status to reconfirm it; call bg_logs only when the task output is needed.',
-            'Use bg_status/bg_logs only when the user explicitly requests an update, automatic notification or wake-up was deliberately disabled, there is concrete evidence the task is hung, or a terminal notification arrived and output details are needed.',
+            "Run short commands with bash as usual. Use run_in_background:true for commands expected to run for a long time, such as test suites, dev servers, watchers, or builds.",
+            "With run_in_background:true the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification> and starts a follow-up agent turn, so do not sleep or poll merely to wait.",
+            "Treat <background-task-notification> as durable terminal truth. Do not call bg_status to reconfirm it; call bg_logs only when the task output is needed.",
+            "Use bg_status/bg_logs only when the user explicitly requests an update, automatic notification or wake-up was deliberately disabled, there is concrete evidence the task is hung, or a terminal notification arrived and output details are needed.",
         ],
         parameters: BashOverrideParams,
-        constrainedSampling: { type: 'json_schema', strict: 'prefer' },
+        constrainedSampling: { type: "json_schema", strict: "prefer" },
         execute: createBashOverrideExecute(bashOverrideDeps),
         renderCall: bashOverrideRenderCall,
         renderResult: bashOverrideRenderResult,
     });
     pi.registerTool({
-        name: 'bg_status',
-        label: 'Background Status',
-        description: 'Inspect one background task or list all running/recent background tasks. This is a point-in-time inspection tool, not a waiting primitive.',
-        promptSnippet: 'Inspect point-in-time status for one or all background tasks; never poll it as a wait loop',
+        name: "bg_status",
+        label: "Background Status",
+        description: "Inspect one background task or list all running/recent background tasks. This is a point-in-time inspection tool, not a waiting primitive.",
+        promptSnippet: "Inspect point-in-time status for one or all background tasks; never poll it as a wait loop",
         promptGuidelines: [
-            'Use bg_status for deliberate point-in-time inspection, not as a waiting primitive.',
-            'A running result is not an instruction to poll again. Do not repeatedly call bg_status while an automatic terminal notification is pending.',
-            'Use bg_status when the user explicitly requests an update, automatic completion handling was disabled, or concrete evidence suggests a task is hung; terminal notifications do not need reconfirmation.',
+            "Use bg_status for deliberate point-in-time inspection, not as a waiting primitive.",
+            "A running result is not an instruction to poll again. Do not repeatedly call bg_status while an automatic terminal notification is pending.",
+            "Use bg_status when the user explicitly requests an update, automatic completion handling was disabled, or concrete evidence suggests a task is hung; terminal notifications do not need reconfirmation.",
         ],
         parameters: BgStatusParams,
         execute(_toolCallId, params) {
@@ -639,19 +660,19 @@ export default async function backgroundTasksExtension(pi) {
             });
         },
         renderCall(args, theme) {
-            return new Text(`${theme.fg('toolTitle', theme.bold('bg_status'))}${args.taskId ? ` ${theme.fg('accent', args.taskId)}` : ''}`, 0, 0);
+            return new Text(`${theme.fg("toolTitle", theme.bold("bg_status"))}${args.taskId ? ` ${theme.fg("accent", args.taskId)}` : ""}`, 0, 0);
         },
         renderResult: renderPlainResult,
     });
     pi.registerTool({
-        name: 'bg_logs',
-        label: 'Background Logs',
+        name: "bg_logs",
+        label: "Background Logs",
         description: `Read bounded output from a background task for deliberate inspection; this is not a waiting primitive. Output is capped at ${formatSize(MAX_LOG_BYTES)} for model safety and points to the full output file when truncated.`,
-        promptSnippet: 'Read bounded task output when needed; never tail it repeatedly as a wait loop',
+        promptSnippet: "Read bounded task output when needed; never tail it repeatedly as a wait loop",
         promptGuidelines: [
-            'Use bg_logs with a modest maxBytes value only when task output is needed, without flooding context.',
-            'Do not repeatedly call bg_logs to wait for completion while an automatic terminal notification is pending.',
-            'Use bg_status first only when a deliberate inspection requires the current task state; do not reconfirm a terminal notification.',
+            "Use bg_logs with a modest maxBytes value only when task output is needed, without flooding context.",
+            "Do not repeatedly call bg_logs to wait for completion while an automatic terminal notification is pending.",
+            "Use bg_status first only when a deliberate inspection requires the current task state; do not reconfirm a terminal notification.",
         ],
         parameters: BgLogsParams,
         async execute(_toolCallId, params) {
@@ -663,36 +684,36 @@ export default async function backgroundTasksExtension(pi) {
             };
         },
         renderCall(args, theme) {
-            return new Text(`${theme.fg('toolTitle', theme.bold('bg_logs '))}${theme.fg('accent', args.taskId)}`, 0, 0);
+            return new Text(`${theme.fg("toolTitle", theme.bold("bg_logs "))}${theme.fg("accent", args.taskId)}`, 0, 0);
         },
         renderResult(result, { expanded }, theme) {
             const details = result.details;
-            let text = `${theme.fg('accent', taskDisplayName(details.task))} ${theme.fg('dim', `(${details.task.id})`)} ${theme.fg('muted', details.tail ? 'tail' : 'head')} ${formatSize(details.bytesRead)} / ${formatSize(details.totalBytes)}`;
+            let text = `${theme.fg("accent", taskDisplayName(details.task))} ${theme.fg("dim", `(${details.task.id})`)} ${theme.fg("muted", details.tail ? "tail" : "head")} ${formatSize(details.bytesRead)} / ${formatSize(details.totalBytes)}`;
             if (details.truncated)
-                text += theme.fg('warning', ' (truncated)');
-            text += `\n${theme.fg('dim', `Full output: ${details.path}`)}`;
+                text += theme.fg("warning", " (truncated)");
+            text += `\n${theme.fg("dim", `Full output: ${details.path}`)}`;
             if (expanded) {
                 const output = result.content
-                    .map((content) => content.type === 'text' ? content.text : '[image content]')
-                    .join('\n');
-                text += `\n${theme.fg('toolOutput', output.split('\n').slice(0, 30).join('\n'))}`;
+                    .map((content) => content.type === "text" ? content.text : "[image content]")
+                    .join("\n");
+                text += `\n${theme.fg("toolOutput", output.split("\n").slice(0, 30).join("\n"))}`;
             }
             return new Text(text, 0, 0);
         },
     });
     pi.registerTool({
-        name: 'bg_kill',
-        label: 'Background Kill',
-        description: 'Stop a running background task by ID. Fails loudly if the task is unknown or already finished.',
-        promptSnippet: 'Stop a running background task by ID',
+        name: "bg_kill",
+        label: "Background Kill",
+        description: "Stop a running background task by ID. Fails loudly if the task is unknown or already finished.",
+        promptSnippet: "Stop a running background task by ID",
         promptGuidelines: [
-            'Use bg_kill when the user asks to stop a background task or when a background command launched via run_in_background:true (or the dock「转后台」entry) is no longer needed.',
+            "Use bg_kill when the user asks to stop a background task or when a background command launched via run_in_background:true (or the dock「转后台」entry) is no longer needed.",
         ],
         parameters: BgKillParams,
         async execute(_toolCallId, params) {
             const task = registry.resolveTask(params.taskId);
             // bg_kill 工具(模型入口)→ initiator=model
-            await registry.stopTask(task, 'user', undefined, 'model');
+            await registry.stopTask(task, "user", undefined, "model");
             const message = `Killed background task ${taskDisplayName(task)} (${task.id}). Output: ${task.outputPath}`;
             return {
                 content: textContent(message),
@@ -700,11 +721,11 @@ export default async function backgroundTasksExtension(pi) {
             };
         },
         renderCall(args, theme) {
-            return new Text(`${theme.fg('toolTitle', theme.bold('bg_kill '))}${theme.fg('accent', args.taskId)}`, 0, 0);
+            return new Text(`${theme.fg("toolTitle", theme.bold("bg_kill "))}${theme.fg("accent", args.taskId)}`, 0, 0);
         },
         renderResult(result, _options, theme) {
             const { task } = result.details;
-            return new Text(`${theme.fg('warning', '■ killed')} ${theme.fg('accent', taskDisplayName(task))} ${theme.fg('dim', `(${task.id})`)}\n${theme.fg('dim', `Output: ${task.outputPath}`)}`, 0, 0);
+            return new Text(`${theme.fg("warning", "■ killed")} ${theme.fg("accent", taskDisplayName(task))} ${theme.fg("dim", `(${task.id})`)}\n${theme.fg("dim", `Output: ${task.outputPath}`)}`, 0, 0);
         },
     });
 }
