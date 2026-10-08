@@ -184,8 +184,14 @@ async function withRpc(
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "pi-bg-rpc-"));
   const cwd = join(root, "project");
+  const agentDir = join(root, "agent");
   await mkdir(cwd, { recursive: true });
-  const rpc = new RPC(cwd, env);
+  await mkdir(agentDir, { recursive: true });
+  // S3 P5:运行时目录迁宿主私有 getAgentDir()——子进程 env 重定向到临时 agent 目录
+  const rpc = new RPC(cwd, {
+    ...env,
+    PI_CODING_AGENT_DIR: agentDir,
+  });
   try {
     await fn(rpc, cwd);
   } finally {

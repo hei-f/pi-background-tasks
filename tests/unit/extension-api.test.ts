@@ -1,10 +1,10 @@
-import { describe, it } from 'node:test';
-import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
-import { appendFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import type { EventBus } from '@earendil-works/pi-coding-agent';
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { appendFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import type { EventBus } from "@earendil-works/pi-coding-agent";
 import {
   BG_EXTENSION_CAPABILITIES,
   BG_REQUEST_CHANNEL,
@@ -17,21 +17,25 @@ import {
   type BackgroundTaskExtensionResponse,
   type BackgroundTaskExtensionService,
   type BackgroundTaskExtensionTerminal,
-} from '../../src/core/extension-api.js';
+} from "../../src/core/extension-api.js";
 import {
   BackgroundTaskRegistry,
   TERMINAL_SUMMARY_TAIL_BYTES,
   type BackgroundTaskContext,
   type BackgroundTaskSpawn,
-} from '../../src/core/registry.js';
-import type { TaskkillOutcome, WindowsKillPhase } from '../../src/core/windows-taskkill.js';
-import type { BgTaskSnapshot } from '../../src/core/common.js';
+} from "../../src/core/registry.js";
+import type {
+  TaskkillOutcome,
+  WindowsKillPhase,
+} from "../../src/core/windows-taskkill.js";
+import type { BgTaskSnapshot } from "../../src/core/common.js";
 
 class MemoryEventBus implements EventBus {
   private readonly listeners = new Map<string, Set<(data: unknown) => void>>();
 
   emit(channel: string, data: unknown): void {
-    for (const listener of [...(this.listeners.get(channel) ?? [])]) listener(data);
+    for (const listener of [...(this.listeners.get(channel) ?? [])])
+      listener(data);
   }
 
   on(channel: string, handler: (data: unknown) => void): () => void {
@@ -61,12 +65,13 @@ class FakeChild extends EventEmitter {
 
   kill(signal?: NodeJS.Signals): boolean {
     this.killCalls.push(signal);
-    if (this.closeOnKill) queueMicrotask(() => this.close(null, signal ?? 'SIGTERM'));
+    if (this.closeOnKill)
+      queueMicrotask(() => this.close(null, signal ?? "SIGTERM"));
     return true;
   }
 
   close(code: number | null = 0, signal: NodeJS.Signals | null = null): void {
-    this.emit('close', code, signal);
+    this.emit("close", code, signal);
   }
 }
 
@@ -83,9 +88,11 @@ interface Harness {
 }
 
 async function createHarness(): Promise<Harness> {
-  const root = await mkdtemp(join(tmpdir(), 'pi-bg-api-'));
-  const cwd = join(root, 'project');
+  const root = await mkdtemp(join(tmpdir(), "pi-bg-api-"));
+  const cwd = join(root, "project");
   await mkdir(cwd, { recursive: true });
+  const agentDir = join(root, "agent");
+  await mkdir(agentDir, { recursive: true });
   const bus = new MemoryEventBus();
   let currentCtx: BackgroundTaskContext | undefined;
   let shuttingDown = false;
@@ -94,12 +101,14 @@ async function createHarness(): Promise<Harness> {
     sendCompletionNotification: () => {},
     spawn: () => {
       spawns += 1;
-      throw new Error('spawn should not be reached by this protocol test');
+      throw new Error("spawn should not be reached by this protocol test");
     },
+    // S3 P5:运行时目录迁宿主私有 agent 目录——测试注入临时目录保持隔离
+    agentDir,
   });
   const ctx: BackgroundTaskContext = {
     cwd,
-    sessionId: 'extension-api-unit',
+    sessionId: "extension-api-unit",
     modelRegistry: { getAll: () => [] },
     model: undefined,
   };
@@ -147,9 +156,11 @@ async function createProtocolHarness(
     onSpawn?: ((child: FakeChild) => void) | undefined;
   } = {},
 ): Promise<ProtocolHarness> {
-  const root = await mkdtemp(join(tmpdir(), 'pi-bg-api-protocol-'));
-  const cwd = join(root, 'project');
+  const root = await mkdtemp(join(tmpdir(), "pi-bg-api-protocol-"));
+  const cwd = join(root, "project");
+  const agentDir = join(root, "agent");
   await mkdir(cwd, { recursive: true });
+  await mkdir(agentDir, { recursive: true });
   const bus = new MemoryEventBus();
   const children: FakeChild[] = [];
   const liveGroups = new Set<number>();
@@ -160,7 +171,7 @@ async function createProtocolHarness(
   const spawn: BackgroundTaskSpawn = () => {
     const child = new FakeChild(++pid);
     liveGroups.add(child.pid);
-    child.on('close', () => liveGroups.delete(child.pid));
+    child.on("close", () => liveGroups.delete(child.pid));
     children.push(child);
     options.onSpawn?.(child);
     return child;
@@ -178,36 +189,47 @@ async function createProtocolHarness(
   // Real Windows termination behaviour is proven on a real Windows host by
   // tests/windows/windows-integration.test.ts (grandchild tree teardown) and
   // by the injected killTree cases in tests/unit/registry.test.ts.
-  const killProcess = (pid: number, signal?: NodeJS.Signals | number): boolean => {
+  const killProcess = (
+    pid: number,
+    signal?: NodeJS.Signals | number,
+  ): boolean => {
     const groupId = Math.abs(pid);
     if (signal === 0) {
       if (liveGroups.has(groupId)) return true;
-      throw Object.assign(new Error(`fake process group ${String(groupId)} is gone`), {
-        code: 'ESRCH',
-      });
+      throw Object.assign(
+        new Error(`fake process group ${String(groupId)} is gone`),
+        {
+          code: "ESRCH",
+        },
+      );
     }
     const target = children.find((child) => child.pid === groupId);
     if (!target) throw new Error(`no fake child for pid ${String(pid)}`);
-    target.kill(typeof signal === 'string' ? signal : 'SIGTERM');
+    target.kill(typeof signal === "string" ? signal : "SIGTERM");
     return true;
   };
-  const killTree = (pid: number, phase: WindowsKillPhase): Promise<TaskkillOutcome> => {
-    killProcess(pid, phase === 'force' ? 'SIGKILL' : 'SIGTERM');
+  const killTree = (
+    pid: number,
+    phase: WindowsKillPhase,
+  ): Promise<TaskkillOutcome> => {
+    killProcess(pid, phase === "force" ? "SIGKILL" : "SIGTERM");
     return Promise.resolve({
       exitCode: 0,
       signal: null,
-      stdout: '',
-      stderr: '',
+      stdout: "",
+      stderr: "",
       stdoutTruncated: false,
       stderrTruncated: false,
     });
   };
   const registry = new BackgroundTaskRegistry({
-    makeTaskId: () => `bproto${String(++idSeq).padStart(3, '0')}`,
+    makeTaskId: () => `bproto${String(++idSeq).padStart(3, "0")}`,
     sendCompletionNotification: () => {},
+    // S3 P5:运行时目录迁宿主私有 agent 目录——测试注入临时目录保持隔离
+    agentDir,
     killGraceMs: 20,
     stopWaitMs: 500,
-    platform: 'linux',
+    platform: "linux",
     killProcess,
     killTree,
     spawn,
@@ -215,15 +237,18 @@ async function createProtocolHarness(
       error: (...args: unknown[]) => {
         errors.push(args);
       },
+      warn: (...args: unknown[]) => {
+        errors.push(args);
+      },
     },
     publishTerminal: (publication) => {
-      if (!service) throw new Error('test EventBus service is not installed');
+      if (!service) throw new Error("test EventBus service is not installed");
       service.publishTerminal(publication);
     },
   });
   const ctx: BackgroundTaskContext = {
     cwd,
-    sessionId: 'extension-api-protocol-unit',
+    sessionId: "extension-api-protocol-unit",
     modelRegistry: { getAll: () => [] },
     model: undefined,
   };
@@ -259,40 +284,44 @@ function deferred<T>() {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function requireResponse(value: unknown): BackgroundTaskExtensionResponse {
-  assert.ok(isRecord(value), 'response must be an object');
-  assert.equal(value['schema_version'], BG_RESPONSE_SCHEMA);
-  assert.equal(typeof value['request_id'], 'string');
-  assert.equal(typeof value['operation'], 'string');
-  assert.equal(typeof value['ok'], 'boolean');
-  const hasResult = Object.prototype.hasOwnProperty.call(value, 'result');
-  const hasError = Object.prototype.hasOwnProperty.call(value, 'error');
-  assert.notEqual(hasResult, hasError, 'response must contain exactly one of result/error');
+  assert.ok(isRecord(value), "response must be an object");
+  assert.equal(value["schema_version"], BG_RESPONSE_SCHEMA);
+  assert.equal(typeof value["request_id"], "string");
+  assert.equal(typeof value["operation"], "string");
+  assert.equal(typeof value["ok"], "boolean");
+  const hasResult = Object.prototype.hasOwnProperty.call(value, "result");
+  const hasError = Object.prototype.hasOwnProperty.call(value, "error");
+  assert.notEqual(
+    hasResult,
+    hasError,
+    "response must contain exactly one of result/error",
+  );
   return value as BackgroundTaskExtensionResponse;
 }
 
 function requireTask(value: unknown, label: string): BgTaskSnapshot {
   assert.ok(isRecord(value), `${label} must be an object`);
-  const id = value['id'];
-  const command = value['command'];
-  const status = value['status'];
-  const outputPath = value['outputPath'];
-  if (typeof id !== 'string') assert.fail(`${label}.id`);
-  if (typeof command !== 'string') assert.fail(`${label}.command`);
+  const id = value["id"];
+  const command = value["command"];
+  const status = value["status"];
+  const outputPath = value["outputPath"];
+  if (typeof id !== "string") assert.fail(`${label}.id`);
+  if (typeof command !== "string") assert.fail(`${label}.command`);
   if (
-    status !== 'running' &&
-    status !== 'completed' &&
-    status !== 'failed' &&
-    status !== 'cancelled' &&
-    status !== 'killed' &&
-    status !== 'lost'
+    status !== "running" &&
+    status !== "completed" &&
+    status !== "failed" &&
+    status !== "cancelled" &&
+    status !== "killed" &&
+    status !== "lost"
   ) {
     assert.fail(`${label}.status`);
   }
-  if (typeof outputPath !== 'string') assert.fail(`${label}.outputPath`);
+  if (typeof outputPath !== "string") assert.fail(`${label}.outputPath`);
   const partial = value as Partial<BgTaskSnapshot>;
   return {
     ...partial,
@@ -300,7 +329,7 @@ function requireTask(value: unknown, label: string): BgTaskSnapshot {
     command,
     status,
     outputPath,
-    cwd: partial.cwd ?? '',
+    cwd: partial.cwd ?? "",
     startTime: partial.startTime ?? 0,
     bytesWritten: partial.bytesWritten ?? 0,
     isAgent: partial.isAgent ?? false,
@@ -312,25 +341,29 @@ function requireTask(value: unknown, label: string): BgTaskSnapshot {
 }
 
 const TERMINAL_OPTIONAL_KEYS = [
-  'status',
-  'failedReason',
-  'initiator',
-  'originMeta',
-  'summaryTail',
-  'usage',
+  "status",
+  "failedReason",
+  "initiator",
+  "originMeta",
+  "summaryTail",
+  "usage",
 ] as const;
 
 function requireTerminal(value: unknown): BackgroundTaskExtensionTerminal {
-  assert.ok(isRecord(value), 'terminal must be an object');
+  assert.ok(isRecord(value), "terminal must be an object");
   // M5 扩展帧:保留闭包校验语义,未知键仍报错;新字段全部可选
-  const allowed = new Set<string>(['schema_version', 'task', ...TERMINAL_OPTIONAL_KEYS]);
+  const allowed = new Set<string>([
+    "schema_version",
+    "task",
+    ...TERMINAL_OPTIONAL_KEYS,
+  ]);
   for (const key of Object.keys(value)) {
     assert.ok(allowed.has(key), `terminal contains unknown key ${key}`);
   }
-  assert.equal(value['schema_version'], BG_TERMINAL_SCHEMA);
+  assert.equal(value["schema_version"], BG_TERMINAL_SCHEMA);
   const out: BackgroundTaskExtensionTerminal = {
     schema_version: BG_TERMINAL_SCHEMA,
-    task: requireTask(value['task'], 'terminal.task'),
+    task: requireTask(value["task"], "terminal.task"),
   };
   for (const key of TERMINAL_OPTIONAL_KEYS) {
     if (Object.prototype.hasOwnProperty.call(value, key)) {
@@ -364,9 +397,9 @@ async function emitRequest(
   request: unknown,
 ): Promise<BackgroundTaskExtensionResponse> {
   const requestId =
-    isRecord(request) && typeof request['request_id'] === 'string'
-      ? request['request_id']
-      : 'malformed';
+    isRecord(request) && typeof request["request_id"] === "string"
+      ? request["request_id"]
+      : "malformed";
   const pending = waitForResponse(bus, requestId);
   bus.emit(BG_REQUEST_CHANNEL, request);
   return pending;
@@ -398,7 +431,11 @@ async function cleanupRoot(root: string): Promise<void> {
       await rm(root, { recursive: true, force: true });
       return;
     } catch (error) {
-      if (!(error instanceof Error) || !/ENOTEMPTY/u.test(error.message) || attempt === 4)
+      if (
+        !(error instanceof Error) ||
+        !/ENOTEMPTY/u.test(error.message) ||
+        attempt === 4
+      )
         throw error;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -419,77 +456,95 @@ async function waitForTerminal(
   throw new Error(`timed out waiting for terminal ${taskId}`);
 }
 
-void describe('background EventBus protocol', () => {
-  void it('handshakes capabilities and rejects malformed, duplicate, and unavailable requests', async () => {
+void describe("background EventBus protocol", () => {
+  void it("handshakes capabilities and rejects malformed, duplicate, and unavailable requests", async () => {
     const h = await createHarness();
     try {
       const ok = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'cap-1',
-        operation: 'capabilities',
+        request_id: "cap-1",
+        operation: "capabilities",
         payload: {},
       });
       assert.equal(ok.ok, true);
-      assert.deepEqual(ok.ok ? ok.result : undefined, BG_EXTENSION_CAPABILITIES);
+      assert.deepEqual(
+        ok.ok ? ok.result : undefined,
+        BG_EXTENSION_CAPABILITIES,
+      );
 
       const duplicate = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'cap-1',
-        operation: 'capabilities',
+        request_id: "cap-1",
+        operation: "capabilities",
         payload: {},
       });
       assert.equal(duplicate.ok, false);
-      assert.match(duplicate.ok ? '' : duplicate.error, /duplicate request_id/u);
+      assert.match(
+        duplicate.ok ? "" : duplicate.error,
+        /duplicate request_id/u,
+      );
 
       const unknown = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'unknown-op',
-        operation: 'bogus',
+        request_id: "unknown-op",
+        operation: "bogus",
         payload: {},
       });
       assert.equal(unknown.ok, false);
-      assert.equal(unknown.operation, 'bogus');
-      assert.match(unknown.ok ? '' : unknown.error, /capabilities, run, status, logs, kill/u);
+      assert.equal(unknown.operation, "bogus");
+      assert.match(
+        unknown.ok ? "" : unknown.error,
+        /capabilities, run, status, logs, kill/u,
+      );
 
       const extra = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'extra-key',
-        operation: 'capabilities',
+        request_id: "extra-key",
+        operation: "capabilities",
         payload: {},
         extra: true,
       });
       assert.equal(extra.ok, false);
-      assert.match(extra.ok ? '' : extra.error, /unknown key extra/u);
+      assert.match(extra.ok ? "" : extra.error, /unknown key extra/u);
 
       const notObject = await emitRequest(h.bus, []);
       assert.equal(notObject.ok, false);
-      assert.equal(notObject.request_id, 'malformed');
-      assert.match(notObject.ok ? '' : notObject.error, /request frame must be an object/u);
+      assert.equal(notObject.request_id, "malformed");
+      assert.match(
+        notObject.ok ? "" : notObject.error,
+        /request frame must be an object/u,
+      );
 
       const missingPayload = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'missing-payload',
-        operation: 'status',
+        request_id: "missing-payload",
+        operation: "status",
       });
       assert.equal(missingPayload.ok, false);
-      assert.match(missingPayload.ok ? '' : missingPayload.error, /payload is required/u);
+      assert.match(
+        missingPayload.ok ? "" : missingPayload.error,
+        /payload is required/u,
+      );
 
       const unknownPayloadKey = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'unknown-payload-key',
-        operation: 'status',
-        payload: { taskId: 'b123', extra: true },
+        request_id: "unknown-payload-key",
+        operation: "status",
+        payload: { taskId: "b123", extra: true },
       });
       assert.equal(unknownPayloadKey.ok, false);
-      assert.match(unknownPayloadKey.ok ? '' : unknownPayloadKey.error, /unknown key extra/u);
+      assert.match(
+        unknownPayloadKey.ok ? "" : unknownPayloadKey.error,
+        /unknown key extra/u,
+      );
 
       const malformedPayload = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'bad-run',
-        operation: 'run',
+        request_id: "bad-run",
+        operation: "run",
         payload: {
-          name: 'Bad Run',
-          command: 'printf nope',
+          name: "Bad Run",
+          command: "printf nope",
           isAgent: false,
           timeoutSeconds: null,
           notifyOnCompletion: true,
@@ -497,16 +552,19 @@ void describe('background EventBus protocol', () => {
         },
       });
       assert.equal(malformedPayload.ok, false);
-      assert.match(malformedPayload.ok ? '' : malformedPayload.error, /positive integer/u);
+      assert.match(
+        malformedPayload.ok ? "" : malformedPayload.error,
+        /positive integer/u,
+      );
       assert.equal(h.spawnCount(), 0);
 
       const survivalIsNotInV1 = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'v1-survival-closed',
-        operation: 'run',
+        request_id: "v1-survival-closed",
+        operation: "run",
         payload: {
-          name: 'Unsupported V1 Survival',
-          command: 'printf nope',
+          name: "Unsupported V1 Survival",
+          command: "printf nope",
           isAgent: false,
           surviveReload: true,
           notifyOnCompletion: true,
@@ -514,55 +572,65 @@ void describe('background EventBus protocol', () => {
         },
       });
       assert.equal(survivalIsNotInV1.ok, false);
-      assert.match(survivalIsNotInV1.ok ? '' : survivalIsNotInV1.error, /unknown key surviveReload/u);
+      assert.match(
+        survivalIsNotInV1.ok ? "" : survivalIsNotInV1.error,
+        /unknown key surviveReload/u,
+      );
       assert.equal(h.spawnCount(), 0);
       assert.deepEqual(Object.keys(BG_EXTENSION_CAPABILITIES).sort(), [
-        'api_version',
-        'kill',
-        'logs',
-        'logs_bounded',
-        'run',
-        'run_completion_trigger',
-        'run_is_agent',
-        'status',
+        "api_version",
+        "kill",
+        "logs",
+        "logs_bounded",
+        "run",
+        "run_completion_trigger",
+        "run_is_agent",
+        "status",
       ]);
 
       h.setCtx(undefined);
       const missingCtx = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'missing-ctx',
-        operation: 'capabilities',
+        request_id: "missing-ctx",
+        operation: "capabilities",
         payload: {},
       });
       assert.equal(missingCtx.ok, false);
-      assert.match(missingCtx.ok ? '' : missingCtx.error, /before session_start/u);
+      assert.match(
+        missingCtx.ok ? "" : missingCtx.error,
+        /before session_start/u,
+      );
 
       h.setCtx(h.ctx);
       h.setShutdown(true);
       h.registry.setShuttingDown(true);
       const shutdown = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'shutdown',
-        operation: 'status',
+        request_id: "shutdown",
+        operation: "status",
         payload: {},
       });
       assert.equal(shutdown.ok, false);
-      assert.match(shutdown.ok ? '' : shutdown.error, /shutting down/u);
+      assert.match(shutdown.ok ? "" : shutdown.error, /shutting down/u);
     } finally {
       h.close();
       await rm(h.root, { recursive: true, force: true });
     }
   });
 
-  void it('publishes exactly one correlated terminal after the run response for every terminal path', async () => {
+  void it("publishes exactly one correlated terminal after the run response for every terminal path", async () => {
     async function runCase(options: {
       label: string;
-      expectedStatus: 'completed' | 'failed' | 'cancelled';
+      expectedStatus: "completed" | "failed" | "cancelled";
       timeoutMs?: number | undefined;
       timeoutSeconds?: number | undefined;
       onSpawn?: ((child: FakeChild) => void) | undefined;
       afterRun?:
-        | ((h: ProtocolHarness, task: BgTaskSnapshot, order: string[]) => Promise<void> | void)
+        | ((
+            h: ProtocolHarness,
+            task: BgTaskSnapshot,
+            order: string[],
+          ) => Promise<void> | void)
         | undefined;
     }): Promise<void> {
       const h = await createProtocolHarness({ onSpawn: options.onSpawn });
@@ -570,8 +638,10 @@ void describe('background EventBus protocol', () => {
       const order: string[] = [];
       const unsubscribeResponse = h.bus.on(BG_RESPONSE_CHANNEL, (data) => {
         const response = requireResponse(data);
-        if (response.request_id === `run-${options.label}`) order.push('run-response');
-        if (response.request_id === `kill-${options.label}`) order.push('kill-response');
+        if (response.request_id === `run-${options.label}`)
+          order.push("run-response");
+        if (response.request_id === `kill-${options.label}`)
+          order.push("kill-response");
       });
       const unsubscribeTerminal = h.bus.on(BG_TERMINAL_CHANNEL, (data) => {
         const terminal = requireTerminal(data);
@@ -590,15 +660,18 @@ void describe('background EventBus protocol', () => {
           triggerOnCompletion: false,
         };
         if (options.timeoutSeconds !== undefined)
-          payload['timeoutSeconds'] = options.timeoutSeconds;
+          payload["timeoutSeconds"] = options.timeoutSeconds;
         const run = await emitRequest(h.bus, {
           schema_version: BG_REQUEST_SCHEMA,
           request_id: `run-${options.label}`,
-          operation: 'run',
+          operation: "run",
           payload,
         });
-        assert.equal(run.ok, true, run.ok ? 'ok' : run.error);
-        const task = requireTask(run.ok ? run.result : undefined, `${options.label}.run.result`);
+        assert.equal(run.ok, true, run.ok ? "ok" : run.error);
+        const task = requireTask(
+          run.ok ? run.result : undefined,
+          `${options.label}.run.result`,
+        );
         assert.equal(task.command, echoCommand);
         await options.afterRun?.(h, task, order);
         const terminal = await waitForTerminal(
@@ -613,17 +686,28 @@ void describe('background EventBus protocol', () => {
           1,
           `${options.label} must publish exactly one terminal`,
         );
-        const responseIndex = order.indexOf('run-response');
-        const terminalIndex = order.findIndex((entry) => entry.startsWith(`terminal:${task.id}:`));
-        assert.ok(responseIndex >= 0, `${options.label} missing run response order marker`);
+        const responseIndex = order.indexOf("run-response");
+        const terminalIndex = order.findIndex((entry) =>
+          entry.startsWith(`terminal:${task.id}:`),
+        );
+        assert.ok(
+          responseIndex >= 0,
+          `${options.label} missing run response order marker`,
+        );
         assert.ok(
           terminalIndex > responseIndex,
           `${options.label} terminal must follow run response`,
         );
-        if (options.expectedStatus === 'cancelled') {
-          const killResponseIndex = order.indexOf('kill-response');
-          assert.ok(killResponseIndex >= 0, 'cancelled case missing kill response marker');
-          assert.ok(terminalIndex > killResponseIndex, 'cancelled terminal must follow kill response');
+        if (options.expectedStatus === "cancelled") {
+          const killResponseIndex = order.indexOf("kill-response");
+          assert.ok(
+            killResponseIndex >= 0,
+            "cancelled case missing kill response marker",
+          );
+          assert.ok(
+            terminalIndex > killResponseIndex,
+            "cancelled terminal must follow kill response",
+          );
         }
       } finally {
         unsubscribeTerminal();
@@ -635,52 +719,52 @@ void describe('background EventBus protocol', () => {
     }
 
     await runCase({
-      label: 'immediate',
-      expectedStatus: 'completed',
+      label: "immediate",
+      expectedStatus: "completed",
       onSpawn: (child) => queueMicrotask(() => child.close(0, null)),
     });
     await runCase({
-      label: 'normal',
-      expectedStatus: 'completed',
+      label: "normal",
+      expectedStatus: "completed",
       afterRun: (h) => h.children[0]?.close(0, null),
     });
     await runCase({
-      label: 'failed',
-      expectedStatus: 'failed',
+      label: "failed",
+      expectedStatus: "failed",
       afterRun: (h) => h.children[0]?.close(9, null),
     });
     await runCase({
-      label: 'timeout',
-      expectedStatus: 'failed',
+      label: "timeout",
+      expectedStatus: "failed",
       timeoutSeconds: 1,
       timeoutMs: 2500,
     });
     await runCase({
-      label: 'cancelled',
-      expectedStatus: 'cancelled',
+      label: "cancelled",
+      expectedStatus: "cancelled",
       afterRun: async (h, task) => {
         const kill = await emitRequest(h.bus, {
           schema_version: BG_REQUEST_SCHEMA,
-          request_id: 'kill-cancelled',
-          operation: 'kill',
+          request_id: "kill-cancelled",
+          operation: "kill",
           payload: { taskId: task.id },
         });
-        assert.equal(kill.ok, true, kill.ok ? 'ok' : kill.error);
+        assert.equal(kill.ok, true, kill.ok ? "ok" : kill.error);
         const result = kill.ok ? kill.result : undefined;
-        assert.ok(isRecord(result), 'kill result must be an object');
+        assert.ok(isRecord(result), "kill result must be an object");
         const resultRecord: Record<string, unknown> = result;
         assert.equal(
-          requireTask(resultRecord['task'], 'kill.result.task').status,
-          'cancelled',
+          requireTask(resultRecord["task"], "kill.result.task").status,
+          "cancelled",
         );
       },
     });
   });
 
-  void it('maps the full terminal status set, failedReason, and initiator onto v1 terminal frames', async () => {
+  void it("maps the full terminal status set, failedReason, and initiator onto v1 terminal frames", async () => {
     async function runCase(options: {
       label: string;
-      expectedStatus: 'completed' | 'failed' | 'cancelled' | 'killed';
+      expectedStatus: "completed" | "failed" | "cancelled" | "killed";
       expectedFailedReason?: string | undefined;
       expectedInitiator?: string | undefined;
       timeoutSeconds?: number | undefined;
@@ -704,14 +788,14 @@ void describe('background EventBus protocol', () => {
           triggerOnCompletion: false,
         };
         if (options.timeoutSeconds !== undefined)
-          payload['timeoutSeconds'] = options.timeoutSeconds;
+          payload["timeoutSeconds"] = options.timeoutSeconds;
         const run = await emitRequest(h.bus, {
           schema_version: BG_REQUEST_SCHEMA,
           request_id: `frame-${options.label}`,
-          operation: 'run',
+          operation: "run",
           payload,
         });
-        assert.equal(run.ok, true, run.ok ? 'ok' : run.error);
+        assert.equal(run.ok, true, run.ok ? "ok" : run.error);
         const task = requireTask(
           run.ok ? run.result : undefined,
           `${options.label}.run.result`,
@@ -729,10 +813,10 @@ void describe('background EventBus protocol', () => {
           options.timeoutMs ?? TERMINAL_WAIT_TIMEOUT_MS,
         );
         assert.equal(terminal.status, options.expectedStatus);
-        assert.deepEqual(terminal.originMeta, { backgroundSource: 'bash' });
+        assert.deepEqual(terminal.originMeta, { backgroundSource: "bash" });
         if (options.expectedFailedReason === undefined) {
           assert.ok(
-            !Object.prototype.hasOwnProperty.call(terminal, 'failedReason'),
+            !Object.prototype.hasOwnProperty.call(terminal, "failedReason"),
             `${options.label} must not fabricate failedReason`,
           );
         } else {
@@ -740,18 +824,18 @@ void describe('background EventBus protocol', () => {
         }
         if (options.expectedInitiator === undefined) {
           assert.ok(
-            !Object.prototype.hasOwnProperty.call(terminal, 'initiator'),
+            !Object.prototype.hasOwnProperty.call(terminal, "initiator"),
             `${options.label} must not fabricate initiator`,
           );
         } else {
           assert.equal(terminal.initiator, options.expectedInitiator);
         }
         // 完成任务的 usage 快照始终携带真实的 durationMs(缺失的遥测字段不伪造 0)
-        assert.ok(terminal.usage, 'terminal task must carry a usage snapshot');
-        assert.equal(typeof terminal.usage?.durationMs, 'number');
+        assert.ok(terminal.usage, "terminal task must carry a usage snapshot");
+        assert.equal(typeof terminal.usage?.durationMs, "number");
         assert.ok(
           (terminal.usage?.durationMs ?? -1) >= 0,
-          'durationMs must be a non-negative real duration',
+          "durationMs must be a non-negative real duration",
         );
       } finally {
         unsubscribeTerminal();
@@ -760,47 +844,51 @@ void describe('background EventBus protocol', () => {
       }
     }
 
-    await runCase({ label: 'completed', expectedStatus: 'completed' });
+    await runCase({ label: "completed", expectedStatus: "completed" });
     await runCase({
-      label: 'failed',
-      expectedStatus: 'failed',
-      expectedFailedReason: 'exit_error',
+      label: "failed",
+      expectedStatus: "failed",
+      expectedFailedReason: "exit_error",
       afterRun: (h) => {
         h.children[0]?.close(9, null);
       },
     });
     await runCase({
-      label: 'timeout',
-      expectedStatus: 'failed',
-      expectedFailedReason: 'timed_out',
+      label: "timeout",
+      expectedStatus: "failed",
+      expectedFailedReason: "timed_out",
       timeoutSeconds: 1,
       timeoutMs: 2500,
     });
     await runCase({
-      label: 'cancelled',
-      expectedStatus: 'cancelled',
-      expectedInitiator: 'model',
+      label: "cancelled",
+      expectedStatus: "cancelled",
+      expectedInitiator: "model",
       afterRun: async (h, task) => {
         const kill = await emitRequest(h.bus, {
           schema_version: BG_REQUEST_SCHEMA,
-          request_id: 'frame-kill-cancelled',
-          operation: 'kill',
+          request_id: "frame-kill-cancelled",
+          operation: "kill",
           payload: { taskId: task.id },
         });
-        assert.equal(kill.ok, true, kill.ok ? 'ok' : kill.error);
+        assert.equal(kill.ok, true, kill.ok ? "ok" : kill.error);
       },
     });
     await runCase({
-      label: 'killed',
-      expectedStatus: 'killed',
-      expectedInitiator: 'system',
+      label: "killed",
+      expectedStatus: "killed",
+      expectedInitiator: "system",
       afterRun: async (h) => {
         const stopped = await h.registry.stopAllRunning(
-          'shutdown',
-          'unit shutdown',
-          'system',
+          "shutdown",
+          "unit shutdown",
+          "system",
         );
-        assert.equal(stopped.failures.length, 0, 'system stop must prove cleanup');
+        assert.equal(
+          stopped.failures.length,
+          0,
+          "system stop must prove cleanup",
+        );
       },
     });
 
@@ -814,10 +902,10 @@ void describe('background EventBus protocol', () => {
     try {
       h.service.publishTerminal({
         task: {
-          id: 'blost9',
-          command: 'date',
-          status: 'lost',
-          outputPath: '.pi/tasks/unit/blost9.output',
+          id: "blost9",
+          command: "date",
+          status: "lost",
+          outputPath: ".pi/tasks/unit/blost9.output",
           cwd: h.ctx.cwd,
           startTime: 10,
           bytesWritten: 0,
@@ -828,9 +916,13 @@ void describe('background EventBus protocol', () => {
           triggerOnCompletion: false,
         },
       });
-      assert.equal(lostTerminals.length, 1, 'lost publication must settle a terminal');
-      assert.equal(lostTerminals[0]?.status, 'lost');
-      assert.equal(lostTerminals[0]?.originMeta?.backgroundSource, 'bash');
+      assert.equal(
+        lostTerminals.length,
+        1,
+        "lost publication must settle a terminal",
+      );
+      assert.equal(lostTerminals[0]?.status, "lost");
+      assert.equal(lostTerminals[0]?.originMeta?.backgroundSource, "bash");
     } finally {
       unsubscribeLost();
       h.close();
@@ -838,7 +930,7 @@ void describe('background EventBus protocol', () => {
     }
   });
 
-  void it('carries a bounded 64KiB summaryTail on completion frames and omits it with empty output', async () => {
+  void it("carries a bounded 64KiB summaryTail on completion frames and omits it with empty output", async () => {
     async function runCase(options: {
       label: string;
       withOutput?: boolean | undefined;
@@ -856,7 +948,7 @@ void describe('background EventBus protocol', () => {
         const run = await emitRequest(h.bus, {
           schema_version: BG_REQUEST_SCHEMA,
           request_id: `tail-${options.label}`,
-          operation: 'run',
+          operation: "run",
           payload: {
             name: `Tail ${options.label}`,
             command: `echo ${options.label}`,
@@ -865,7 +957,7 @@ void describe('background EventBus protocol', () => {
             triggerOnCompletion: false,
           },
         });
-        assert.equal(run.ok, true, run.ok ? 'ok' : run.error);
+        assert.equal(run.ok, true, run.ok ? "ok" : run.error);
         const task = requireTask(
           run.ok ? run.result : undefined,
           `${options.label}.run.result`,
@@ -873,17 +965,20 @@ void describe('background EventBus protocol', () => {
         if (options.withOutput === true) {
           const outputAbsPath = join(
             h.root,
-            'project',
-            '.pi',
-            'tasks',
+            "agent",
+            "tasks",
             `extension-api-protocol-unit-${process.pid}`,
             `${task.id}.output`,
           );
-          await appendFile(outputAbsPath, 'z'.repeat(TERMINAL_SUMMARY_TAIL_BYTES + 8 * 1024), 'utf8');
+          await appendFile(
+            outputAbsPath,
+            "z".repeat(TERMINAL_SUMMARY_TAIL_BYTES + 8 * 1024),
+            "utf8",
+          );
         }
         h.children[0]?.close(0, null);
         const terminal = await waitForTerminal(terminalPushed, task.id);
-        assert.equal(terminal.status, 'completed');
+        assert.equal(terminal.status, "completed");
         return { terminal, harness: h };
       } finally {
         unsubscribeTerminal();
@@ -892,41 +987,44 @@ void describe('background EventBus protocol', () => {
       }
     }
 
-    const empty = await runCase({ label: 'empty' });
+    const empty = await runCase({ label: "empty" });
     assert.ok(
-      !Object.prototype.hasOwnProperty.call(empty.terminal, 'summaryTail'),
-      'empty output must not fabricate a summary tail',
+      !Object.prototype.hasOwnProperty.call(empty.terminal, "summaryTail"),
+      "empty output must not fabricate a summary tail",
     );
 
-    const withOutput = await runCase({ label: 'with-output', withOutput: true });
+    const withOutput = await runCase({
+      label: "with-output",
+      withOutput: true,
+    });
     assert.ok(
       withOutput.terminal.summaryTail !== undefined,
-      'completed task output must carry summaryTail',
+      "completed task output must carry summaryTail",
     );
     assert.ok(
-      Buffer.byteLength(withOutput.terminal.summaryTail, 'utf8') <=
-      TERMINAL_SUMMARY_TAIL_BYTES,
-      'summaryTail must stay within 64KiB',
+      Buffer.byteLength(withOutput.terminal.summaryTail, "utf8") <=
+        TERMINAL_SUMMARY_TAIL_BYTES,
+      "summaryTail must stay within 64KiB",
     );
     assert.equal(
       withOutput.terminal.summaryTail,
-      'z'.repeat(TERMINAL_SUMMARY_TAIL_BYTES),
-      'summaryTail must be the bounded tail of the output file',
+      "z".repeat(TERMINAL_SUMMARY_TAIL_BYTES),
+      "summaryTail must be the bounded tail of the output file",
     );
   });
 
-  void it('unifies the usage snapshot shape with dock telemetry and omits unavailable fields', async () => {
+  void it("unifies the usage snapshot shape with dock telemetry and omits unavailable fields", async () => {
     const h = await createHarness();
     const terminals: BackgroundTaskExtensionTerminal[] = [];
     const unsubscribe = h.bus.on(BG_TERMINAL_CHANNEL, (data) => {
       const terminal = requireTerminal(data);
       terminals.push(terminal);
     });
-    const base = (status: 'completed' | 'failed'): BgTaskSnapshot => ({
-      id: 'busage1',
-      command: 'pi --mode json -p probe',
+    const base = (status: "completed" | "failed"): BgTaskSnapshot => ({
+      id: "busage1",
+      command: "pi --mode json -p probe",
       status,
-      outputPath: '.pi/tasks/unit/busage1.output',
+      outputPath: ".pi/tasks/unit/busage1.output",
       cwd: h.ctx.cwd,
       startTime: 1000,
       endTime: 7000,
@@ -939,7 +1037,7 @@ void describe('background EventBus protocol', () => {
     });
     try {
       const rich: BgTaskSnapshot = {
-        ...base('completed'),
+        ...base("completed"),
         tokenUsage: {
           input: 10,
           output: 5,
@@ -951,8 +1049,11 @@ void describe('background EventBus protocol', () => {
       };
       h.service.publishTerminal({ task: rich });
       const richTerminal = terminals[0];
-      assert.ok(richTerminal !== undefined, 'rich publication must settle a terminal');
-      assert.ok(richTerminal.usage, 'rich task must carry a usage snapshot');
+      assert.ok(
+        richTerminal !== undefined,
+        "rich publication must settle a terminal",
+      );
+      assert.ok(richTerminal.usage, "rich task must carry a usage snapshot");
       assert.equal(richTerminal.usage.durationMs, 6000);
       assert.deepEqual(richTerminal.usage.modelUsage, {
         inputTokens: 10,
@@ -964,26 +1065,32 @@ void describe('background EventBus protocol', () => {
       assert.equal(richTerminal.usage.toolUseCount, 3);
       assert.equal(richTerminal.usage.totalTokens, 18);
 
-      const plain: BgTaskSnapshot = base('failed');
+      const plain: BgTaskSnapshot = base("failed");
       h.service.publishTerminal({ task: plain });
       const plainTerminal = terminals[1];
-      assert.ok(plainTerminal !== undefined, 'plain publication must settle a terminal');
-      assert.ok(plainTerminal.usage, 'terminal task must always carry real durationMs');
+      assert.ok(
+        plainTerminal !== undefined,
+        "plain publication must settle a terminal",
+      );
+      assert.ok(
+        plainTerminal.usage,
+        "terminal task must always carry real durationMs",
+      );
       assert.equal(plainTerminal.usage.durationMs, 6000);
       assert.equal(
         plainTerminal.usage.modelUsage,
         undefined,
-        'missing telemetry reports unavailable, not fabricated zeros',
+        "missing telemetry reports unavailable, not fabricated zeros",
       );
       assert.equal(
         plainTerminal.usage.toolUseCount,
         undefined,
-        'missing telemetry reports unavailable, not fabricated zeros',
+        "missing telemetry reports unavailable, not fabricated zeros",
       );
       assert.equal(
         plainTerminal.usage.totalTokens,
         undefined,
-        'missing telemetry reports unavailable, not fabricated zeros',
+        "missing telemetry reports unavailable, not fabricated zeros",
       );
     } finally {
       unsubscribe();
@@ -992,12 +1099,14 @@ void describe('background EventBus protocol', () => {
     }
   });
 
-  void it('does not spawn or answer an EventBus run whose admission resumes after shutdown', async () => {
+  void it("does not spawn or answer an EventBus run whose admission resumes after shutdown", async () => {
     const h = await createProtocolHarness();
     const entered = deferred<void>();
     const release = deferred<void>();
     const responses: BackgroundTaskExtensionResponse[] = [];
-    const originalEnsureRuntimeDir = h.registry.ensureRuntimeDir.bind(h.registry);
+    const originalEnsureRuntimeDir = h.registry.ensureRuntimeDir.bind(
+      h.registry,
+    );
     h.registry.ensureRuntimeDir = async (ctx) => {
       entered.resolve(undefined);
       await release.promise;
@@ -1009,11 +1118,11 @@ void describe('background EventBus protocol', () => {
     try {
       h.bus.emit(BG_REQUEST_CHANNEL, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'inflight-shutdown-run',
-        operation: 'run',
+        request_id: "inflight-shutdown-run",
+        operation: "run",
         payload: {
-          name: 'In-flight shutdown',
-          command: 'node delayed-admission.js',
+          name: "In-flight shutdown",
+          command: "node delayed-admission.js",
           isAgent: false,
           notifyOnCompletion: false,
           triggerOnCompletion: false,
@@ -1026,36 +1135,56 @@ void describe('background EventBus protocol', () => {
       release.resolve(undefined);
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      assert.equal(h.children.length, 0, 'closed admissions must not create a child');
-      assert.equal(h.registry.allTasks().length, 0, 'closed preflight must not retain a task');
-      const matching = responses.filter(
-        (response) => response.request_id === 'inflight-shutdown-run',
+      assert.equal(
+        h.children.length,
+        0,
+        "closed admissions must not create a child",
       );
-      assert.equal(matching.length, 1, 'the accepted in-flight request must settle once');
-      assert.equal(matching[0]?.ok, false, 'post-close admission may report only failure');
+      assert.equal(
+        h.registry.allTasks().length,
+        0,
+        "closed preflight must not retain a task",
+      );
+      const matching = responses.filter(
+        (response) => response.request_id === "inflight-shutdown-run",
+      );
+      assert.equal(
+        matching.length,
+        1,
+        "the accepted in-flight request must settle once",
+      );
+      assert.equal(
+        matching[0]?.ok,
+        false,
+        "post-close admission may report only failure",
+      );
     } finally {
       release.resolve(undefined);
       unsubscribeResponse();
       h.registry.ensureRuntimeDir = originalEnsureRuntimeDir;
-      for (const child of h.children) child.close(null, 'SIGTERM');
+      for (const child of h.children) child.close(null, "SIGTERM");
       h.close();
       await new Promise((resolve) => setTimeout(resolve, 25));
       await rm(h.root, { recursive: true, force: true });
     }
   });
 
-  void it('keeps shutdown ownership of a spawned child while its admission finishes metadata', async () => {
+  void it("keeps shutdown ownership of a spawned child while its admission finishes metadata", async () => {
     const h = await createProtocolHarness();
     const enteredMetadata = deferred<void>();
     const releaseMetadata = deferred<void>();
     const responses: BackgroundTaskExtensionResponse[] = [];
-    const originalWriteMetadata = Reflect.get(h.registry, 'writeMetadata');
-    if (typeof originalWriteMetadata !== 'function') assert.fail('writeMetadata must be callable');
+    const originalWriteMetadata = Reflect.get(h.registry, "writeMetadata");
+    if (typeof originalWriteMetadata !== "function")
+      assert.fail("writeMetadata must be callable");
     let metadataCalls = 0;
     Reflect.set(
       h.registry,
-      'writeMetadata',
-      async function (this: BackgroundTaskRegistry, task: unknown): Promise<void> {
+      "writeMetadata",
+      async function (
+        this: BackgroundTaskRegistry,
+        task: unknown,
+      ): Promise<void> {
         metadataCalls += 1;
         if (metadataCalls === 1) {
           enteredMetadata.resolve(undefined);
@@ -1070,24 +1199,28 @@ void describe('background EventBus protocol', () => {
     try {
       h.bus.emit(BG_REQUEST_CHANNEL, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'spawned-admission-shutdown',
-        operation: 'run',
+        request_id: "spawned-admission-shutdown",
+        operation: "run",
         payload: {
-          name: 'Spawned admission shutdown',
-          command: 'node admitted-before-shutdown.js',
+          name: "Spawned admission shutdown",
+          command: "node admitted-before-shutdown.js",
           isAgent: false,
           notifyOnCompletion: false,
           triggerOnCompletion: false,
         },
       });
       await enteredMetadata.promise;
-      assert.equal(h.children.length, 1, 'the child must be committed before shutdown');
+      assert.equal(
+        h.children.length,
+        1,
+        "the child must be committed before shutdown",
+      );
 
       h.registry.setShuttingDown(true);
       h.close();
       await waitForCondition(
         () => (h.children[0]?.killCalls.length ?? 0) > 0,
-        'admission-owned child cancellation while metadata remains blocked',
+        "admission-owned child cancellation while metadata remains blocked",
       );
       const admissionDrain = h.registry.waitForTaskAdmissions();
       const drainedBeforeMetadataSettled = await Promise.race([
@@ -1097,88 +1230,118 @@ void describe('background EventBus protocol', () => {
       assert.equal(
         drainedBeforeMetadataSettled,
         false,
-        'shutdown must retain ownership of an unabortable in-flight metadata operation',
+        "shutdown must retain ownership of an unabortable in-flight metadata operation",
       );
       releaseMetadata.resolve(undefined);
       await admissionDrain;
       const stopped = await h.registry.stopAllRunning(
-        'shutdown',
-        'Killed during admission ownership test',
+        "shutdown",
+        "Killed during admission ownership test",
       );
       assert.equal(stopped.failures.length, 0);
       await waitForCondition(
-        () => h.registry.allTasks()[0]?.status === 'killed',
-        'owned child shutdown terminal',
+        () => h.registry.allTasks()[0]?.status === "killed",
+        "owned child shutdown terminal",
       );
-      assert.ok(h.children[0]?.killCalls.length, 'shutdown must terminate the owned child');
+      assert.ok(
+        h.children[0]?.killCalls.length,
+        "shutdown must terminate the owned child",
+      );
 
       await waitForCondition(
         () =>
-          responses.some((response) => response.request_id === 'spawned-admission-shutdown'),
-        'spawned admission failure response',
+          responses.some(
+            (response) => response.request_id === "spawned-admission-shutdown",
+          ),
+        "spawned admission failure response",
       );
       const response = responses.find(
-        (entry) => entry.request_id === 'spawned-admission-shutdown',
+        (entry) => entry.request_id === "spawned-admission-shutdown",
       );
-      assert.equal(response?.ok, false, 'a finishing admission cannot report post-close success');
-      assert.equal(h.registry.allTasks()[0]?.status, 'killed');
+      assert.equal(
+        response?.ok,
+        false,
+        "a finishing admission cannot report post-close success",
+      );
+      assert.equal(h.registry.allTasks()[0]?.status, "killed");
     } finally {
       releaseMetadata.resolve(undefined);
       unsubscribeResponse();
-      Reflect.set(h.registry, 'writeMetadata', originalWriteMetadata);
-      for (const child of h.children) child.close(null, 'SIGTERM');
+      Reflect.set(h.registry, "writeMetadata", originalWriteMetadata);
+      for (const child of h.children) child.close(null, "SIGTERM");
       h.close();
       await rm(h.root, { recursive: true, force: true });
     }
   });
 
-  void it('settles reentrant service close truthfully for emitter returns and throws', async () => {
+  void it("settles reentrant service close truthfully for emitter returns and throws", async () => {
     async function runCase(throwsAfterClose: boolean): Promise<void> {
       const h = await createProtocolHarness();
       let listenerCalls = 0;
       const unsubscribeTerminal = h.bus.on(BG_TERMINAL_CHANNEL, () => {
         listenerCalls += 1;
         h.service.close();
-        if (throwsAfterClose) throw new Error('reentrant close listener threw');
+        if (throwsAfterClose) throw new Error("reentrant close listener threw");
       });
       try {
-        const requestId = throwsAfterClose ? 'reentrant-close-throw' : 'reentrant-close-return';
+        const requestId = throwsAfterClose
+          ? "reentrant-close-throw"
+          : "reentrant-close-return";
         const run = await emitRequest(h.bus, {
           schema_version: BG_REQUEST_SCHEMA,
           request_id: requestId,
-          operation: 'run',
+          operation: "run",
           payload: {
             name: requestId,
-            command: 'echo reentrant-close',
+            command: "echo reentrant-close",
             isAgent: false,
             notifyOnCompletion: false,
             triggerOnCompletion: false,
           },
         });
-        assert.equal(run.ok, true, run.ok ? 'ok' : run.error);
-        const taskId = requireTask(run.ok ? run.result : undefined, requestId).id;
+        assert.equal(run.ok, true, run.ok ? "ok" : run.error);
+        const taskId = requireTask(
+          run.ok ? run.result : undefined,
+          requestId,
+        ).id;
         h.children[0]?.close(0, null);
         await waitForCondition(
-          () => h.registry.resolveTask(taskId).terminalPublicationState !== 'pending',
+          () =>
+            h.registry.resolveTask(taskId).terminalPublicationState !==
+            "pending",
           `${requestId} settlement`,
         );
 
         const task = h.registry.resolveTask(taskId);
         assert.equal(listenerCalls, 1);
-        assert.equal(h.service.state, 'closed');
+        assert.equal(h.service.state, "closed");
         assert.equal(task.terminalPublishAttempts, 1);
         assert.equal(task.terminalPublishRetryHandle, undefined);
         if (throwsAfterClose) {
-          assert.equal(task.terminalPublicationState, 'abandoned');
-          assert.equal(task.terminalPublicationAbandonReason, 'publisher_closed');
+          assert.equal(task.terminalPublicationState, "abandoned");
+          assert.equal(
+            task.terminalPublicationAbandonReason,
+            "publisher_closed",
+          );
           assert.equal(task.terminalPublished, false);
-          assert.equal(h.errors.length, 1, 'throwing close settles with one diagnostic');
-          assert.match(h.errors.flat().join(' '), /reentrant close listener threw/);
+          assert.equal(
+            h.errors.length,
+            1,
+            "throwing close settles with one diagnostic",
+          );
+          assert.match(
+            h.errors.flat().join(" "),
+            /reentrant close listener threw/,
+          );
         } else {
-          assert.equal(task.terminalPublicationState, 'delivered');
+          assert.equal(task.terminalPublicationState, "delivered");
           assert.equal(task.terminalPublicationAbandonReason, undefined);
           assert.equal(task.terminalPublished, true);
-          assert.equal(h.errors.length, 0, 'successful emit must not log abandonment');
+          assert.equal(
+            h.errors.length,
+            0,
+            "successful emit must not log abandonment",
+          );
         }
       } finally {
         unsubscribeTerminal();
@@ -1191,47 +1354,64 @@ void describe('background EventBus protocol', () => {
     await runCase(true);
   });
 
-  void it('bounds genuine listener failures with documented at-least-once delivery', async () => {
+  void it("bounds genuine listener failures with documented at-least-once delivery", async () => {
     const h = await createProtocolHarness();
     const received: BackgroundTaskExtensionTerminal[] = [];
     const unsubscribeReceiver = h.bus.on(BG_TERMINAL_CHANNEL, (data) => {
       received.push(requireTerminal(data));
     });
     const unsubscribeFailure = h.bus.on(BG_TERMINAL_CHANNEL, () => {
-      throw new Error('later terminal listener failed');
+      throw new Error("later terminal listener failed");
     });
     let taskId: string | undefined;
     try {
       const run = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'listener-failure-run',
-        operation: 'run',
+        request_id: "listener-failure-run",
+        operation: "run",
         payload: {
-          name: 'Listener Failure',
-          command: 'echo listener-failure',
+          name: "Listener Failure",
+          command: "echo listener-failure",
           isAgent: false,
           notifyOnCompletion: false,
           triggerOnCompletion: false,
         },
       });
-      assert.equal(run.ok, true, run.ok ? 'ok' : run.error);
-      taskId = requireTask(run.ok ? run.result : undefined, 'listener failure task').id;
+      assert.equal(run.ok, true, run.ok ? "ok" : run.error);
+      taskId = requireTask(
+        run.ok ? run.result : undefined,
+        "listener failure task",
+      ).id;
       h.children[0]?.close(0, null);
 
-      await waitForCondition(() => received.length >= 3, 'three bounded listener deliveries');
+      await waitForCondition(
+        () => received.length >= 3,
+        "three bounded listener deliveries",
+      );
       await new Promise((resolve) => setTimeout(resolve, 180));
       const task = h.registry.resolveTask(taskId);
-      assert.equal(received.length, 3, 'persistent emit failure must stop after three attempts');
+      assert.equal(
+        received.length,
+        3,
+        "persistent emit failure must stop after three attempts",
+      );
       assert.deepEqual(
         received.map((entry) => entry.task.id),
         [taskId, taskId, taskId],
-        'an earlier listener can observe duplicate at-least-once frames',
+        "an earlier listener can observe duplicate at-least-once frames",
       );
       assert.notEqual(task.terminalPublished, true);
-      assert.equal(Reflect.get(task, 'terminalPublicationState'), 'abandoned');
-      assert.equal(Reflect.get(task, 'terminalPublicationAbandonReason'), 'retry_exhausted');
+      assert.equal(Reflect.get(task, "terminalPublicationState"), "abandoned");
+      assert.equal(
+        Reflect.get(task, "terminalPublicationAbandonReason"),
+        "retry_exhausted",
+      );
       assert.equal(task.terminalPublishRetryHandle, undefined);
-      assert.equal(h.errors.length, 3, 'publisher diagnostics must be bounded with attempts');
+      assert.equal(
+        h.errors.length,
+        3,
+        "publisher diagnostics must be bounded with attempts",
+      );
     } finally {
       unsubscribeFailure();
       unsubscribeReceiver();
@@ -1241,7 +1421,7 @@ void describe('background EventBus protocol', () => {
           clearTimeout(task.terminalPublishRetryHandle);
         task.terminalPublishRetryHandle = undefined;
         // Baseline-only cleanup: stop its unbounded retry after preserving red evidence.
-        if (Reflect.get(task, 'terminalPublicationState') === undefined)
+        if (Reflect.get(task, "terminalPublicationState") === undefined)
           task.terminalPublished = true;
       }
       h.close();
@@ -1249,53 +1429,71 @@ void describe('background EventBus protocol', () => {
     }
   });
 
-  void it('uses a typed closed-service error and disposes registry publication retries', async () => {
+  void it("uses a typed closed-service error and disposes registry publication retries", async () => {
     const h = await createProtocolHarness();
     const unsubscribeFailure = h.bus.on(BG_TERMINAL_CHANNEL, () => {
-      throw new Error('terminal listener failed before close');
+      throw new Error("terminal listener failed before close");
     });
     let taskId: string | undefined;
     try {
       const run = await emitRequest(h.bus, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'close-retry-run',
-        operation: 'run',
+        request_id: "close-retry-run",
+        operation: "run",
         payload: {
-          name: 'Close Retry',
-          command: 'echo close-retry',
+          name: "Close Retry",
+          command: "echo close-retry",
           isAgent: false,
           notifyOnCompletion: false,
           triggerOnCompletion: false,
         },
       });
-      assert.equal(run.ok, true, run.ok ? 'ok' : run.error);
-      const snapshot = requireTask(run.ok ? run.result : undefined, 'close retry task');
+      assert.equal(run.ok, true, run.ok ? "ok" : run.error);
+      const snapshot = requireTask(
+        run.ok ? run.result : undefined,
+        "close retry task",
+      );
       taskId = snapshot.id;
       h.children[0]?.close(0, null);
       const task = h.registry.resolveTask(taskId);
       await waitForCondition(
         () => task.terminalPublishRetryHandle !== undefined,
-        'publication retry before service close',
+        "publication retry before service close",
       );
 
-      assert.equal(h.service.state, 'open');
+      assert.equal(h.service.state, "open");
       h.close();
-      assert.equal(h.service.state, 'closed');
-      assert.equal(task.terminalPublishRetryHandle, undefined, 'service close cancels old timer');
-      assert.notEqual(task.terminalPublished, true, 'service close is abandonment, not delivery');
-      assert.equal(Reflect.get(task, 'terminalPublicationState'), 'abandoned');
-      assert.equal(Reflect.get(task, 'terminalPublicationAbandonReason'), 'publisher_closed');
+      assert.equal(h.service.state, "closed");
+      assert.equal(
+        task.terminalPublishRetryHandle,
+        undefined,
+        "service close cancels old timer",
+      );
+      assert.notEqual(
+        task.terminalPublished,
+        true,
+        "service close is abandonment, not delivery",
+      );
+      assert.equal(Reflect.get(task, "terminalPublicationState"), "abandoned");
+      assert.equal(
+        Reflect.get(task, "terminalPublicationAbandonReason"),
+        "publisher_closed",
+      );
       assert.equal(task.terminalPublicationGate, undefined);
       assert.equal(task.terminalPublishInFlight, false);
       assert.throws(
         () => h.service.publishTerminal({ task: snapshot }),
         (error: unknown) =>
           error instanceof Error &&
-          error.name === 'BackgroundTaskExtensionServiceClosedError' &&
-          Reflect.get(error, 'code') === 'pi_background_tasks_eventbus_closed',
+          error.name === "BackgroundTaskExtensionServiceClosedError" &&
+          Reflect.get(error, "code") === "pi_background_tasks_eventbus_closed",
       );
       await new Promise((resolve) => setTimeout(resolve, 250));
-      assert.equal(h.errors.length, 2, 'close may add one abandonment diagnostic but no flood');
+      assert.equal(
+        h.errors.length,
+        2,
+        "close may add one abandonment diagnostic but no flood",
+      );
     } finally {
       unsubscribeFailure();
       if (taskId !== undefined) {
@@ -1304,7 +1502,7 @@ void describe('background EventBus protocol', () => {
           clearTimeout(task.terminalPublishRetryHandle);
         task.terminalPublishRetryHandle = undefined;
         // Baseline-only cleanup: stop its unbounded retry after preserving red evidence.
-        if (Reflect.get(task, 'terminalPublicationState') === undefined)
+        if (Reflect.get(task, "terminalPublicationState") === undefined)
           task.terminalPublished = true;
       }
       h.close();
@@ -1312,15 +1510,15 @@ void describe('background EventBus protocol', () => {
     }
   });
 
-  void it('unsubscribes cleanly when the service closes', async () => {
+  void it("unsubscribes cleanly when the service closes", async () => {
     const h = await createHarness();
     try {
       h.close();
-      const pending = waitForResponse(h.bus, 'after-close');
+      const pending = waitForResponse(h.bus, "after-close");
       h.bus.emit(BG_REQUEST_CHANNEL, {
         schema_version: BG_REQUEST_SCHEMA,
-        request_id: 'after-close',
-        operation: 'capabilities',
+        request_id: "after-close",
+        operation: "capabilities",
         payload: {},
       });
       await assert.rejects(pending, /timed out/u);

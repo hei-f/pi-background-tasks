@@ -150,12 +150,17 @@ void describe(
         await makeFakeNu(firstNu, firstArgv);
         await makeFakeNu(secondNu, secondArgv);
 
-        const previousShell = process.env["SHELL"];
-        const previousPolicy = process.env["PI_BG_POSIX_SHELL"];
-        const previousPath = process.env["PI_BG_POSIX_SHELL_PATH"];
-        delete process.env["PI_BG_POSIX_SHELL"];
-        delete process.env["PI_BG_POSIX_SHELL_PATH"];
-        process.env["SHELL"] = firstNu;
+        // S3 P5:运行时目录迁宿主私有 getAgentDir()——测试进程内重定向到临时 agent 目录
+        const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+        process.env["PI_CODING_AGENT_DIR"] = agentDir;
+        // P1 同源链:env.SHELL 不再驱动后台 spawn——经宿主用户级 settings.json 的
+        // shellPath 在激活期注入 firstNu(hostShellPath 链;S1 激活期一次性解析,
+        // 激活后改写文件模拟"配置变更",验证代理期稳定与 reload 重读)。
+        await writeFile(
+          join(agentDir, "settings.json"),
+          JSON.stringify({ shellPath: firstNu }),
+          "utf8",
+        );
 
         const eventBus = createEventBus();
         const terminals = new Map<string, JsonObject>();
@@ -202,7 +207,12 @@ void describe(
             onError: (error) => assert.fail(String(error)),
           });
 
-          process.env["SHELL"] = secondNu;
+          // 激活后改写用户级 settings:live 策略不得漂移(S1 激活期一次性解析)
+          await writeFile(
+            join(agentDir, "settings.json"),
+            JSON.stringify({ shellPath: secondNu }),
+            "utf8",
+          );
           const commandOne = `printf '%s\\n' 'first activation Ω with spaces'`;
           const first = await run(eventBus, "immutable-first", commandOne);
           const firstId = String(first["id"]);
@@ -222,10 +232,11 @@ void describe(
           assert.equal(
             existsSync(secondArgv),
             false,
-            "env mutation must not drift this activation",
+            "settings mutation must not drift this activation",
           );
+          // P4:outputPath 已绝对化——直接按快照路径读取
           assert.match(
-            await readFile(join(cwd, String(first["outputPath"])), "utf8"),
+            await readFile(String(first["outputPath"]), "utf8"),
             /first activation Ω/u,
           );
 
@@ -247,7 +258,7 @@ void describe(
             commandTwo,
           ]);
           assert.match(
-            await readFile(join(cwd, String(second["outputPath"])), "utf8"),
+            await readFile(String(second["outputPath"]), "utf8"),
             /reloaded activation Ω/u,
           );
         } finally {
@@ -258,9 +269,7 @@ void describe(
               .catch(() => undefined);
             session.dispose();
           }
-          restoreEnv("SHELL", previousShell);
-          restoreEnv("PI_BG_POSIX_SHELL", previousPolicy);
-          restoreEnv("PI_BG_POSIX_SHELL_PATH", previousPath);
+          restoreEnv("PI_CODING_AGENT_DIR", previousAgentDir);
           await rm(root, { recursive: true, force: true });
         }
       },

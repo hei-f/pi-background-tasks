@@ -1,88 +1,94 @@
-import { describe, it } from 'node:test';
-import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { Theme, type ThemeColor } from '@earendil-works/pi-coding-agent';
-import { visibleWidth } from '@earendil-works/pi-tui';
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   BackgroundTasksManager,
   type BackgroundTaskForUi,
-} from '../../src/ui/background-tasks-manager.js';
-import { stripAnsi } from '../helpers/normalize.js';
+} from "../../src/ui/background-tasks-manager.js";
+import { stripAnsi } from "../helpers/normalize.js";
 
 const themeColors: readonly ThemeColor[] = [
-  'accent',
-  'border',
-  'borderAccent',
-  'borderMuted',
-  'success',
-  'error',
-  'warning',
-  'muted',
-  'dim',
-  'text',
-  'thinkingText',
-  'userMessageText',
-  'customMessageText',
-  'customMessageLabel',
-  'toolTitle',
-  'toolOutput',
-  'mdHeading',
-  'mdLink',
-  'mdLinkUrl',
-  'mdCode',
-  'mdCodeBlock',
-  'mdCodeBlockBorder',
-  'mdQuote',
-  'mdQuoteBorder',
-  'mdHr',
-  'mdListBullet',
-  'toolDiffAdded',
-  'toolDiffRemoved',
-  'toolDiffContext',
-  'syntaxComment',
-  'syntaxKeyword',
-  'syntaxFunction',
-  'syntaxVariable',
-  'syntaxString',
-  'syntaxNumber',
-  'syntaxType',
-  'syntaxOperator',
-  'syntaxPunctuation',
-  'thinkingOff',
-  'thinkingMinimal',
-  'thinkingLow',
-  'thinkingMedium',
-  'thinkingHigh',
-  'thinkingXhigh',
-  'bashMode',
+  "accent",
+  "border",
+  "borderAccent",
+  "borderMuted",
+  "success",
+  "error",
+  "warning",
+  "muted",
+  "dim",
+  "text",
+  "thinkingText",
+  "userMessageText",
+  "customMessageText",
+  "customMessageLabel",
+  "toolTitle",
+  "toolOutput",
+  "mdHeading",
+  "mdLink",
+  "mdLinkUrl",
+  "mdCode",
+  "mdCodeBlock",
+  "mdCodeBlockBorder",
+  "mdQuote",
+  "mdQuoteBorder",
+  "mdHr",
+  "mdListBullet",
+  "toolDiffAdded",
+  "toolDiffRemoved",
+  "toolDiffContext",
+  "syntaxComment",
+  "syntaxKeyword",
+  "syntaxFunction",
+  "syntaxVariable",
+  "syntaxString",
+  "syntaxNumber",
+  "syntaxType",
+  "syntaxOperator",
+  "syntaxPunctuation",
+  "thinkingOff",
+  "thinkingMinimal",
+  "thinkingLow",
+  "thinkingMedium",
+  "thinkingHigh",
+  "thinkingXhigh",
+  "bashMode",
 ];
 const themeBackgrounds = [
-  'selectedBg',
-  'userMessageBg',
-  'customMessageBg',
-  'toolPendingBg',
-  'toolSuccessBg',
-  'toolErrorBg',
+  "selectedBg",
+  "userMessageBg",
+  "customMessageBg",
+  "toolPendingBg",
+  "toolSuccessBg",
+  "toolErrorBg",
 ] as const;
 type ThemeForegrounds = ConstructorParameters<typeof Theme>[0];
 type ThemeBackgrounds = ConstructorParameters<typeof Theme>[1];
 const theme = new Theme(
-  Object.fromEntries(themeColors.map((color) => [color, '#ffffff'])) as ThemeForegrounds,
-  Object.fromEntries(themeBackgrounds.map((color) => [color, '#000000'])) as ThemeBackgrounds,
-  'truecolor',
+  Object.fromEntries(
+    themeColors.map((color) => [color, "#ffffff"]),
+  ) as ThemeForegrounds,
+  Object.fromEntries(
+    themeBackgrounds.map((color) => [color, "#000000"]),
+  ) as ThemeBackgrounds,
+  "truecolor",
 );
 
-function task(overrides: Partial<BackgroundTaskForUi> = {}): BackgroundTaskForUi {
+function task(
+  overrides: Partial<BackgroundTaskForUi> = {},
+): BackgroundTaskForUi {
   const now = Date.now();
   return {
-    id: 'b12345678',
-    name: 'Component Task',
-    command: 'printf component-ok',
-    status: 'running',
-    outputPath: '.pi/tasks/test/b12345678.output',
-    outputAbsPath: join(tmpdir(), 'missing-output'),
+    id: "b12345678",
+    name: "Component Task",
+    command: "printf component-ok",
+    status: "running",
+    outputPath: join(tmpdir(), "pi-bg-test", "b12345678.output"),
+    outputAbsPath: join(tmpdir(), "missing-output"),
     cwd: tmpdir(),
     startTime: now - 1000,
     bytesWritten: 0,
@@ -96,7 +102,9 @@ function task(overrides: Partial<BackgroundTaskForUi> = {}): BackgroundTaskForUi
 }
 
 function manager(
-  options: Partial<ConstructorParameters<typeof BackgroundTasksManager>[3]> = {},
+  options: Partial<
+    ConstructorParameters<typeof BackgroundTasksManager>[3]
+  > = {},
   tasks: BackgroundTaskForUi[] = [task()],
 ) {
   let closed = false;
@@ -118,15 +126,15 @@ function manager(
       getTasks: () => tasks,
       stopTask: (t) => {
         stopped.push(t.id);
-        t.status = 'killed';
+        t.status = "killed";
         t.endTime = Date.now();
         return Promise.resolve();
       },
       stopAllRunning: () => {
-        const running = tasks.filter((t) => t.status === 'running');
+        const running = tasks.filter((t) => t.status === "running");
         for (const t of running) {
           stopped.push(t.id);
-          t.status = 'killed';
+          t.status = "killed";
           t.endTime = Date.now();
         }
         return Promise.resolve({ stopped: running.length, failures: [] });
@@ -139,13 +147,18 @@ function manager(
           startTime: Date.now(),
         };
         if (t.description !== undefined) overrides.description = t.description;
-        if (t.timeoutSeconds !== undefined) overrides.timeoutSeconds = t.timeoutSeconds;
+        if (t.timeoutSeconds !== undefined)
+          overrides.timeoutSeconds = t.timeoutSeconds;
         const rerun = task(overrides);
         tasks.unshift(rerun);
         return Promise.resolve(rerun);
       },
       startBackgroundTask: (command) => {
-        const started = task({ id: `bg-start-${String(tasks.length)}`, name: 'Dock Start', command });
+        const started = task({
+          id: `bg-start-${String(tasks.length)}`,
+          name: "Dock Start",
+          command,
+        });
         tasks.unshift(started);
         return Promise.resolve(started);
       },
@@ -177,22 +190,23 @@ function manager(
 }
 
 function assertWidth(lines: string[], width: number) {
-  for (const line of lines) assert.ok(visibleWidth(stripAnsi(line)) <= width, line);
+  for (const line of lines)
+    assert.ok(visibleWidth(stripAnsi(line)) <= width, line);
 }
 
-void describe('BackgroundTasksManager component', () => {
-  void it('passes the selected survival flag to dock rerun and accepts a new id/nonce', async () => {
+void describe("BackgroundTasksManager component", () => {
+  void it("passes the selected survival flag to dock rerun and accepts a new id/nonce", async () => {
     const original = task({
-      id: 'bsurvive1',
+      id: "bsurvive1",
       surviveReload: true,
       reloadSurvival: {
-        schemaVersion: 'pi-background-tasks.reload-shell.v1',
-        authority: 'same-process-live-owner',
+        schemaVersion: "pi-background-tasks.reload-shell.v1",
+        authority: "same-process-live-owner",
         hostPid: process.pid,
-        sessionId: 'component',
+        sessionId: "component",
         cwdRealpath: tmpdir(),
-        launchNonce: '1'.repeat(32),
-        completionId: 'bsurvive1:1',
+        launchNonce: "1".repeat(32),
+        completionId: "bsurvive1:1",
         spawnedAt: 1,
         childPid: 100,
         outputCapBytes: 1024,
@@ -208,11 +222,11 @@ void describe('BackgroundTasksManager component', () => {
           return Promise.resolve(
             task({
               ...selected,
-              id: 'bsurvive2',
+              id: "bsurvive2",
               reloadSurvival: {
                 ...selected.reloadSurvival!,
-                launchNonce: '2'.repeat(32),
-                completionId: 'bsurvive2:1',
+                launchNonce: "2".repeat(32),
+                completionId: "bsurvive2:1",
               },
             }),
           );
@@ -221,11 +235,14 @@ void describe('BackgroundTasksManager component', () => {
       [original],
     );
     try {
-      h.instance.handleInput('R');
+      h.instance.handleInput("R");
       await new Promise((resolve) => setTimeout(resolve, 0));
       assert.equal(rerunInput?.id, original.id);
       assert.equal(rerunInput?.surviveReload, true);
-      assert.match(stripAnsi(h.instance.render(90).join('\n')), /Reran as .*\(bsurvive2\)/u);
+      assert.match(
+        stripAnsi(h.instance.render(90).join("\n")),
+        /Reran as .*\(bsurvive2\)/u,
+      );
     } finally {
       h.instance.dispose();
     }
@@ -239,8 +256,8 @@ void describe('BackgroundTasksManager component', () => {
         startBackgroundTask: (command) => {
           startedCommands.push(command.trim());
           const started = task({
-            id: 'bg-start-1',
-            name: 'Dock Start',
+            id: "bg-start-1",
+            name: "Dock Start",
             command,
           });
           tasks.unshift(started);
@@ -250,56 +267,53 @@ void describe('BackgroundTasksManager component', () => {
       tasks,
     );
     try {
-      h.instance.handleInput('b');
-      const compose = stripAnsi(h.instance.render(90).join('\n'));
+      h.instance.handleInput("b");
+      const compose = stripAnsi(h.instance.render(90).join("\n"));
       assert.match(compose, /Shell command to run in the background/u);
       assert.match(compose, /user entry/u);
 
-      for (const key of ['n', 'p', 'm', ' ', 'r', 'u', 'n']) {
+      for (const key of ["n", "p", "m", " ", "r", "u", "n"]) {
         h.instance.handleInput(key);
       }
-      assert.match(
-        stripAnsi(h.instance.render(90).join('\n')),
-        /npm run/u,
-      );
+      assert.match(stripAnsi(h.instance.render(90).join("\n")), /npm run/u);
 
-      h.instance.handleInput('\x7f');
-      h.instance.handleInput('\x7f');
+      h.instance.handleInput("\x7f");
+      h.instance.handleInput("\x7f");
       assert.match(
-        stripAnsi(h.instance.render(90).join('\n')),
+        stripAnsi(h.instance.render(90).join("\n")),
         /npm r/u,
-        'backspace 逐字符移除',
+        "backspace 逐字符移除",
       );
 
-      h.instance.handleInput('\r');
+      h.instance.handleInput("\r");
       await new Promise((resolve) => setTimeout(resolve, 0));
-      assert.deepEqual(startedCommands, ['npm r']);
-      const list = stripAnsi(h.instance.render(90).join('\n'));
+      assert.deepEqual(startedCommands, ["npm r"]);
+      const list = stripAnsi(h.instance.render(90).join("\n"));
       assert.match(list, /Started as Dock Start/u);
     } finally {
       h.instance.dispose();
     }
   });
 
-  void it('cancels dock background composition with Escape and rejects empty command', async () => {
+  void it("cancels dock background composition with Escape and rejects empty command", async () => {
     const h = manager({}, [task()]);
     try {
-      h.instance.handleInput('B');
-      h.instance.handleInput('\x1b');
-      const list = stripAnsi(h.instance.render(90).join('\n'));
-      assert.match(list, /bg tasks focused/u, '取消后回到列表视图');
+      h.instance.handleInput("B");
+      h.instance.handleInput("\x1b");
+      const list = stripAnsi(h.instance.render(90).join("\n"));
+      assert.match(list, /bg tasks focused/u, "取消后回到列表视图");
 
-      h.instance.handleInput('b');
-      h.instance.handleInput('\r');
+      h.instance.handleInput("b");
+      h.instance.handleInput("\r");
       await new Promise((resolve) => setTimeout(resolve, 0));
-      const empty = stripAnsi(h.instance.render(90).join('\n'));
+      const empty = stripAnsi(h.instance.render(90).join("\n"));
       assert.match(empty, /Background command is empty/u);
     } finally {
       h.instance.dispose();
     }
   });
 
-  void it('keeps the dock open while composing commands containing q/x letters and submits on Enter (REVIEW)', async () => {
+  void it("keeps the dock open while composing commands containing q/x letters and submits on Enter (REVIEW)", async () => {
     const startedCommands: string[] = [];
     const tasks = [task()];
     const h = manager(
@@ -307,8 +321,8 @@ void describe('BackgroundTasksManager component', () => {
         startBackgroundTask: (command) => {
           startedCommands.push(command.trim());
           const started = task({
-            id: 'bg-start-2',
-            name: 'Dock Start',
+            id: "bg-start-2",
+            name: "Dock Start",
             command,
           });
           tasks.unshift(started);
@@ -318,32 +332,32 @@ void describe('BackgroundTasksManager component', () => {
       tasks,
     );
     try {
-      h.instance.handleInput('b');
-      const open = stripAnsi(h.instance.render(90).join('\n'));
+      h.instance.handleInput("b");
+      const open = stripAnsi(h.instance.render(90).join("\n"));
       assert.match(open, /Shell command to run in the background/u);
-      assert.equal(h.closed, false, 'compose 输入态下 dock 不得关闭');
+      assert.equal(h.closed, false, "compose 输入态下 dock 不得关闭");
 
       // 逐字符输入含 q/x 字母的命令(q/x 关闭语义仅属列表/详情视图,compose 中是
       // 可打印字母,如 `chmod +x`、`exit`):任何一步输入都不得关闭 dock
       for (const key of [
-        'c',
-        'h',
-        'm',
-        'o',
-        'd',
-        ' ',
-        '+',
-        'x',
-        ' ',
-        'r',
-        'u',
-        'n',
-        '.',
-        's',
-        'h',
+        "c",
+        "h",
+        "m",
+        "o",
+        "d",
+        " ",
+        "+",
+        "x",
+        " ",
+        "r",
+        "u",
+        "n",
+        ".",
+        "s",
+        "h",
       ]) {
         h.instance.handleInput(key);
-        const rendered = stripAnsi(h.instance.render(90).join('\n'));
+        const rendered = stripAnsi(h.instance.render(90).join("\n"));
         assert.match(
           rendered,
           /Shell command to run in the background/u,
@@ -351,81 +365,81 @@ void describe('BackgroundTasksManager component', () => {
         );
       }
       assert.match(
-        stripAnsi(h.instance.render(90).join('\n')),
+        stripAnsi(h.instance.render(90).join("\n")),
         /chmod \+x run\.sh/u,
-        'q/x 字母逐字符进入 compose 缓冲',
+        "q/x 字母逐字符进入 compose 缓冲",
       );
-      assert.equal(h.closed, false, 'q/x 字母输入不得关闭 dock');
+      assert.equal(h.closed, false, "q/x 字母输入不得关闭 dock");
 
-      h.instance.handleInput('\r');
+      h.instance.handleInput("\r");
       await new Promise((resolve) => setTimeout(resolve, 0));
       assert.match(
-        stripAnsi(h.instance.render(90).join('\n')),
+        stripAnsi(h.instance.render(90).join("\n")),
         /Started as Dock Start/u,
-        'Enter 提交含 q/x 字母的命令',
+        "Enter 提交含 q/x 字母的命令",
       );
 
       // 另一条以 x 开头的命令同样保持 compose 打开并提交
-      h.instance.handleInput('b');
-      for (const key of ['e', 'x', 'i', 't']) {
+      h.instance.handleInput("b");
+      for (const key of ["e", "x", "i", "t"]) {
         h.instance.handleInput(key);
-        const rendered = stripAnsi(h.instance.render(90).join('\n'));
+        const rendered = stripAnsi(h.instance.render(90).join("\n"));
         assert.match(rendered, /Shell command to run in the background/u);
       }
-      assert.equal(h.closed, false, '`exit` 输入不得关闭 dock');
-      h.instance.handleInput('\r');
+      assert.equal(h.closed, false, "`exit` 输入不得关闭 dock");
+      h.instance.handleInput("\r");
       await new Promise((resolve) => setTimeout(resolve, 0));
-      assert.deepEqual(startedCommands, ['chmod +x run.sh', 'exit']);
+      assert.deepEqual(startedCommands, ["chmod +x run.sh", "exit"]);
     } finally {
       h.instance.dispose();
     }
   });
 
-  void it('renders list within width and handles selection/actions', async () => {
+  void it("renders list within width and handles selection/actions", async () => {
     const baseTime = Date.now();
     const tasks = [
-      task({ id: 'b11111111', name: 'First Task', startTime: baseTime + 1000 }),
-      task({ id: 'b22222222', name: 'Second Task', startTime: baseTime }),
+      task({ id: "b11111111", name: "First Task", startTime: baseTime + 1000 }),
+      task({ id: "b22222222", name: "Second Task", startTime: baseTime }),
     ];
     const h = manager({}, tasks);
     try {
       const lines = h.instance.render(90);
-      assert.match(stripAnsi(lines.join('\n')), /bg tasks focused/);
-      assert.match(stripAnsi(lines.join('\n')), /First Task/);
+      assert.match(stripAnsi(lines.join("\n")), /bg tasks focused/);
+      assert.match(stripAnsi(lines.join("\n")), /First Task/);
       assertWidth(lines, 90);
 
-      h.instance.handleInput('\x1b[B');
-      h.instance.handleInput('k');
+      h.instance.handleInput("\x1b[B");
+      h.instance.handleInput("k");
       await new Promise((resolve) => setTimeout(resolve, 0));
-      assert.deepEqual(h.stopped, ['b22222222']);
+      assert.deepEqual(h.stopped, ["b22222222"]);
 
-      h.instance.handleInput('h');
-      h.instance.handleInput('R');
+      h.instance.handleInput("h");
+      h.instance.handleInput("R");
       await new Promise((resolve) => setTimeout(resolve, 0));
-      assert.ok(tasks.some((candidate) => candidate.id.startsWith('babcdef')));
+      assert.ok(tasks.some((candidate) => candidate.id.startsWith("babcdef")));
 
-      h.instance.handleInput('c');
+      h.instance.handleInput("c");
       assert.ok(h.paths.length >= 1);
 
-      h.instance.handleInput('x');
+      h.instance.handleInput("x");
       assert.equal(h.closed, true);
     } finally {
       h.instance.dispose();
     }
   });
 
-  void it('renders task-owned context, model, token, and tool telemetry in list/detail rows and placeholder when absent', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'pi-bg-context-'));
+  void it("renders task-owned context, model, token, and tool telemetry in list/detail rows and placeholder when absent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-bg-context-"));
     try {
-      const outputAbsPath = join(dir, 'task.output');
-      await writeFile(outputAbsPath, 'context-output\n', 'utf8');
+      const outputAbsPath = join(dir, "task.output");
+      await writeFile(outputAbsPath, "context-output\n", "utf8");
       const tasks = [
         task({
-          id: 'bctx00001',
-          name: 'Context Task',
+          id: "bctx00001",
+          name: "Context Task",
           outputAbsPath,
           isAgent: true,
-          model: 'openai-codex/gpt-5.5',
+          model: "openai-codex/gpt-5.5",
           contextUsage: { tokens: 42_000, contextWindow: 200_000, percent: 21 },
           tokenUsage: {
             input: 1000,
@@ -437,23 +451,23 @@ void describe('BackgroundTasksManager component', () => {
           toolUsage: { total: 3, failed: 1, byName: { bash: 2, read: 1 } },
         }),
         task({
-          id: 'bctx00002',
-          name: 'No Context Task',
+          id: "bctx00002",
+          name: "No Context Task",
           outputAbsPath,
           startTime: Date.now() - 2000,
         }),
       ];
       const h = manager({}, tasks);
       try {
-        let text = stripAnsi(h.instance.render(120).join('\n'));
+        let text = stripAnsi(h.instance.render(120).join("\n"));
         assert.match(text, /ctx 21\.0%\/200k/);
         assert.match(text, /model gpt-5\.5/);
         assert.match(text, /tok 1\.3k/);
         assert.match(text, /tools 3\/1 failed/);
         assert.match(text, /ctx —/);
-        h.instance.handleInput('\r');
+        h.instance.handleInput("\r");
         await new Promise((resolve) => setTimeout(resolve, 20));
-        text = stripAnsi(h.instance.render(120).join('\n'));
+        text = stripAnsi(h.instance.render(120).join("\n"));
         assert.match(text, /Model: openai-codex\/gpt-5\.5/);
         assert.match(text, /Context: 21\.0% of 200k window \(42k tokens\)/);
         assert.match(
@@ -461,11 +475,11 @@ void describe('BackgroundTasksManager component', () => {
           /Tokens: input 1\.0k · output 200 · cache read 30 · cache write 20 · total 1\.3k/,
         );
         assert.match(text, /Tools: 3 total · 1 failed · bash 2 · read 1/);
-        h.instance.handleInput('\x1b[D');
-        h.instance.handleInput('\x1b[B');
-        h.instance.handleInput('\r');
+        h.instance.handleInput("\x1b[D");
+        h.instance.handleInput("\x1b[B");
+        h.instance.handleInput("\r");
         await new Promise((resolve) => setTimeout(resolve, 20));
-        text = stripAnsi(h.instance.render(120).join('\n'));
+        text = stripAnsi(h.instance.render(120).join("\n"));
         assert.match(text, /Model: not reported by this background task/);
       } finally {
         h.instance.dispose();
@@ -475,32 +489,34 @@ void describe('BackgroundTasksManager component', () => {
     }
   });
 
-  void it('opens detail, reads bounded tail, refreshes, acts, and returns to list', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'pi-bg-component-'));
+  void it("opens detail, reads bounded tail, refreshes, acts, and returns to list", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-bg-component-"));
     try {
-      const outputAbsPath = join(dir, 'task.output');
-      await writeFile(outputAbsPath, 'line one\ncomponent-tail\n', 'utf8');
+      const outputAbsPath = join(dir, "task.output");
+      await writeFile(outputAbsPath, "line one\ncomponent-tail\n", "utf8");
       const tasks = [task({ outputAbsPath, bytesWritten: 24 })];
-      const h = manager({ initialTaskId: 'b12345678' }, tasks);
+      const h = manager({ initialTaskId: "b12345678" }, tasks);
       try {
         await new Promise((resolve) => setTimeout(resolve, 20));
-        let text = stripAnsi(h.instance.render(100).join('\n'));
+        let text = stripAnsi(h.instance.render(100).join("\n"));
         assert.match(text, /bg: Component Task/);
         assert.match(text, /component-tail/);
-        assert.ok(h.seen.has('b12345678'));
+        assert.ok(h.seen.has("b12345678"));
 
-        h.instance.handleInput('r');
-        h.instance.handleInput('c');
-        h.instance.handleInput('k');
+        h.instance.handleInput("r");
+        h.instance.handleInput("c");
+        h.instance.handleInput("k");
         await new Promise((resolve) => setTimeout(resolve, 0));
-        assert.deepEqual(h.paths, ['.pi/tasks/test/b12345678.output']);
-        assert.deepEqual(h.stopped, ['b12345678']);
-        h.instance.handleInput('R');
+        assert.deepEqual(h.paths, [join(tmpdir(), "pi-bg-test", "b12345678.output")]);
+        assert.deepEqual(h.stopped, ["b12345678"]);
+        h.instance.handleInput("R");
         await new Promise((resolve) => setTimeout(resolve, 0));
-        assert.ok(tasks.some((candidate) => candidate.id.startsWith('babcdef')));
+        assert.ok(
+          tasks.some((candidate) => candidate.id.startsWith("babcdef")),
+        );
 
-        h.instance.handleInput('\x1b[D');
-        text = stripAnsi(h.instance.render(100).join('\n'));
+        h.instance.handleInput("\x1b[D");
+        text = stripAnsi(h.instance.render(100).join("\n"));
         assert.match(text, /bg tasks focused/);
       } finally {
         h.instance.dispose();
@@ -510,21 +526,21 @@ void describe('BackgroundTasksManager component', () => {
     }
   });
 
-  void it('scrolls the detail output tail with arrows/pages and resumes follow at the bottom', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'pi-bg-scroll-'));
+  void it("scrolls the detail output tail with arrows/pages and resumes follow at the bottom", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-bg-scroll-"));
     try {
-      const outputAbsPath = join(dir, 'task.output');
+      const outputAbsPath = join(dir, "task.output");
       const fileLines = Array.from(
         { length: 40 },
-        (_, i) => `LINE-${String(i + 1).padStart(3, '0')}`,
+        (_, i) => `LINE-${String(i + 1).padStart(3, "0")}`,
       );
-      await writeFile(outputAbsPath, `${fileLines.join('\n')}\n`, 'utf8');
-      const h = manager({ initialTaskId: 'b12345678' }, [
+      await writeFile(outputAbsPath, `${fileLines.join("\n")}\n`, "utf8");
+      const h = manager({ initialTaskId: "b12345678" }, [
         task({ outputAbsPath, bytesWritten: 400 }),
       ]);
       try {
         await new Promise((resolve) => setTimeout(resolve, 20));
-        let text = stripAnsi(h.instance.render(100).join('\n'));
+        let text = stripAnsi(h.instance.render(100).join("\n"));
         assert.match(text, /following tail/);
         assert.match(text, /LINE-040/);
         assert.match(text, /LINE-029/);
@@ -532,25 +548,25 @@ void describe('BackgroundTasksManager component', () => {
         assert.doesNotMatch(text, /LINE-005/);
 
         // Scroll up 20 lines: pauses follow, reveals earlier lines, hides the latest.
-        for (let i = 0; i < 20; i++) h.instance.handleInput('\x1b[A');
-        text = stripAnsi(h.instance.render(100).join('\n'));
+        for (let i = 0; i < 20; i++) h.instance.handleInput("\x1b[A");
+        text = stripAnsi(h.instance.render(100).join("\n"));
         assert.match(text, /lines 9\u201320 of 40/);
         assert.match(text, /LINE-009/);
         assert.match(text, /LINE-020/);
         assert.doesNotMatch(text, /LINE-040/);
 
         // PageUp reaches the top of the buffer.
-        h.instance.handleInput('\x1b[5~');
-        text = stripAnsi(h.instance.render(100).join('\n'));
+        h.instance.handleInput("\x1b[5~");
+        text = stripAnsi(h.instance.render(100).join("\n"));
         assert.match(text, /lines 1\u201312 of 40/);
         assert.match(text, /LINE-001/);
 
         // Paging back past the end resumes the live tail.
-        h.instance.handleInput('\x1b[6~');
-        h.instance.handleInput('\x1b[6~');
-        h.instance.handleInput('\x1b[6~');
+        h.instance.handleInput("\x1b[6~");
+        h.instance.handleInput("\x1b[6~");
+        h.instance.handleInput("\x1b[6~");
         await new Promise((resolve) => setTimeout(resolve, 20));
-        text = stripAnsi(h.instance.render(100).join('\n'));
+        text = stripAnsi(h.instance.render(100).join("\n"));
         assert.match(text, /following tail/);
         assert.match(text, /LINE-040/);
       } finally {
@@ -561,19 +577,23 @@ void describe('BackgroundTasksManager component', () => {
     }
   });
 
-  void it('does not enter scroll mode when the output fits the detail window', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'pi-bg-noscroll-'));
+  void it("does not enter scroll mode when the output fits the detail window", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-bg-noscroll-"));
     try {
-      const outputAbsPath = join(dir, 'task.output');
-      await writeFile(outputAbsPath, 'only-line-a\nonly-line-b\nonly-line-c\n', 'utf8');
-      const h = manager({ initialTaskId: 'b12345678' }, [
+      const outputAbsPath = join(dir, "task.output");
+      await writeFile(
+        outputAbsPath,
+        "only-line-a\nonly-line-b\nonly-line-c\n",
+        "utf8",
+      );
+      const h = manager({ initialTaskId: "b12345678" }, [
         task({ outputAbsPath, bytesWritten: 33 }),
       ]);
       try {
         await new Promise((resolve) => setTimeout(resolve, 20));
-        h.instance.handleInput('\x1b[A');
-        h.instance.handleInput('\x1b[A');
-        const text = stripAnsi(h.instance.render(100).join('\n'));
+        h.instance.handleInput("\x1b[A");
+        h.instance.handleInput("\x1b[A");
+        const text = stripAnsi(h.instance.render(100).join("\n"));
         assert.match(text, /only-line-c/);
         assert.match(text, /following tail/);
         assert.doesNotMatch(text, /lines \d+\u2013\d+ of/);
@@ -585,90 +605,131 @@ void describe('BackgroundTasksManager component', () => {
     }
   });
 
-  void it('requires confirmation before stopping all running tasks and reports no-op clearly', async () => {
-    const tasks = [task({ id: 'b11111111' }), task({ id: 'b22222222' })];
+  void it("requires confirmation before stopping all running tasks and reports no-op clearly", async () => {
+    const tasks = [task({ id: "b11111111" }), task({ id: "b22222222" })];
     const h = manager({}, tasks);
     try {
-      h.instance.handleInput('a');
+      h.instance.handleInput("a");
       assert.deepEqual(h.stopped, []);
-      assert.match(stripAnsi(h.instance.render(100).join('\n')), /Press a\/K again/);
-      h.instance.handleInput('a');
+      assert.match(
+        stripAnsi(h.instance.render(100).join("\n")),
+        /Press a\/K again/,
+      );
+      h.instance.handleInput("a");
       await new Promise((resolve) => setTimeout(resolve, 0));
-      assert.deepEqual(h.stopped.sort(), ['b11111111', 'b22222222']);
-      h.instance.handleInput('a');
-      assert.match(stripAnsi(h.instance.render(100).join('\n')), /No running background tasks/);
+      assert.deepEqual(h.stopped.sort(), ["b11111111", "b22222222"]);
+      h.instance.handleInput("a");
+      assert.match(
+        stripAnsi(h.instance.render(100).join("\n")),
+        /No running background tasks/,
+      );
     } finally {
       h.instance.dispose();
     }
   });
 
-  void it('shows empty and history states, unread badges, and does not auto-clear finished notices on close', () => {
+  void it("shows empty and history states, unread badges, and does not auto-clear finished notices on close", () => {
     const h = manager({}, []);
     try {
-      const text = stripAnsi(h.instance.render(72).join('\n'));
+      const text = stripAnsi(h.instance.render(72).join("\n"));
       assert.match(text, /No background tasks/);
-      h.instance.handleInput('h');
-      assert.match(stripAnsi(h.instance.render(72).join('\n')), /No background tasks/);
+      h.instance.handleInput("h");
+      assert.match(
+        stripAnsi(h.instance.render(72).join("\n")),
+        /No background tasks/,
+      );
     } finally {
       h.instance.dispose();
     }
 
     const finished = [
       task({
-        id: 'bfailed01',
-        name: 'Failed Task',
-        status: 'failed',
-        error: 'boom',
+        id: "bfailed01",
+        name: "Failed Task",
+        status: "failed",
+        error: "boom",
         endTime: Date.now(),
         exitCode: 1,
       }),
     ];
     const hf = manager({}, finished);
     try {
-      const text = stripAnsi(hf.instance.render(80).join('\n'));
+      const text = stripAnsi(hf.instance.render(80).join("\n"));
       assert.match(text, /1 failed/);
       assert.match(text, /1 unread/);
       assert.match(text, /●/);
-      hf.instance.handleInput('x');
-      assert.equal(hf.seen.has('bfailed01'), false);
+      hf.instance.handleInput("x");
+      assert.equal(hf.seen.has("bfailed01"), false);
     } finally {
       hf.instance.dispose();
     }
   });
 
-  void it('handles non-running stop, output read failures, paging, long text, and close aliases', async () => {
+  void it("shows tasks without an explicit name via the display-chain fallback (REVIEW UI-2)", async () => {
+    const h = manager({}, [
+      task({
+        id: "bnoname01",
+        name: undefined,
+        command: "cd /a && npm test",
+        status: "completed",
+        endTime: Date.now(),
+      }),
+    ]);
+    try {
+      const list = stripAnsi(h.instance.render(90).join("\n"));
+      assert.match(
+        list,
+        /cd \/a && np/u,
+        "无显式名任务按完整 command 兜底展示(行宽截断)",
+      );
+      assert.doesNotMatch(list, /undefined/u, "列表不得出现 undefined 字样");
+      h.instance.handleInput("\r");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const detail = stripAnsi(h.instance.render(90).join("\n"));
+      assert.match(
+        detail,
+        /cd \/a && npm test/u,
+        "详情视图经 taskDisplayName 兜底展示完整命令",
+      );
+      assert.doesNotMatch(detail, /undefined/u, "详情不得出现 undefined 字样");
+    } finally {
+      h.instance.dispose();
+    }
+  });
+
+  void it("handles non-running stop, output read failures, paging, long text, and close aliases", async () => {
     const many = Array.from({ length: 20 }, (_, i) =>
       task({
-        id: `b${String(i).padStart(8, '0')}`,
-        name: `Very Long Component Task Name ${String(i)} ${'x'.repeat(80)}`,
+        id: `b${String(i).padStart(8, "0")}`,
+        name: `Very Long Component Task Name ${String(i)} ${"x".repeat(80)}`,
         command: `printf ${String(i)}`,
         startTime: Date.now() - i * 1000,
       }),
     );
     const firstTask = many[0];
     assert.ok(firstTask);
-    firstTask.status = 'completed';
+    firstTask.status = "completed";
     firstTask.endTime = Date.now();
     const h = manager({}, many);
     try {
-      h.instance.handleInput('\x1b[6~');
-      h.instance.handleInput('\x1b[5~');
+      h.instance.handleInput("\x1b[6~");
+      h.instance.handleInput("\x1b[5~");
       const lines = h.instance.render(50);
       assertWidth(lines, 50);
-      h.instance.handleInput('h');
-      h.instance.handleInput('\x1b[5~');
+      h.instance.handleInput("h");
+      h.instance.handleInput("\x1b[5~");
       assertWidth(h.instance.render(64), 64);
-      h.instance.handleInput('\r');
+      h.instance.handleInput("\r");
       await new Promise((resolve) => setTimeout(resolve, 20));
-      let text = stripAnsi(h.instance.render(80).join('\n'));
+      let text = stripAnsi(h.instance.render(80).join("\n"));
       assert.match(text, /Output file not found|No output yet|bg:/);
-      h.instance.handleInput('\x1b[D');
-      h.instance.handleInput('h');
-      h.instance.handleInput('k');
+      h.instance.handleInput("\x1b[D");
+      h.instance.handleInput("h");
+      h.instance.handleInput("k");
       await new Promise((resolve) => setTimeout(resolve, 0));
-      text = stripAnsi(h.instance.render(90).join('\n'));
+      text = stripAnsi(h.instance.render(90).join("\n"));
       assert.match(text, /nothing to stop|Stopped/);
-      h.instance.handleInput('q');
+      h.instance.handleInput("q");
       assert.equal(h.closed, true);
     } finally {
       h.instance.dispose();
@@ -676,7 +737,7 @@ void describe('BackgroundTasksManager component', () => {
 
     const esc = manager({}, [task()]);
     try {
-      esc.instance.handleInput('\x1b');
+      esc.instance.handleInput("\x1b");
       assert.equal(esc.closed, true);
     } finally {
       esc.instance.dispose();
