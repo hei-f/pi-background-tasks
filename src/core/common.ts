@@ -1,5 +1,11 @@
-import { accessSync, constants, existsSync, statSync, type WriteStream } from 'node:fs';
-import { open } from 'node:fs/promises';
+import {
+  accessSync,
+  constants,
+  existsSync,
+  statSync,
+  type WriteStream,
+} from "node:fs";
+import { open } from "node:fs/promises";
 import {
   basename,
   delimiter,
@@ -8,62 +14,54 @@ import {
   join,
   resolve,
   win32,
-} from 'node:path';
-import { DEFAULT_MAX_BYTES, formatSize } from '@earendil-works/pi-coding-agent';
-import type { BackgroundTaskChildProcess } from './registry.js';
+} from "node:path";
+import { DEFAULT_MAX_BYTES, formatSize } from "@earendil-works/pi-coding-agent";
+import type { BackgroundTaskChildProcess } from "./registry.js";
 
 export const TASK_STATUS_VALUES = [
-  'running',
-  'completed',
-  'failed',
-  'cancelled',
-  'killed',
-  'lost',
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "killed",
+  "lost",
 ] as const;
 export const TERMINAL_TASK_STATUS_VALUES = [
-  'completed',
-  'failed',
-  'cancelled',
-  'killed',
-  'lost',
+  "completed",
+  "failed",
+  "cancelled",
+  "killed",
+  "lost",
 ] as const;
 
 export type TaskStatus = (typeof TASK_STATUS_VALUES)[number];
 export type TerminalTaskStatus = (typeof TERMINAL_TASK_STATUS_VALUES)[number];
 export type FailedReason =
-  | 'exit_error'
-  | 'timed_out'
-  | 'output_limit'
-  | 'spawn_error'
-  | 'disk_full';
+  "exit_error" | "timed_out" | "output_limit" | "spawn_error" | "disk_full";
 /** 停止发起者,冲突优先级 user > model > system。 */
-export type StopInitiator = 'user' | 'model' | 'system';
+export type StopInitiator = "user" | "model" | "system";
 export type KillKind =
-  | 'user'
-  | 'timeout'
-  | 'output_cap'
-  | 'disk_full'
-  | 'shutdown';
-export type ReloadShellStopKind = KillKind | 'handoff_expired';
+  "user" | "timeout" | "output_cap" | "disk_full" | "shutdown";
+export type ReloadShellStopKind = KillKind | "handoff_expired";
 
-export type TerminalPublicationState = 'pending' | 'delivered' | 'abandoned';
+export type TerminalPublicationState = "pending" | "delivered" | "abandoned";
 export type TerminalPublicationAbandonReason =
-  | 'registry_shutdown'
-  | 'publisher_closed'
-  | 'gate_rejected'
-  | 'retry_exhausted'
-  | 'retention_limit'
-  | 'reload_handoff_expired';
+  | "registry_shutdown"
+  | "publisher_closed"
+  | "gate_rejected"
+  | "retry_exhausted"
+  | "retention_limit"
+  | "reload_handoff_expired";
 
 export type ReloadSurvivalErrorCode =
-  | 'pi_bg_survive_reload_invalid'
-  | 'pi_bg_survive_reload_requires_non_agent'
-  | 'pi_bg_survive_reload_requires_shell_command'
-  | 'pi_bg_reload_owner_unavailable'
-  | 'pi_bg_reload_owner_protocol_incompatible'
-  | 'pi_bg_reload_owner_activation_conflict'
-  | 'pi_bg_reload_owner_stale_claim'
-  | 'pi_bg_reload_handoff_expired';
+  | "pi_bg_survive_reload_invalid"
+  | "pi_bg_survive_reload_requires_non_agent"
+  | "pi_bg_survive_reload_requires_shell_command"
+  | "pi_bg_reload_owner_unavailable"
+  | "pi_bg_reload_owner_protocol_incompatible"
+  | "pi_bg_reload_owner_activation_conflict"
+  | "pi_bg_reload_owner_stale_claim"
+  | "pi_bg_reload_handoff_expired";
 
 export class ReloadSurvivalError extends Error {
   constructor(
@@ -71,7 +69,7 @@ export class ReloadSurvivalError extends Error {
     message: string,
   ) {
     super(`${code}: ${message}`);
-    this.name = 'ReloadSurvivalError';
+    this.name = "ReloadSurvivalError";
   }
 }
 
@@ -99,8 +97,8 @@ export interface TaskToolUsage {
 }
 
 export interface ReloadSurvivalSnapshotV1 {
-  schemaVersion: 'pi-background-tasks.reload-shell.v1';
-  authority: 'same-process-live-owner';
+  schemaVersion: "pi-background-tasks.reload-shell.v1";
+  authority: "same-process-live-owner";
   hostPid: number;
   sessionId: string;
   cwdRealpath: string;
@@ -123,7 +121,7 @@ export interface ReloadShellIdentityV1 {
 }
 
 export interface ReloadShellActivationLeaseV1 {
-  readonly protocol: 'pi-background-tasks.reload-shell-owner.v1';
+  readonly protocol: "pi-background-tasks.reload-shell-owner.v1";
   readonly hubNonce: string;
   readonly identityKey: string;
   readonly generation: number;
@@ -131,7 +129,7 @@ export interface ReloadShellActivationLeaseV1 {
 }
 
 export interface ReloadShellActivationClaimV1 {
-  readonly protocol: 'pi-background-tasks.reload-shell-owner.v1';
+  readonly protocol: "pi-background-tasks.reload-shell-owner.v1";
   readonly hubNonce: string;
   readonly claimNonce: string;
   readonly identity: ReloadShellIdentityV1;
@@ -146,27 +144,27 @@ export interface ReloadShellProcessV1 {
   readonly pid?: number | undefined;
   stdout?:
     | {
-        on(event: 'data', listener: (data: Buffer | string) => void): unknown;
-        off?(event: 'data', listener: (data: Buffer | string) => void): unknown;
+        on(event: "data", listener: (data: Buffer | string) => void): unknown;
+        off?(event: "data", listener: (data: Buffer | string) => void): unknown;
       }
     | null
     | undefined;
   stderr?:
     | {
-        on(event: 'data', listener: (data: Buffer | string) => void): unknown;
-        off?(event: 'data', listener: (data: Buffer | string) => void): unknown;
+        on(event: "data", listener: (data: Buffer | string) => void): unknown;
+        off?(event: "data", listener: (data: Buffer | string) => void): unknown;
       }
     | null
     | undefined;
   kill(signal?: NodeJS.Signals): boolean;
-  on(event: 'error', listener: (error: Error) => void): unknown;
+  on(event: "error", listener: (error: Error) => void): unknown;
   on(
-    event: 'close',
+    event: "close",
     listener: (code: number | null, signal: NodeJS.Signals | null) => void,
   ): unknown;
-  off?(event: 'error', listener: (error: Error) => void): unknown;
+  off?(event: "error", listener: (error: Error) => void): unknown;
   off?(
-    event: 'close',
+    event: "close",
     listener: (code: number | null, signal: NodeJS.Signals | null) => void,
   ): unknown;
 }
@@ -177,10 +175,10 @@ export interface ReloadShellOwnerEventSinkV1 {
 }
 
 export type ReloadShellNotificationState =
-  'disabled' | 'pending' | 'sending' | 'delivered';
+  "disabled" | "pending" | "sending" | "delivered";
 
 export interface ReloadableShellExecutionV1 {
-  readonly protocol: 'pi-background-tasks.reload-shell-owner.v1';
+  readonly protocol: "pi-background-tasks.reload-shell-owner.v1";
   readonly launchNonce: string;
   readonly completionId: string;
   readonly task: BgTask;
@@ -195,12 +193,12 @@ export interface ReloadableShellExecutionV1 {
     reason?: string,
   ) => Promise<BgTask>;
   phase:
-    | 'starting'
-    | 'running'
-    | 'stop_requested'
-    | 'finalizing'
-    | 'terminal'
-    | 'released';
+    | "starting"
+    | "running"
+    | "stop_requested"
+    | "finalizing"
+    | "terminal"
+    | "released";
   closeObservation?:
     | {
         code: number | null;
@@ -236,7 +234,7 @@ export interface ReloadShellHostAdapterV1 {
 }
 
 export interface ReloadShellOwnerHubV1 {
-  readonly protocol: 'pi-background-tasks.reload-shell-owner.v1';
+  readonly protocol: "pi-background-tasks.reload-shell-owner.v1";
   readonly hubNonce: string;
   beginActivation(
     identity: ReloadShellIdentityV1,
@@ -304,8 +302,11 @@ export interface BgTaskSnapshot {
   shellPolicy?: ShellPolicySnapshot | undefined;
 }
 
-export interface BgTask extends Omit<BgTaskSnapshot, 'name'> {
-  name: string;
+export interface BgTask extends Omit<BgTaskSnapshot, "name"> {
+  /** 显式命名(覆盖版 bash `task_name` 或 dock rerun 透传);无显式名时保持
+   * undefined(S7),显示链在 `taskDisplayName` 内以 description > 完整 command > id 兜底。 */
+  name?: string | undefined;
+  /** S2 向后兼容别名:与绝对 `outputPath` 值相同;历史字段名保留,新代码一律读 outputPath。 */
   outputAbsPath: string;
   metadataAbsPath: string;
   child?: BackgroundTaskChildProcess | undefined;
@@ -326,7 +327,7 @@ export interface BgTask extends Omit<BgTaskSnapshot, 'name'> {
   /** branchGeneration 迟到结算 fence 命中标记:旧代次帧标陈旧、不触发唤醒(不写入快照)。 */
   staleBranchFrame?: boolean | undefined;
   /** 入口来源标记(模型/用户语义落点,不写入快照)。 */
-  entrySource?: 'model' | 'user' | undefined;
+  entrySource?: "model" | "user" | undefined;
   /** M5:终态发布时从输出文件取的有界 tail 完成摘要(瞬态,不落盘、不进入快照)。 */
   terminalSummaryTail?: string | undefined;
   /**
@@ -365,7 +366,7 @@ export interface BgTask extends Omit<BgTaskSnapshot, 'name'> {
 }
 
 export type CompletionDeliveryMode =
-  'notification-and-wake' | 'notification-only' | 'manual-monitoring';
+  "notification-and-wake" | "notification-only" | "manual-monitoring";
 
 export interface CompletionDeliveryGuidance {
   readonly mode: CompletionDeliveryMode;
@@ -385,41 +386,41 @@ export function deriveCompletionDeliveryGuidance(
 ): CompletionDeliveryGuidance {
   if (notifyOnCompletion && triggerOnCompletion) {
     return {
-      mode: 'notification-and-wake',
+      mode: "notification-and-wake",
       notificationEnabled: true,
       automaticWakeEnabled: true,
       text: [
-        'Terminal notification: enabled.',
-        'Automatic follow-up turn: enabled.',
-        'Next action: do not poll or sleep merely to wait; continue only independent useful work, otherwise end this turn and wait for <background-task-notification>.',
-      ].join('\n'),
+        "Terminal notification: enabled.",
+        "Automatic follow-up turn: enabled.",
+        "Next action: do not poll or sleep merely to wait; continue only independent useful work, otherwise end this turn and wait for <background-task-notification>.",
+      ].join("\n"),
     };
   }
 
   if (notifyOnCompletion) {
     return {
-      mode: 'notification-only',
+      mode: "notification-only",
       notificationEnabled: true,
       automaticWakeEnabled: false,
       text: [
-        'Terminal notification: enabled.',
-        'Automatic follow-up turn: disabled. The terminal notification will be delivered, but it will not start an agent turn.',
-        'Next action: automatic wake-up was explicitly disabled; use bg_status/bg_logs only when deliberate monitoring is required, without tight polling.',
-      ].join('\n'),
+        "Terminal notification: enabled.",
+        "Automatic follow-up turn: disabled. The terminal notification will be delivered, but it will not start an agent turn.",
+        "Next action: automatic wake-up was explicitly disabled; use bg_status/bg_logs only when deliberate monitoring is required, without tight polling.",
+      ].join("\n"),
     };
   }
 
   return {
-    mode: 'manual-monitoring',
+    mode: "manual-monitoring",
     notificationEnabled: false,
     automaticWakeEnabled: false,
     text: [
-      'Terminal notification: disabled.',
+      "Terminal notification: disabled.",
       triggerOnCompletion
-        ? 'Automatic follow-up turn: disabled because terminal notifications are disabled. triggerOnCompletion has no effect while notifyOnCompletion is false.'
-        : 'Automatic follow-up turn: disabled.',
-      'Next action: completion delivery was explicitly disabled; use bg_status/bg_logs only for deliberate manual monitoring, without tight polling.',
-    ].join('\n'),
+        ? "Automatic follow-up turn: disabled because terminal notifications are disabled. triggerOnCompletion has no effect while notifyOnCompletion is false."
+        : "Automatic follow-up turn: disabled.",
+      "Next action: completion delivery was explicitly disabled; use bg_status/bg_logs only for deliberate manual monitoring, without tight polling.",
+    ].join("\n"),
   };
 }
 
@@ -454,7 +455,7 @@ export interface StartTaskOptions {
    * 缺省 notify+trigger;用户入口(dock「转后台」)缺省仅通知。仅作来源标记,
    * dock 动作本体在 M4 实现。
    */
-  entrySource?: 'model' | 'user' | undefined;
+  entrySource?: "model" | "user" | undefined;
   /** @internal EventBus protocol barrier; callers should not set this outside the extension service. */
   terminalPublicationGate?: Promise<void> | undefined;
   /**
@@ -472,21 +473,24 @@ export interface StartTaskOptions {
  * 本插件按 64KiB 封顶,防止模型视图无界膨胀。
  */
 export const MODEL_VIEW_BYTES_CAP = 64 * 1024;
-export const DEFAULT_LOG_BYTES = Math.min(DEFAULT_MAX_BYTES, MODEL_VIEW_BYTES_CAP);
+export const DEFAULT_LOG_BYTES = Math.min(
+  DEFAULT_MAX_BYTES,
+  MODEL_VIEW_BYTES_CAP,
+);
 export const MAX_LOG_BYTES = Math.min(DEFAULT_MAX_BYTES, MODEL_VIEW_BYTES_CAP);
 export const COMMAND_PREVIEW_CHARS = 90;
 const parseJsonValue: (text: string) => unknown = globalThis.JSON.parse;
 
 export function isJsonObject(value: unknown): value is JsonObject {
-  return typeof value === 'object' && value !== null;
+  return typeof value === "object" && value !== null;
 }
 
 /** 判别输出流错误是否由磁盘空间耗尽(ENOSPC)引发,用于终止分支选择。 */
 export function isEnospcError(error: unknown): boolean {
   return (
-    typeof error === 'object' &&
+    typeof error === "object" &&
     error !== null &&
-    Reflect.get(error, 'code') === 'ENOSPC'
+    Reflect.get(error, "code") === "ENOSPC"
   );
 }
 
@@ -496,9 +500,9 @@ export function parseJsonText(text: string): unknown {
 
 export function sanitizePathSegment(value: string): string {
   const sanitized = value
-    .replace(/[^a-zA-Z0-9_.-]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  return sanitized || 'session';
+    .replace(/[^a-zA-Z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return sanitized || "session";
 }
 
 export function stripMatchingQuotes(value: string): string {
@@ -514,7 +518,7 @@ export function stripMatchingQuotes(value: string): string {
 }
 
 export function compactWhitespace(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
+  return value.replace(/\s+/g, " ").trim();
 }
 
 export function truncateChars(value: string, maxChars: number): string {
@@ -523,28 +527,26 @@ export function truncateChars(value: string, maxChars: number): string {
 }
 
 export function normalizeTaskName(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
+  if (typeof value !== "string") return undefined;
   const normalized = compactWhitespace(stripMatchingQuotes(value));
   if (!normalized) return undefined;
   return truncateChars(normalized, 80);
 }
 
-export function deriveTaskNameFromCommand(command: string): string {
-  const normalized = compactWhitespace(stripMatchingQuotes(command));
-  if (!normalized) return 'Background task';
+/** 防病态超长命令的显示护栏:仅作用于 `taskDisplayName` 的完整命令兜底分支,
+ * 4KiB 内命令保持原样(不 compactWhitespace、不按词截断、不剥前缀);显式
+ * name/description 已由 normalizeTaskName 归一到 80 字符,不触达本护栏。 */
+export const TASK_DISPLAY_NAME_MAX_CHARS = 4 * 1024;
 
-  const packageScript = /^(npm|pnpm|yarn|bun)\s+(?:(run)\s+)?([^\s;&|]+)/.exec(
-    normalized,
-  );
-  if (packageScript) {
-    const runner = packageScript[1] ?? 'npm';
-    const run = packageScript[2] !== undefined ? ' run' : '';
-    const script = packageScript[3] ?? '';
-    return truncateChars(`${runner}${run} ${script}`, 48);
-  }
-
-  const words = normalized.split(/\s+/).slice(0, 5).join(' ');
-  return truncateChars(words.length > 0 ? words : normalized, 48);
+/** 完整 `task.command` 原样兜底(ZCode 命名方案):空/纯空白命令视为无兜底,
+ * 超长命令仅在 4KiB 护栏内裁剪。 */
+function fullCommandDisplayName(
+  command: string | undefined,
+): string | undefined {
+  if (command === undefined || command.length === 0) return undefined;
+  if (command.trim().length === 0) return undefined;
+  if (command.length <= TASK_DISPLAY_NAME_MAX_CHARS) return command;
+  return truncateChars(command, TASK_DISPLAY_NAME_MAX_CHARS);
 }
 
 export function taskDisplayName(task: {
@@ -553,16 +555,12 @@ export function taskDisplayName(task: {
   command?: string | undefined;
   id?: string | undefined;
 }): string {
-  const commandName =
-    task.command && task.command.length > 0
-      ? deriveTaskNameFromCommand(task.command)
-      : undefined;
   return (
     normalizeTaskName(task.name) ??
     normalizeTaskName(task.description) ??
-    commandName ??
+    fullCommandDisplayName(task.command) ??
     task.id ??
-    'Background task'
+    "Background task"
   );
 }
 
@@ -573,10 +571,10 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(seconds / 60);
   const remSeconds = seconds % 60;
   if (minutes < 60)
-    return `${String(minutes)}m${remSeconds > 0 ? `${String(remSeconds)}s` : ''}`;
+    return `${String(minutes)}m${remSeconds > 0 ? `${String(remSeconds)}s` : ""}`;
   const hours = Math.floor(minutes / 60);
   const remMinutes = minutes % 60;
-  return `${String(hours)}h${remMinutes > 0 ? `${String(remMinutes)}m` : ''}`;
+  return `${String(hours)}h${remMinutes > 0 ? `${String(remMinutes)}m` : ""}`;
 }
 
 export function formatCompactNumber(count: number): string {
@@ -609,7 +607,7 @@ export function formatToolUsageSummary(
   usage?: TaskToolUsage,
 ): string | undefined {
   if (!usage || (usage.total <= 0 && usage.failed <= 0)) return undefined;
-  const failed = usage.failed > 0 ? ` failed=${String(usage.failed)}` : '';
+  const failed = usage.failed > 0 ? ` failed=${String(usage.failed)}` : "";
   return `tools=${String(usage.total)}${failed}`;
 }
 
@@ -627,14 +625,14 @@ export function formatModelSummary(model?: string): string | undefined {
  * file instead of leaking raw telemetry JSON. Both the parser and the formatter
  * are pure so the visible transcript is fully unit-testable.
  */
-export const AGENT_ACTIVITY_TYPE = 'background-task-activity';
+export const AGENT_ACTIVITY_TYPE = "background-task-activity";
 const AGENT_ACTIVITY_DETAIL_MAX = 80;
 
 export type AgentActivity =
-  | { kind: 'assistant_text'; text: string }
-  | { kind: 'reasoning'; text: string }
-  | { kind: 'tool_start'; tool: string; argsSummary: string }
-  | { kind: 'tool_end'; tool: string; isError: boolean; error?: string };
+  | { kind: "assistant_text"; text: string }
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool_start"; tool: string; argsSummary: string }
+  | { kind: "tool_end"; tool: string; isError: boolean; error?: string };
 
 interface AgentActivityPayload extends JsonObject {
   readonly type?: unknown;
@@ -648,10 +646,10 @@ interface AgentActivityPayload extends JsonObject {
 
 function readActivityString(
   record: AgentActivityPayload,
-  key: 'text' | 'tool' | 'argsSummary' | 'error',
+  key: "text" | "tool" | "argsSummary" | "error",
 ): string | undefined {
   const value = record[key];
-  return typeof value === 'string' ? value : undefined;
+  return typeof value === "string" ? value : undefined;
 }
 
 /** Narrow a parsed `background-task-activity` control payload into a typed {@link AgentActivity}. */
@@ -662,29 +660,29 @@ export function parseAgentActivity(
   const record: AgentActivityPayload = payload;
   if (record.type !== AGENT_ACTIVITY_TYPE) return undefined;
   const kind = record.kind;
-  if (kind === 'assistant_text' || kind === 'reasoning') {
-    const text = readActivityString(record, 'text');
+  if (kind === "assistant_text" || kind === "reasoning") {
+    const text = readActivityString(record, "text");
     if (text === undefined) return undefined;
     return { kind, text };
   }
-  if (kind === 'tool_start') {
-    const tool = readActivityString(record, 'tool');
+  if (kind === "tool_start") {
+    const tool = readActivityString(record, "tool");
     if (!tool) return undefined;
     return {
       kind,
       tool,
-      argsSummary: readActivityString(record, 'argsSummary') ?? '',
+      argsSummary: readActivityString(record, "argsSummary") ?? "",
     };
   }
-  if (kind === 'tool_end') {
-    const tool = readActivityString(record, 'tool');
+  if (kind === "tool_end") {
+    const tool = readActivityString(record, "tool");
     if (!tool) return undefined;
     const activity: AgentActivity = {
       kind,
       tool,
       isError: record.isError === true,
     };
-    const error = readActivityString(record, 'error');
+    const error = readActivityString(record, "error");
     if (error !== undefined && error.trim().length > 0) activity.error = error;
     return activity;
   }
@@ -700,26 +698,26 @@ export function parseAgentActivity(
 export function formatAgentActivityLine(
   activity: AgentActivity,
 ): string | undefined {
-  if (activity.kind === 'assistant_text') {
-    const text = activity.text.replace(/\s+$/u, '');
+  if (activity.kind === "assistant_text") {
+    const text = activity.text.replace(/\s+$/u, "");
     return text.trim().length > 0 ? text : undefined;
   }
-  if (activity.kind === 'reasoning') {
-    const text = activity.text.replace(/\s+$/u, '');
+  if (activity.kind === "reasoning") {
+    const text = activity.text.replace(/\s+$/u, "");
     return text.trim().length > 0 ? `\u2026 ${text}` : undefined;
   }
-  if (activity.kind === 'tool_start') {
+  if (activity.kind === "tool_start") {
     const summary = compactWhitespace(activity.argsSummary);
     const suffix =
       summary.length > 0
         ? ` ${truncateChars(summary, AGENT_ACTIVITY_DETAIL_MAX)}`
-        : '';
+        : "";
     return `\u2192 ${activity.tool}${suffix}`;
   }
   if (!activity.isError) return undefined;
   const detail = activity.error
     ? `: ${truncateChars(compactWhitespace(activity.error), AGENT_ACTIVITY_DETAIL_MAX)}`
-    : '';
+    : "";
   return `\u2717 ${activity.tool} failed${detail}`;
 }
 
@@ -727,9 +725,9 @@ export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-export type ShellDialect = 'cmd' | 'posix' | 'user-non-posix';
-export type ShellPolicyDialect = ShellDialect | 'bash';
-export type ShellPolicyName = 'inherit' | 'bash' | 'sh' | 'cmd';
+export type ShellDialect = "cmd" | "posix" | "user-non-posix";
+export type ShellPolicyDialect = ShellDialect | "bash";
+export type ShellPolicyName = "inherit" | "bash" | "sh" | "cmd";
 
 /** Non-secret launch facts persisted for ordinary shell tasks. */
 export interface ShellPolicySnapshot {
@@ -753,11 +751,11 @@ export interface ShellInvocation {
 }
 
 export class ShellInvocationError extends Error {
-  readonly code = 'pi_bg_shell_invalid';
+  readonly code = "pi_bg_shell_invalid";
 
   constructor(message: string) {
     super(`pi_bg_shell_invalid: ${message}`);
-    this.name = 'ShellInvocationError';
+    this.name = "ShellInvocationError";
   }
 }
 
@@ -766,16 +764,16 @@ type ShellCandidateResult =
   | { readonly found: false; readonly diagnostic: string };
 
 const POSIX_FUNCTION_SHELLS = new Set([
-  'sh',
-  'dash',
-  'ash',
-  'ksh',
-  'ksh93',
-  'mksh',
-  'pdksh',
-  'zsh',
-  'yash',
-  'posh',
+  "sh",
+  "dash",
+  "ash",
+  "ksh",
+  "ksh93",
+  "mksh",
+  "pdksh",
+  "zsh",
+  "yash",
+  "posh",
 ]);
 
 function failShellInvocation(message: string): never {
@@ -787,7 +785,7 @@ function shellErrorMessage(error: unknown): string {
 }
 
 function freezeShellPolicy(
-  policy: Omit<ResolvedShellPolicy, 'argvPrefix'> & {
+  policy: Omit<ResolvedShellPolicy, "argvPrefix"> & {
     argvPrefix: readonly string[];
   },
 ): ResolvedShellPolicy {
@@ -810,7 +808,7 @@ export function shellPolicySnapshot(
 
 function isWindowsExecutablePath(path: string): boolean {
   const extension = extname(path).toLowerCase();
-  return extension === '.exe' || extension === '.com';
+  return extension === ".exe" || extension === ".com";
 }
 
 function validateWindowsShellPath(path: string, label: string): string {
@@ -846,21 +844,21 @@ function inspectWindowsShellCandidate(path: string): ShellCandidateResult {
 }
 
 function windowsPathValue(env: NodeJS.ProcessEnv): string {
-  return env['PATH'] ?? env['Path'] ?? env['path'] ?? '';
+  return env["PATH"] ?? env["Path"] ?? env["path"] ?? "";
 }
 
 function resolveWindowsBash(env: NodeJS.ProcessEnv): string {
   const pathValue = windowsPathValue(env);
   const diagnostics: string[] = [];
-  for (const dir of pathValue.split(';').filter((entry) => entry.length > 0)) {
-    for (const name of ['bash.exe', 'bash.com']) {
+  for (const dir of pathValue.split(";").filter((entry) => entry.length > 0)) {
+    for (const name of ["bash.exe", "bash.com"]) {
       const candidate = join(dir, name);
       const result = inspectWindowsShellCandidate(candidate);
       if (result.found) return candidate;
       diagnostics.push(result.diagnostic);
     }
   }
-  const suffix = diagnostics.length > 0 ? `: ${diagnostics.join('; ')}` : '';
+  const suffix = diagnostics.length > 0 ? `: ${diagnostics.join("; ")}` : "";
   failShellInvocation(
     `PI_BG_SHELL=bash could not resolve bash.exe or bash.com on PATH${suffix}`,
   );
@@ -900,13 +898,13 @@ function inspectPosixShellCandidate(path: string): boolean {
 }
 
 function resolvePosixExecutable(
-  name: 'bash' | 'sh',
+  name: "bash" | "sh",
   env: NodeJS.ProcessEnv,
   activationCwd: string,
 ): string {
   const binCandidate = `/bin/${name}`;
   if (inspectPosixShellCandidate(binCandidate)) return binCandidate;
-  const pathValue = env['PATH'] ?? '';
+  const pathValue = env["PATH"] ?? "";
   for (const entry of pathValue.split(delimiter)) {
     if (entry.length === 0) continue;
     const directory = isAbsolute(entry) ? entry : resolve(activationCwd, entry);
@@ -920,103 +918,117 @@ function resolvePosixExecutable(
 
 function inheritedPosixDialect(executable: string): ShellPolicyDialect {
   const name = basename(executable).toLowerCase();
-  if (name === 'bash') return 'bash';
-  return POSIX_FUNCTION_SHELLS.has(name) ? 'posix' : 'user-non-posix';
+  if (name === "bash") return "bash";
+  return POSIX_FUNCTION_SHELLS.has(name) ? "posix" : "user-non-posix";
 }
 
-/** Resolve one activation-stable policy. New POSIX variables are intentionally ignored on Windows. */
+/**
+ * Resolve one activation-stable policy. New POSIX variables are intentionally
+ * ignored on Windows.
+ *
+ * S1 P1 同源化的宿主注入面:`hostShellPath` 为宿主前台 shell 解析结果
+ * (settings.shellPath 或 getShellConfig 默认解析),POSIX `inherit` 分支中
+ * 有效(非空)时优先于 `env.SHELL`;纯函数保持可测,扩展入口把宿主解析结果
+ * 经 `initializeShellPolicy` 注入。Win32 分支不消费该参数(前后台 Win32 对称性
+ * 见 README 平台边界注记)。
+ */
 export function resolveShellPolicy(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
   activationCwd: string = process.cwd(),
+  hostShellPath?: string | undefined,
 ): ResolvedShellPolicy {
-  if (platform === 'win32') {
-    const requestedShell = env['PI_BG_SHELL'];
-    const requestedPath = env['PI_BG_SHELL_PATH'];
+  if (platform === "win32") {
+    const requestedShell = env["PI_BG_SHELL"];
+    const requestedPath = env["PI_BG_SHELL_PATH"];
     if (requestedShell === undefined) {
       if (requestedPath !== undefined)
-        failShellInvocation('PI_BG_SHELL_PATH requires PI_BG_SHELL');
-      const comSpec = env['ComSpec'];
+        failShellInvocation("PI_BG_SHELL_PATH requires PI_BG_SHELL");
+      const comSpec = env["ComSpec"];
       return freezeShellPolicy({
-        policy: 'cmd',
-        executable: comSpec && comSpec.length > 0 ? comSpec : 'cmd.exe',
-        argvPrefix: ['/d', '/s', '/c'],
-        dialect: 'cmd',
+        policy: "cmd",
+        executable: comSpec && comSpec.length > 0 ? comSpec : "cmd.exe",
+        argvPrefix: ["/d", "/s", "/c"],
+        dialect: "cmd",
         supportsPosixFunctionWrapper: false,
         windowsVerbatimArguments: true,
       });
     }
-    if (requestedShell !== 'cmd' && requestedShell !== 'bash') {
-      failShellInvocation('PI_BG_SHELL must be exactly cmd or bash');
+    if (requestedShell !== "cmd" && requestedShell !== "bash") {
+      failShellInvocation("PI_BG_SHELL must be exactly cmd or bash");
     }
     const explicitPath =
       requestedPath !== undefined
-        ? validateWindowsShellPath(requestedPath, 'PI_BG_SHELL_PATH')
+        ? validateWindowsShellPath(requestedPath, "PI_BG_SHELL_PATH")
         : undefined;
-    if (requestedShell === 'cmd') {
-      const comSpec = env['ComSpec'];
+    if (requestedShell === "cmd") {
+      const comSpec = env["ComSpec"];
       return freezeShellPolicy({
-        policy: 'cmd',
+        policy: "cmd",
         executable:
-          explicitPath ?? (comSpec && comSpec.length > 0 ? comSpec : 'cmd.exe'),
-        argvPrefix: ['/d', '/s', '/c'],
-        dialect: 'cmd',
+          explicitPath ?? (comSpec && comSpec.length > 0 ? comSpec : "cmd.exe"),
+        argvPrefix: ["/d", "/s", "/c"],
+        dialect: "cmd",
         supportsPosixFunctionWrapper: false,
         windowsVerbatimArguments: true,
       });
     }
     return freezeShellPolicy({
-      policy: 'bash',
+      policy: "bash",
       executable: explicitPath ?? resolveWindowsBash(env),
-      argvPrefix: ['-c'],
-      dialect: 'bash',
+      argvPrefix: ["-c"],
+      dialect: "bash",
       supportsPosixFunctionWrapper: true,
       windowsVerbatimArguments: false,
     });
   }
 
-  const configuredPolicy = env['PI_BG_POSIX_SHELL'];
+  const configuredPolicy = env["PI_BG_POSIX_SHELL"];
   if (
     configuredPolicy !== undefined &&
-    configuredPolicy !== 'inherit' &&
-    configuredPolicy !== 'bash' &&
-    configuredPolicy !== 'sh'
+    configuredPolicy !== "inherit" &&
+    configuredPolicy !== "bash" &&
+    configuredPolicy !== "sh"
   ) {
     failShellInvocation(
-      'PI_BG_POSIX_SHELL must be exactly inherit, bash, or sh',
+      "PI_BG_POSIX_SHELL must be exactly inherit, bash, or sh",
     );
   }
-  const policy = configuredPolicy ?? 'inherit';
-  const configuredPath = env['PI_BG_POSIX_SHELL_PATH'];
-  if (policy === 'inherit') {
+  const policy = configuredPolicy ?? "inherit";
+  const configuredPath = env["PI_BG_POSIX_SHELL_PATH"];
+  if (policy === "inherit") {
     if (configuredPath !== undefined) {
       failShellInvocation(
-        'PI_BG_POSIX_SHELL_PATH requires PI_BG_POSIX_SHELL=bash or PI_BG_POSIX_SHELL=sh',
+        "PI_BG_POSIX_SHELL_PATH requires PI_BG_POSIX_SHELL=bash or PI_BG_POSIX_SHELL=sh",
       );
     }
-    const inherited = env['SHELL'];
+    const inherited = env["SHELL"];
     const executable =
-      inherited && inherited.length > 0 ? inherited : '/bin/sh';
+      hostShellPath !== undefined && hostShellPath.length > 0
+        ? hostShellPath
+        : inherited && inherited.length > 0
+          ? inherited
+          : "/bin/sh";
     const dialect = inheritedPosixDialect(executable);
     return freezeShellPolicy({
       policy,
       executable,
-      argvPrefix: ['-c'],
+      argvPrefix: ["-c"],
       dialect,
-      supportsPosixFunctionWrapper: dialect === 'bash' || dialect === 'posix',
+      supportsPosixFunctionWrapper: dialect === "bash" || dialect === "posix",
       windowsVerbatimArguments: false,
     });
   }
 
   const executable =
     configuredPath !== undefined
-      ? validatePosixShellPath(configuredPath, 'PI_BG_POSIX_SHELL_PATH')
+      ? validatePosixShellPath(configuredPath, "PI_BG_POSIX_SHELL_PATH")
       : resolvePosixExecutable(policy, env, activationCwd);
   return freezeShellPolicy({
     policy,
     executable,
-    argvPrefix: ['-c'],
-    dialect: policy === 'bash' ? 'bash' : 'posix',
+    argvPrefix: ["-c"],
+    dialect: policy === "bash" ? "bash" : "posix",
     supportsPosixFunctionWrapper: true,
     windowsVerbatimArguments: false,
   });
@@ -1027,11 +1039,11 @@ export function shellInvocationForPolicy(
   policy: ResolvedShellPolicy,
 ): ShellInvocation {
   const dialect: ShellDialect =
-    policy.dialect === 'bash' ? 'posix' : policy.dialect;
+    policy.dialect === "bash" ? "posix" : policy.dialect;
   return {
     shell: policy.executable,
     args:
-      policy.dialect === 'cmd'
+      policy.dialect === "cmd"
         ? [...policy.argvPrefix, `"${command}"`]
         : [...policy.argvPrefix, command],
     dialect,
@@ -1049,14 +1061,14 @@ export function shellInvocation(
 
 /** Windows `.cmd`/`.bat` shim 扩展名集合(shell:false 不能直接 spawn shim)。 */
 const WINDOWS_COMMAND_SHIM_EXTENSIONS: ReadonlySet<string> = new Set([
-  '.cmd',
-  '.bat',
+  ".cmd",
+  ".bat",
 ]);
 const DEFAULT_WINDOWS_PATHEXT: readonly string[] = [
-  '.COM',
-  '.EXE',
-  '.BAT',
-  '.CMD',
+  ".COM",
+  ".EXE",
+  ".BAT",
+  ".CMD",
 ];
 
 /** 单条直执行规格:可执行文件、参数与 cmd 下 verbatim 开关。 */
@@ -1070,13 +1082,13 @@ export interface ResolvedDirectExecution {
  * 键为字面量,因此显式枚举候选键而不是运行期循环匹配。
  */
 function windowsPathextValue(env: NodeJS.ProcessEnv): string | undefined {
-  const value = env['PATHEXT'] ?? env['PathExt'] ?? env['pathext'];
-  return typeof value === 'string' ? value : undefined;
+  const value = env["PATHEXT"] ?? env["PathExt"] ?? env["pathext"];
+  return typeof value === "string" ? value : undefined;
 }
 
 function windowsComSpecValue(env: NodeJS.ProcessEnv): string | undefined {
-  const value = env['ComSpec'] ?? env['COMSPEC'] ?? env['comspec'];
-  return typeof value === 'string' ? value : undefined;
+  const value = env["ComSpec"] ?? env["COMSPEC"] ?? env["comspec"];
+  return typeof value === "string" ? value : undefined;
 }
 
 function windowsExtensionCandidates(
@@ -1084,7 +1096,10 @@ function windowsExtensionCandidates(
   pathExts: readonly string[],
 ): string[] {
   if (extname(file)) return [file];
-  return [file, ...pathExts.map((extension) => `${file}${extension.toLowerCase()}`)];
+  return [
+    file,
+    ...pathExts.map((extension) => `${file}${extension.toLowerCase()}`),
+  ];
 }
 
 function isWindowsCommandShim(path: string): boolean {
@@ -1103,13 +1118,13 @@ function resolveWindowsDirectExecutionFile(
   const pathExts =
     raw && raw.length > 0
       ? raw
-          .split(';')
+          .split(";")
           .map((extension) => extension.trim())
           .filter((extension) => extension.length > 0)
       : [...DEFAULT_WINDOWS_PATHEXT];
   const fileCandidates = windowsExtensionCandidates(file, pathExts);
   let candidates: string[];
-  if (file.includes('\\') || file.includes('/') || win32.isAbsolute(file)) {
+  if (file.includes("\\") || file.includes("/") || win32.isAbsolute(file)) {
     const basePath =
       !win32.isAbsolute(file) && options.cwd
         ? win32.resolve(options.cwd, file)
@@ -1130,7 +1145,7 @@ function resolveWindowsDirectExecutionFile(
 function quoteCmdArgument(value: string): string {
   if (value.length === 0) return '""';
   if (!/[\s"%&()<>^|]/.test(value)) return value;
-  return `"${value.replace(/(["%&()<>^|])/g, '^$1')}"`;
+  return `"${value.replace(/(["%&()<>^|])/g, "^$1")}"`;
 }
 
 /**
@@ -1152,13 +1167,13 @@ export function resolveDirectExecution(
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
   const file = argv[0];
-  if (typeof file !== 'string' || file.trim().length === 0) {
+  if (typeof file !== "string" || file.trim().length === 0) {
     throw new Error(
-      'Direct execution argv[0] must be a non-empty executable name',
+      "Direct execution argv[0] must be a non-empty executable name",
     );
   }
   const args = argv.slice(1);
-  if (platform !== 'win32') {
+  if (platform !== "win32") {
     return { file, args, windowsVerbatimArguments: false };
   }
   const resolvedFile = resolveWindowsDirectExecutionFile(file, {
@@ -1169,11 +1184,11 @@ export function resolveDirectExecution(
   if (!isWindowsCommandShim(resolvedFile)) {
     return { file: resolvedFile, args, windowsVerbatimArguments: false };
   }
-  const commandLine = [resolvedFile, ...args].map(quoteCmdArgument).join(' ');
+  const commandLine = [resolvedFile, ...args].map(quoteCmdArgument).join(" ");
   const comSpec = windowsComSpecValue(env);
   return {
-    file: comSpec && comSpec.length > 0 ? comSpec : 'cmd.exe',
-    args: ['/d', '/s', '/c', commandLine],
+    file: comSpec && comSpec.length > 0 ? comSpec : "cmd.exe",
+    args: ["/d", "/s", "/c", commandLine],
     windowsVerbatimArguments: true,
   };
 }
@@ -1183,7 +1198,7 @@ export function normalizeMaxBytes(
   fallback = DEFAULT_LOG_BYTES,
 ): number {
   const raw =
-    typeof value === 'number' && Number.isFinite(value)
+    typeof value === "number" && Number.isFinite(value)
       ? Math.floor(value)
       : fallback;
   return Math.max(1, Math.min(MAX_LOG_BYTES, raw));
@@ -1209,7 +1224,7 @@ export function appendErrorText(
  * 的 boundedBackgroundTaskError 与 reload 的 boundedError、registry 的
  * terminalPublicationError 三处收敛的统一实现)。 */
 export function boundedErrorMessage(error: unknown, maxChars: number): string {
-  const text = errorMessage(error).replace(/\s+/gu, ' ').trim();
+  const text = errorMessage(error).replace(/\s+/gu, " ").trim();
   if (text.length <= maxChars) return text;
   return `${text.slice(0, maxChars - 1)}…`;
 }
@@ -1228,45 +1243,49 @@ export function deriveTerminalStatus(
   signal: NodeJS.Signals | null,
   maxOutputBytes: number,
 ): { status: TaskStatus; error?: string | undefined } {
-  if (killKind === 'user') return { status: 'cancelled' };
-  if (killKind === 'shutdown') return { status: 'killed' };
-  if (killKind === 'timeout') {
-    task.failedReason = 'timed_out';
+  if (killKind === "user") return { status: "cancelled" };
+  if (killKind === "shutdown") return { status: "killed" };
+  if (killKind === "timeout") {
+    task.failedReason = "timed_out";
     return {
-      status: 'failed',
+      status: "failed",
       error: task.error ?? `Timed out after ${String(task.timeoutSeconds)}s`,
     };
   }
-  if (killKind === 'output_cap') {
-    task.failedReason = 'output_limit';
+  if (killKind === "output_cap") {
+    task.failedReason = "output_limit";
     return {
-      status: 'failed',
-      error: task.error ?? `Output exceeded cap of ${formatSize(maxOutputBytes)}`,
+      status: "failed",
+      error:
+        task.error ?? `Output exceeded cap of ${formatSize(maxOutputBytes)}`,
     };
   }
-  if (killKind === 'disk_full') {
+  if (killKind === "disk_full") {
     // 磁盘满终止:已写输出文件保留,便于审计
-    task.failedReason = 'disk_full';
+    task.failedReason = "disk_full";
     return {
-      status: 'failed',
+      status: "failed",
       error:
         task.error ??
         `Output file write failed because the disk is full (ENOSPC); partial output is retained at ${task.outputPath}`,
     };
   }
-  if (killKind === 'handoff_expired') {
+  if (killKind === "handoff_expired") {
     return {
-      status: 'failed',
+      status: "failed",
       error:
         task.error ??
-        'pi_bg_reload_handoff_expired: reload shell execution was not claimed before its handoff deadline',
+        "pi_bg_reload_handoff_expired: reload shell execution was not claimed before its handoff deadline",
     };
   }
-  if ((exitCode ?? 0) === 0) return { status: 'completed' };
-  task.failedReason = 'exit_error';
+  // REVIEW Q3:仅字面 exitCode === 0 判 completed。被外部信号杀死(close 的
+  // exitCode 为 null、signal 有值、无 killKind)不再是「completed」误判——null
+  // 落入下方失败分支,error 含 signal 信息(`Exited with code null (SIGKILL)`)。
+  if (exitCode === 0) return { status: "completed" };
+  task.failedReason = "exit_error";
   return {
-    status: 'failed',
-    error: `Exited with code ${exitCode === null ? 'null' : String(exitCode)}${signal ? ` (${signal})` : ''}`,
+    status: "failed",
+    error: `Exited with code ${exitCode === null ? "null" : String(exitCode)}${signal ? ` (${signal})` : ""}`,
   };
 }
 
@@ -1315,7 +1334,7 @@ export function writeTaskOutputChunk(
   task.error = `Output exceeded cap of ${formatSize(options.hardBytes)}; terminating task`;
   const notice = `\n\n[background task error: ${task.error}]\n`;
   task.stream.write(notice);
-  task.bytesWritten += Buffer.byteLength(notice, 'utf8');
+  task.bytesWritten += Buffer.byteLength(notice, "utf8");
   return true;
 }
 
@@ -1359,22 +1378,24 @@ export function formatSnapshotList(
   now = Date.now(),
 ): string {
   if (tasks.length === 0)
-    return 'No background tasks in this Pi extension runtime.';
+    return "No background tasks in this Pi extension runtime.";
   return tasks
     .map((task) => {
       const statusIcon =
-        task.status === 'running'
-          ? '▶'
-          : task.status === 'completed'
-            ? '✓'
-            : task.status === 'killed' || task.status === 'cancelled'
-              ? '■'
-              : '✗';
+        task.status === "running"
+          ? "▶"
+          : task.status === "completed"
+            ? "✓"
+            : task.status === "killed" || task.status === "cancelled"
+              ? "■"
+              : "✗";
       const age = formatDuration((task.endTime ?? now) - task.startTime);
       const code =
-        task.exitCode !== undefined ? ` exit=${String(task.exitCode)}` : '';
-      const pid = task.pid !== undefined ? ` pid=${String(task.pid)}` : '';
-      const error = task.error ? ` error=${truncateChars(task.error, 80)}` : '';
+        task.exitCode === undefined || task.exitCode === null
+          ? ""
+          : ` exit=${String(task.exitCode)}`;
+      const pid = task.pid !== undefined ? ` pid=${String(task.pid)}` : "";
+      const error = task.error ? ` error=${truncateChars(task.error, 80)}` : "";
       const telemetry = [
         formatContextUsageSummary(task.contextUsage),
         formatModelSummary(task.model),
@@ -1382,11 +1403,11 @@ export function formatSnapshotList(
         formatToolUsageSummary(task.toolUsage),
       ]
         .filter(Boolean)
-        .join(' ');
-      const telemetryText = telemetry ? ` ${telemetry}` : '';
+        .join(" ");
+      const telemetryText = telemetry ? ` ${telemetry}` : "";
       return `${statusIcon} ${task.id} ${task.status} ${age}${code}${pid}${telemetryText} — ${truncateChars(taskDisplayName(task), COMMAND_PREVIEW_CHARS)}${error}\n    output: ${task.outputPath}`;
     })
-    .join('\n');
+    .join("\n");
 }
 
 export async function boundedRead(
@@ -1403,15 +1424,15 @@ export async function boundedRead(
   const totalBytes = stats.size;
   const bytesToRead = Math.min(totalBytes, maxBytes);
   if (bytesToRead === 0)
-    return { content: '', truncated: false, bytesRead: 0, totalBytes };
+    return { content: "", truncated: false, bytesRead: 0, totalBytes };
 
-  const file = await open(filePath, 'r');
+  const file = await open(filePath, "r");
   try {
     const buffer = Buffer.alloc(bytesToRead);
     const position = tail ? Math.max(0, totalBytes - bytesToRead) : 0;
     const { bytesRead } = await file.read(buffer, 0, bytesToRead, position);
     return {
-      content: buffer.subarray(0, bytesRead).toString('utf8'),
+      content: buffer.subarray(0, bytesRead).toString("utf8"),
       truncated: totalBytes > bytesRead,
       bytesRead,
       totalBytes,
@@ -1423,7 +1444,7 @@ export async function boundedRead(
 
 export function escapeXml(value: string): string {
   return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
