@@ -4,7 +4,7 @@ import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { formatSize, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { appendErrorText, boundedErrorMessage, boundedRead, deriveTerminalStatus, escapeXml, errorMessage as errorMessageText, formatAgentActivityLine, formatDuration, isEnospcError, isJsonObject, normalizeTaskName, parseAgentActivity, parseJsonText, resolveDirectExecution, resolveShellPolicy, sanitizePathSegment, shellInvocationForPolicy, shellPolicySnapshot, shellQuote, snapshot, taskDisplayName, writeTaskOutputChunk, ReloadSurvivalError, } from "./common.js";
+import { appendErrorText, boundedErrorMessage, boundedRead, buildTaskNotificationContent, deriveTerminalStatus, errorMessage as errorMessageText, formatAgentActivityLine, formatDuration, isEnospcError, isJsonObject, normalizeTaskName, parseAgentActivity, parseJsonText, resolveDirectExecution, resolveShellPolicy, sanitizePathSegment, shellInvocationForPolicy, shellPolicySnapshot, shellQuote, snapshot, taskDisplayName, truncateChars, writeTaskOutputChunk, ReloadSurvivalError, } from "./common.js";
 import { normalizeContextUsage, normalizeModel, normalizeTokenUsage, normalizeToolUsage, parseTelemetryStream, } from "./telemetry.js";
 import { writeFileDurable } from "./durable-fs.js";
 import { closeAndFsyncOutputStream, writeJsonAtomic } from "./task-durable.js";
@@ -35,6 +35,8 @@ export const TERMINAL_PUBLICATION_MAX_ATTEMPTS = 3;
 export const TERMINAL_PUBLICATION_RETRY_MS = 100;
 export const TASK_ADMISSION_TIMEOUT_MS = 30_000;
 const TERMINAL_PUBLICATION_DIAGNOSTIC_CHARS = 500;
+/** S1 排水层批失败告警:批 id 列表的有界上限(防病态大批日志膨胀)。 */
+const NOTIFICATION_BATCH_WARN_MAX_CHARS = 200;
 /** M5:终态帧完成摘要 summaryTail 的有界上限(64KiB 内;完整日志不自动回传)。 */
 export const TERMINAL_SUMMARY_TAIL_BYTES = 64 * 1024;
 /** M5:从任务输出文件取有界 tail 作为完成摘要;文件缺失/不可读/无内容时缺省,
@@ -511,6 +513,15 @@ export class BackgroundTaskRegistry {
     activeBranchGeneration = 0;
     terminalWaiters = new Map();
     backgroundRequestWaiters = new Map();
+    /** S1 通知批队列:终态任务引用,微任务排水时合成一条消息发送(无时间窗口)。 */
+    pendingNotificationTasks;
+    scheduleDrain;
+    /**
+     * S1:当前批排水的结算 promise。finalize/结单路径据此在本批投递(成功置位或
+     * 失败回滚)尘埃落定后再落盘 `notified`,避免「先写快照、后回滚」造成磁盘与
+     * 内存不一致(曾致 registry.test.ts 间歇失败)。无在途批时为 undefined。
+     */
+    pendingNotificationDrain;
     constructor(options) {
         this.terminalPublicationClosedSignal = new Promise((resolve) => {
             this.resolveTerminalPublicationClosedSignal = resolve;
@@ -548,7 +559,11 @@ export class BackgroundTaskRegistry {
         this.agentDir = options.agentDir ?? getAgentDir();
         this.onChange = options.onChange ?? noopOnChange;
         this.sendCompletionNotification = options.sendCompletionNotification;
+        // S1:批排水调度器缺省微任务排水;测试注入捕获式(手动触发排水)
+        this.scheduleDrain =
+            options.scheduleDrain ?? ((drain) => queueMicrotask(drain));
         this.publishTerminalPublication = options.publishTerminal ?? noopOnChange;
+        this.pendingNotificationTasks = [];
         this.reloadShellOwner = options.reloadShellOwner;
     }
     isShuttingDown() {
@@ -2579,10 +2594,16 @@ export class BackgroundTaskRegistry {
                 const token = execution.beginNotification(lease);
                 if (token !== undefined) {
                     try {
+                        // S1:notifyCompletion 入队后同步置 notified,finishNotification
+                        // (token, true) 于入队后同步执行、恒先行于排水层的实际投递;批排水
+                        // 失败仅回滚 notified、不触发重投(notificationState 已置 delivered)
+                        // ——与现状丢一次语义等价。
                         this.notifyCompletion(task);
                         execution.finishNotification(token, task.notified);
                     }
                     catch (error) {
+                        // S1:notifyCompletion 改为仅入队、不再同步发送,不再抛错;本 catch
+                        // 成为防御性保留(未来行为回归亦不吞错),不移除。
                         execution.finishNotification(token, false);
                         this.logger.error(`[background-tasks] notification failed for ${task.id}:`, error);
                     }
@@ -2593,6 +2614,8 @@ export class BackgroundTaskRegistry {
             task.reloadHostNotificationSettled = true;
             task.reloadHostDeliverySettled = true;
             try {
+                // S1:先等本批排水结算再落盘 notified(与 finalizeTask 同策略)
+                await this.awaitPendingNotificationDrain();
                 await this.writeMetadata(task);
             }
             catch (error) {
@@ -2844,61 +2867,88 @@ export class BackgroundTaskRegistry {
         }, TERMINAL_PUBLICATION_RETRY_MS);
         task.terminalPublishRetryHandle.unref();
     }
+    /**
+     * S1:终态任务入批队列,不再同步发送;微任务排水合成一条消息统一投递
+     * (deliverAs:'steer' 由宿主按 streaming/triggerTurn 分流)。guard 检查点
+     * 保持在入队时;微任务窗口内 shuttingDown 翻转不复查(与现状「调用时检查」
+     * 的微小时序差异,接受)。
+     */
     notifyCompletion(task) {
         if (!task.notifyOnCompletion || task.notified || this.shuttingDown)
             return;
+        // 置位时机不变:入队即锁存 notified,重复终态调用直接短路返回
         task.notified = true;
-        // S4 P6:严格判空 —— null/undefined 均省略 <exit-code>(禁止宽松相等)
-        const exit = task.exitCode === undefined || task.exitCode === null
-            ? ""
-            : `\n  <exit-code>${String(task.exitCode)}</exit-code>`;
-        const error = task.error
-            ? `\n  <error>${escapeXml(task.error)}</error>`
-            : "";
-        const taskName = taskDisplayName(task);
-        const guidance = "Terminal state and output metadata are durable. Do not call bg_status to reconfirm; use bg_logs only if output is needed.";
-        // M5 REVIEW:完成通知自动携带有界 tail 摘要(64KiB 内,复用 finalize/reload
-        // 交付路径已计算好的 terminalSummaryTail);缺失(空输出/读失败)时省略字段,
-        // 不含完整日志,output-file 字段维持。
-        const summaryTail = task.terminalSummaryTail === undefined
-            ? ""
-            : `\n  <summary-tail>${escapeXml(task.terminalSummaryTail)}</summary-tail>`;
-        const content = [
-            "<background-task-notification>",
-            `  <task-id>${task.id}</task-id>`,
-            `  <task-name>${escapeXml(taskName)}</task-name>`,
-            `  <status>${task.status}</status>`,
-            exit,
-            error,
-            `  <output-file>${escapeXml(task.outputPath)}</output-file>`,
-            summaryTail,
-            `  <summary>${escapeXml(`Background task ${JSON.stringify(taskName)} ${task.status}`)}</summary>`,
-            `  <guidance>${escapeXml(guidance)}</guidance>`,
-            "</background-task-notification>",
-        ]
-            .filter(Boolean)
-            .join("\n");
+        // 首个入队(队列为空)即调度排水;队列非空说明本排水段已调度同一次排水。
+        // 排水开始即同步取空队列,因此「队列为空」与「无已调度排水」等价。
+        const firstOfBatch = this.pendingNotificationTasks.length === 0;
+        this.pendingNotificationTasks.push(task);
+        if (firstOfBatch) {
+            let settleDrain = () => undefined;
+            this.pendingNotificationDrain = new Promise((resolve) => {
+                settleDrain = resolve;
+            });
+            const drain = () => {
+                try {
+                    this.drainNotifications();
+                }
+                finally {
+                    this.pendingNotificationDrain = undefined;
+                    settleDrain();
+                }
+            };
+            this.scheduleDrain(drain);
+        }
+    }
+    /**
+     * S1:等待当前批排水结算(投递成功置位 / 失败回滚均已落到内存 `notified`),
+     * 供 finalize/reload 结单路径在落盘前调用。无在途批时立即返回。
+     */
+    async awaitPendingNotificationDrain() {
+        await this.pendingNotificationDrain;
+    }
+    /** S1 批排水:取走队列全部任务,合成一条通知发送(单条完整块以 `\n\n` 拼接)。 */
+    drainNotifications() {
+        const tasks = this.pendingNotificationTasks;
+        this.pendingNotificationTasks = [];
+        if (tasks.length === 0)
+            return;
+        const first = tasks[0];
+        if (first === undefined)
+            return; // 队列长度已校验非空,此处仅类型收窄
         try {
+            const content = tasks
+                .map((batchTask) => buildTaskNotificationContent(batchTask))
+                .join("\n\n");
+            // 批语义:批内任一任务为 triggerOnCompletion 且非陈旧帧 → 触发新轮,
+            // 与现状按任务逐条决策的组合等价
+            const triggerTurn = tasks.some((batchTask) => batchTask.triggerOnCompletion === true &&
+                batchTask.staleBranchFrame !== true);
+            // 批信息由 content 承载,details 仅取首任务快照作 UI 展示代表;宿主
+            // extension 仅透传 sendMessage,无 per-task routing 依赖(通知渲染器按
+            // content 块数显示批规模)
+            const details = snapshot(first);
             this.sendCompletionNotification({
                 customType: "background-task-notification",
                 content,
                 display: true,
-                details: snapshot(task),
+                details,
             }, {
-                deliverAs: "followUp",
-                // 迟到结算 fence:旧代次帧只通知、不触发唤醒
-                triggerTurn: task.triggerOnCompletion === true && task.staleBranchFrame !== true,
+                deliverAs: "steer",
+                triggerTurn,
             });
         }
         catch (error) {
-            task.notified = false;
-            // S6 P8 投递确认(近似语义):同步失败可观测 → 回滚锁存 + warn 留痕。
-            // 如实说明:插件的 warn 是本次失败唯一新增留痕点;同一失败下调用方
-            // finalizeTask 既有 logger.error 记录属宿主通道既有保留,两者先后各记
-            // 一次(warn + error 双通道留痕,非重复新增)。异步失败经宿主 bindCore
-            // sendMessage→emitError 通道留痕,插件无法观测(README 已声明局限)。
-            this.logger.warn(`[background-tasks] notification delivery failed for ${task.id}; notified reset to false: ${error instanceof Error ? error.message : String(error)}`);
-            throw new Error(`Failed to send background task notification for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+            // P8 投递留痕迁移至排水层:批内全部回滚 notified(已结算的其他批不受
+            // 影响),单处 warn 留痕(含有界批 id 列表),不重抛——微任务内 rethrow
+            // 会触发 unhandledrejection;调用点既有的 logger.error 亦不再触发,
+            // 本处 warn 为唯一新增留痕。跨 reload 竞态:旧注册表排水若在 handoff
+            // 后运行仍会发送批(任务对象引用存活),叠加新注册表 notified 锁存,
+            // 结果恰好一次或丢一次(与现状 P8 丢一次语义等价),无双发路径。
+            // try 覆盖取批后的构造+发送全段:构造期纯函数若抛错同样不得逸出微任务。
+            for (const batchTask of tasks)
+                batchTask.notified = false;
+            const batchIds = truncateChars(tasks.map((batchTask) => batchTask.id).join(", "), NOTIFICATION_BATCH_WARN_MAX_CHARS);
+            this.logger.warn(`[background-tasks] notification delivery failed for batch [${batchIds}]; notified reset to false: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
     async finalizeTask(task, status, exitCode, signal, error) {
@@ -2985,6 +3035,8 @@ export class BackgroundTaskRegistry {
         else {
             // EventBus disposal abandons only EventBus publication. Notification truth
             // remains independent; notifyCompletion itself suppresses session shutdown.
+            // S1:notifyCompletion 现在仅入队(置位 notified),实际投递在微任务排水层;
+            // 排水失败由排水层单处 warn 留痕,本处 catch 成为防御性保留,不移除。
             try {
                 this.notifyCompletion(task);
             }
@@ -2993,6 +3045,9 @@ export class BackgroundTaskRegistry {
             }
         }
         try {
+            // S1:先等本批排水结算,再落盘 notified——保证持久化值等于投递结果
+            // (成功 true / 失败 false),杜绝「先写快照、后回滚」的写序竞态。
+            await this.awaitPendingNotificationDrain();
             await this.writeMetadata(task);
         }
         catch (metadataError) {

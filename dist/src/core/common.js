@@ -851,4 +851,39 @@ export function escapeXml(value) {
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
 }
+/**
+ * S2/S1:构造单条完成通知的完整 `<background-task-notification>` 内容块。
+ * 单条格式与合并通知中的组成块逐字节一致(向后兼容);合并通知以 `\n\n`
+ * 拼接多条完整块。自 registry 原内容构造块原样搬入,格式与缩进保持。
+ */
+export function buildTaskNotificationContent(task) {
+    // S4 P6:严格判空 —— null/undefined 均省略 <exit-code>(禁止宽松相等)
+    const exit = task.exitCode === undefined || task.exitCode === null
+        ? ""
+        : `\n  <exit-code>${String(task.exitCode)}</exit-code>`;
+    const error = task.error ? `\n  <error>${escapeXml(task.error)}</error>` : "";
+    const taskName = taskDisplayName(task);
+    const guidance = "Terminal state and output metadata are durable. Do not call bg_status to reconfirm; use bg_logs only if output is needed.";
+    // M5 REVIEW:完成通知自动携带有界 tail 摘要(64KiB 内,复用 finalize/reload
+    // 交付路径已计算好的 terminalSummaryTail);缺失(空输出/读失败)时省略字段,
+    // 不含完整日志,output-file 字段维持。
+    const summaryTail = task.terminalSummaryTail === undefined
+        ? ""
+        : `\n  <summary-tail>${escapeXml(task.terminalSummaryTail)}</summary-tail>`;
+    return [
+        "<background-task-notification>",
+        `  <task-id>${task.id}</task-id>`,
+        `  <task-name>${escapeXml(taskName)}</task-name>`,
+        `  <status>${task.status}</status>`,
+        exit,
+        error,
+        `  <output-file>${escapeXml(task.outputPath)}</output-file>`,
+        summaryTail,
+        `  <summary>${escapeXml(`Background task ${JSON.stringify(taskName)} ${task.status}`)}</summary>`,
+        `  <guidance>${escapeXml(guidance)}</guidance>`,
+        "</background-task-notification>",
+    ]
+        .filter(Boolean)
+        .join("\n");
+}
 //# sourceMappingURL=common.js.map
