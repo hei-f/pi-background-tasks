@@ -148,7 +148,39 @@ See [Choose a workflow](docs/choose-a-workflow.md) for a decision tree and trade
 }
 ```
 
-Expected: returns immediately with a task id, PID when available, and `.pi/tasks/...output`. Foreground calls (no `run_in_background`) behave exactly like the host built-in bash. The command runs as an ordinary local shell command with your user permissions; it can invoke networked tools or paid services if the command itself does so.
+Expected: returns immediately with a task id, PID when available, and `<agent-dir>/tasks/...output` (the host-private agent dir, e.g. `~/.pi/agent/tasks/...`). Foreground calls (no `run_in_background`) behave exactly like the host built-in bash. The command runs as an ordinary local shell command with your user permissions; it can invoke networked tools or paid services if the command itself does so.
+
+## Shell selection and host settings
+
+后台 POSIX shell 解析链(P1 同源化,与宿主前台行为对齐):
+
+1. `PI_BG_POSIX_SHELL=bash|sh`(+可选 `PI_BG_POSIX_SHELL_PATH`)显式选择;
+2. 宿主用户级 `settings.json` 的 `shellPath`(已应用宿主同款归一化,含 `~` 展开);
+3. 宿主前台 `getShellConfig()` 解析结果(缺省:macOS/Linux 为 `/bin/bash` 或 PATH 上的 bash,兜底 `sh`);
+4. `$SHELL` 环境变量;
+5. `/bin/sh`。
+
+读取失败(settings.json 缺失/解析失败/`shellPath` 指向不存在的文件)或 Windows 上找不到
+bash 时**静默降级**到 `$SHELL` 兜底,插件照常激活,不告警。**仅读用户级 settings**
+(`~/.pi/agent/settings.json`);宿主项目级 settings 合并不在本插件读取面。
+
+`settings.json` 的 `shellCommandPrefix` 前置到前台与后台命令(`<prefix>\n<command>`换行拼接,与宿主前台逐行对齐);`shellPath` 对前台经宿主 `createBashToolDefinition`
+第二参生效,对后台进入上述解析链。
+
+平台边界:Windows 上后台不走该链(`PI_BG_POSIX_SHELL` 系列在 Windows 被忽略,
+后台 Win32 分支不消费 `settings.shellPath`),前台仍按宿主 behavior 生效——前后台
+Win32 不对称;实测环境为 macOS。
+
+后台 `timeout` 语义:0 或缺省 = 不限时;`> 0` = 该秒数后强杀截止。前台 timeout 语义
+与宿主内置 bash 完全一致,不变。
+
+命名(S7):覆盖版 bash 支持可选 `task_name`(≤200 字符,存储归一 80 字符);显式
+`task_name` 第一优先,缺省时任务名 = **完整 `task.command` 原样**(4KiB 防病态护栏
+仅作用于显示面,`task.command` 字段保持完整)。
+
+通知投递留痕(P8 局限声明):宿主 `sendMessage` 返回 `void`,异步投递失败对插件不可见;
+异步失败经**宿主 bindCore `sendMessage → emitError` 通道留痕**(宿主既有机制,插件不
+假装知情)。同步失败可观测:回滚 `notified=false` 并以 warn 留痕。
 
 ## Footer dock
 
@@ -175,7 +207,7 @@ The dock「转后台」entry is the user-facing way to start background tasks; i
 
 ## Architecture, trust, and safety
 
-- Runtime task files live under `.pi/tasks/<session-id>-<pid>/`.- Shell jobs are tracked by the package, but they are not sandboxed. Treat commands as local processes with your permissions and credentials.
+- Runtime task files live under `<agent-dir>/tasks/<session-id>-<pid>/` (`getAgentDir()` defaults to `~/.pi/agent/`, the host-private agent dir; old project-local `.pi/tasks` directories are not migrated and can be removed manually).- Shell jobs are tracked by the package, but they are not sandboxed. Treat commands as local processes with your permissions and credentials.
 - Metadata and configuration replacements use write/fsync/rename durability patterns. Ordinary task output is closed and drained before terminal publication but is not explicitly fsynced. POSIX directory entries are fsynced after atomic replacement; Windows lacks the same portable directory-entry crash-durability guarantee.
 - Reload persistence keeps an opted ordinary execution alive across a real same-process `/reload`; it never adopts PIDs or copies task JSON, and a hard crash/restart is not a survival path. After the `bg_run` retirement (M4), only dock rerun of an already-opted task preserves the flag; new launches via covered `bash` do not expose it.
 

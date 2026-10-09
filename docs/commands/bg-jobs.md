@@ -13,7 +13,7 @@ covers_sources: []
 <!-- pi-docs:begin name="command-contract-bg-jobs" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-jobs` | `always` | yes | List running and recent background tasks: /bg-jobs | `src/extension.ts:700` |
+| `/bg-jobs` | `always` | yes | List running and recent background tasks: /bg-jobs | `src/extension.ts:722` |
 <!-- pi-docs:end name="command-contract-bg-jobs" -->
 
 List running and recent background tasks.
@@ -56,7 +56,7 @@ No task-resolution errors; it formats the current registry contents.
 
 ## Runtime artifacts
 
-`/bg-jobs` reads in-memory task snapshots. It points at `.pi/tasks/<session-id>-<pid>/<task-id>.output` but does not read output bytes.
+`/bg-jobs` reads in-memory task snapshots. It points at `<agent-dir>/tasks/<session-id>-<pid>/<task-id>.output` (host-private agent dir, default `~/.pi/agent/tasks/`) but does not read output bytes.
 
 ## Safety boundaries
 

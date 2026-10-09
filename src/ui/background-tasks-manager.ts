@@ -23,7 +23,8 @@ export interface TaskManagerTheme {
 }
 
 export type BackgroundTaskForUi = BgTaskSnapshot & {
-  name: string;
+  /** S7:显式命名可缺省——UI 显示一律经 taskDisplayName 兜底链,不读取原始字段。 */
+  name?: string | undefined;
   outputAbsPath: string;
 };
 type BgTask = BackgroundTaskForUi;

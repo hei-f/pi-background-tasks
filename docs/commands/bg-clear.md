@@ -13,7 +13,7 @@ covers_sources: []
 <!-- pi-docs:begin name="command-contract-bg-clear" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-clear` | `always` | yes | Clear finished background task footer notices | `src/extension.ts:666` |
+| `/bg-clear` | `always` | yes | Clear finished background task footer notices | `src/extension.ts:688` |
 <!-- pi-docs:end name="command-contract-bg-clear" -->
 
 Clear finished background task footer notices.
@@ -53,7 +53,7 @@ No task-resolution errors; the command operates on the in-memory task registry.
 
 ## Runtime artifacts
 
-No task files are deleted. Output and metadata under `.pi/tasks/...` remain intact.
+No task files are deleted. Output and metadata under `<agent-dir>/tasks/...` (`~/.pi/agent/tasks/` by default) remain intact.
 
 ## Safety boundaries
 

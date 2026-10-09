@@ -2,14 +2,14 @@ import type {
   BeforeAgentStartEvent,
   BeforeAgentStartEventResult,
   ExtensionAPI,
-} from '@earendil-works/pi-coding-agent';
+} from "@earendil-works/pi-coding-agent";
 import {
   resolveShellPolicy,
   type ResolvedShellPolicy,
   type ShellPolicySnapshot,
-} from './common.js';
+} from "./common.js";
 
-export const SHELL_POLICY_SECTION = 'pi_background_shell_policy';
+export const SHELL_POLICY_SECTION = "pi_background_shell_policy";
 const SHELL_POLICY_OPEN = `<${SHELL_POLICY_SECTION}>`;
 const SHELL_POLICY_CLOSE = `</${SHELL_POLICY_SECTION}>`;
 
@@ -19,7 +19,7 @@ interface ShellPolicyPromptEvent {
 }
 
 function promptObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function unsupportedPrompt(field: string): Error {
@@ -30,10 +30,16 @@ export interface ShellPolicyInitializationOptions {
   readonly platform?: NodeJS.Platform | undefined;
   readonly env?: NodeJS.ProcessEnv | undefined;
   readonly activationCwd?: string | undefined;
+  /** S1 P1 宿主同源注入:宿主前台 shell 解析结果(settings.shellPath 或
+   * getShellConfig 默认),有效时 POSIX inherit 分支优先于 env.SHELL。 */
+  readonly hostShellPath?: string | undefined;
 }
 
 function displayedArgs(policy: ShellPolicySnapshot): string[] {
-  return [...policy.argvPrefix, policy.dialect === 'cmd' ? '"<command>"' : '<command>'];
+  return [
+    ...policy.argvPrefix,
+    policy.dialect === "cmd" ? '"<command>"' : "<command>",
+  ];
 }
 
 /** Stable, non-secret guidance generated from the same selection used for spawning. */
@@ -46,32 +52,34 @@ export function shellPolicyGuidance(policy: ShellPolicySnapshot): string {
   });
   const lines = [
     `bash run_in_background:true and the dock "to background" entry execute commands with the activation shell policy ${launch}.`,
-    'The executable and arguments are passed directly to process spawn; the executable path is never interpolated into another shell command.',
+    "The executable and arguments are passed directly to process spawn; the executable path is never interpolated into another shell command.",
   ];
 
-  if (policy.dialect === 'user-non-posix') {
+  if (policy.dialect === "user-non-posix") {
     lines.push(
-      'This inherited user shell is not classified as POSIX or Bash. Do not generate Bash/POSIX syntax or assume Bash startup files for background commands.',
-      'Bash remediation: set PI_BG_POSIX_SHELL=bash before starting or reloading Pi; optionally set PI_BG_POSIX_SHELL_PATH to an absolute executable Bash path.',
+      "This inherited user shell is not classified as POSIX or Bash. Do not generate Bash/POSIX syntax or assume Bash startup files for background commands.",
+      "Bash remediation: set PI_BG_POSIX_SHELL=bash before starting or reloading Pi; optionally set PI_BG_POSIX_SHELL_PATH to an absolute executable Bash path.",
     );
-  } else if (policy.dialect === 'bash') {
+  } else if (policy.dialect === "bash") {
     lines.push(
-      'Generate Bash syntax for background commands. Commands use Bash -c, never -lc, so login-shell startup files are not loaded implicitly.',
+      "Generate Bash syntax for background commands. Commands use Bash -c, never -lc, so login-shell startup files are not loaded implicitly.",
     );
-  } else if (policy.dialect === 'posix') {
+  } else if (policy.dialect === "posix") {
     lines.push(
-      'Generate portable POSIX shell syntax for background commands; do not assume Bash-only syntax. Commands use -c and do not request login-shell startup.',
+      "Generate portable POSIX shell syntax for background commands; do not assume Bash-only syntax. Commands use -c and do not request login-shell startup.",
     );
   } else {
     lines.push(
-      'Generate Windows cmd.exe syntax for background commands. The POSIX shell-selection variables do not change Windows execution.',
+      "Generate Windows cmd.exe syntax for background commands. The POSIX shell-selection variables do not change Windows execution.",
     );
   }
 
-  return lines.join('\n');
+  return lines.join("\n");
 }
 
-export function renderShellPolicyGuidanceBlock(policy: ShellPolicySnapshot): string {
+export function renderShellPolicyGuidanceBlock(
+  policy: ShellPolicySnapshot,
+): string {
   return `${SHELL_POLICY_OPEN}\n${shellPolicyGuidance(policy)}\n${SHELL_POLICY_CLOSE}`;
 }
 
@@ -83,7 +91,10 @@ export function upsertShellPolicyGuidance(
   const block = renderShellPolicyGuidanceBlock(policy);
   const start = systemPrompt.indexOf(SHELL_POLICY_OPEN);
   if (start >= 0) {
-    const close = systemPrompt.indexOf(SHELL_POLICY_CLOSE, start + SHELL_POLICY_OPEN.length);
+    const close = systemPrompt.indexOf(
+      SHELL_POLICY_CLOSE,
+      start + SHELL_POLICY_OPEN.length,
+    );
     if (close >= 0) {
       return `${systemPrompt.slice(0, start)}${block}${systemPrompt.slice(close + SHELL_POLICY_CLOSE.length)}`;
     }
@@ -103,15 +114,20 @@ function upsertShellPolicySections(
   const sections: string[] = [];
   for (const part of parts) {
     // Iteration visits sparse holes as undefined, unlike Array.every/map.
-    if (typeof part !== 'string') throw unsupportedPrompt('systemPrompt array element');
+    if (typeof part !== "string")
+      throw unsupportedPrompt("systemPrompt array element");
     sections.push(part);
   }
   const index = sections.findIndex((section) => {
     const start = section.indexOf(SHELL_POLICY_OPEN);
-    return start >= 0 && section.indexOf(SHELL_POLICY_CLOSE, start + SHELL_POLICY_OPEN.length) >= 0;
+    return (
+      start >= 0 &&
+      section.indexOf(SHELL_POLICY_CLOSE, start + SHELL_POLICY_OPEN.length) >= 0
+    );
   });
   const existing = sections[index];
-  if (existing === undefined) sections.push(renderShellPolicyGuidanceBlock(policy));
+  if (existing === undefined)
+    sections.push(renderShellPolicyGuidanceBlock(policy));
   else sections[index] = upsertShellPolicyGuidance(existing, policy);
   return sections;
 }
@@ -136,27 +152,32 @@ export function applyShellPolicyGuidance(
   event: ShellPolicyPromptEvent,
   policy: ShellPolicySnapshot,
 ): BeforeAgentStartEventResult | { systemPrompt: string[] } | undefined {
-  if (!promptObject(event)) throw unsupportedPrompt('before_agent_start event');
+  if (!promptObject(event)) throw unsupportedPrompt("before_agent_start event");
   const prompt = event.systemPrompt;
-  if (Array.isArray(prompt)) return { systemPrompt: upsertShellPolicySections(prompt, policy) };
-  if (typeof prompt !== 'string')
-    throw unsupportedPrompt('systemPrompt (expected string or string[])');
+  if (Array.isArray(prompt))
+    return { systemPrompt: upsertShellPolicySections(prompt, policy) };
+  if (typeof prompt !== "string")
+    throw unsupportedPrompt("systemPrompt (expected string or string[])");
 
   const options = event.systemPromptOptions;
   if (options !== undefined && options !== null) {
-    if (!promptObject(options)) throw unsupportedPrompt('systemPromptOptions');
-    const sections = options['sections'];
+    if (!promptObject(options)) throw unsupportedPrompt("systemPromptOptions");
+    const sections = options["sections"];
     if (sections !== undefined && sections !== null) {
-      if (!promptObject(sections)) throw unsupportedPrompt('systemPromptOptions.sections');
-      const forced = options['forceSystemPrompt'];
-      if (forced !== undefined && typeof forced !== 'string') {
-        throw unsupportedPrompt('systemPromptOptions.forceSystemPrompt');
+      if (!promptObject(sections))
+        throw unsupportedPrompt("systemPromptOptions.sections");
+      const forced = options["forceSystemPrompt"];
+      if (forced !== undefined && typeof forced !== "string") {
+        throw unsupportedPrompt("systemPromptOptions.forceSystemPrompt");
       }
       // Validate before mutating host-owned sections. Preserve the existing Pi
       // mutation contract, including forced prompts that hide structured sections.
       sections[SHELL_POLICY_SECTION] = shellPolicyGuidance(policy);
-      if (typeof forced === 'string') {
-        options['forceSystemPrompt'] = upsertShellPolicyGuidance(forced, policy);
+      if (typeof forced === "string") {
+        options["forceSystemPrompt"] = upsertShellPolicyGuidance(
+          forced,
+          policy,
+        );
       }
       return undefined;
     }
@@ -165,15 +186,17 @@ export function applyShellPolicyGuidance(
 }
 
 export function createShellPolicyGuidanceHandler(policy: ResolvedShellPolicy) {
-  return (event: BeforeAgentStartEvent): BeforeAgentStartEventResult | undefined =>
+  return (
+    event: BeforeAgentStartEvent,
+  ): BeforeAgentStartEventResult | undefined =>
     applyShellPolicyGuidance(event, policy);
 }
 
 export function registerShellPolicyGuidance(
-  pi: Pick<ExtensionAPI, 'on'>,
+  pi: Pick<ExtensionAPI, "on">,
   policy: ResolvedShellPolicy,
 ): void {
-  pi.on('before_agent_start', createShellPolicyGuidanceHandler(policy));
+  pi.on("before_agent_start", createShellPolicyGuidanceHandler(policy));
 }
 
 /** Resolve once at extension activation; the returned object is deeply frozen. */
@@ -184,5 +207,6 @@ export function initializeShellPolicy(
     options.platform ?? process.platform,
     options.env ?? process.env,
     options.activationCwd ?? process.cwd(),
+    options.hostShellPath,
   );
 }

@@ -22,6 +22,7 @@ Every production file under `src/**` and `extensions/**` has exactly one primary
 | `src/core/config.ts` | [subsystems/host-ui-and-telemetry](./subsystems/host-ui-and-telemetry.md) |
 | `src/core/durable-fs.ts` | [subsystems/child-launch-durability-and-safety](./subsystems/child-launch-durability-and-safety.md) |
 | `src/core/extension-api.ts` | [api/eventbus-v1](./api/eventbus-v1.md) |
+| `src/core/host-settings.ts` | [subsystems/background-task-runtime](./subsystems/background-task-runtime.md) |
 | `src/core/lazy-module.ts` | [subsystems/host-ui-and-telemetry](./subsystems/host-ui-and-telemetry.md) |
 | `src/core/pi-launch.ts` | [subsystems/child-launch-durability-and-safety](./subsystems/child-launch-durability-and-safety.md) |
 | `src/core/process-tree.ts` | [subsystems/background-task-runtime](./subsystems/background-task-runtime.md) |

@@ -12,7 +12,7 @@ covers_sources: []
 
 <!-- pi-docs:begin name="tool-contract-bg_logs" generator="scripts/docs/generate.mjs" -->
 - Label: **Background Logs**
-- Source: `src/extension.ts:850`
+- Source: `src/extension.ts:877`
 - Availability: `always`
 - Available by default: **yes**
 - Description: Read bounded output from a background task for deliberate inspection; this is not a waiting primitive. Output is capped at 50.0KB for model safety and points to the full output file when truncated.
@@ -116,7 +116,7 @@ If not truncated, the result appends `[Full output: <path>]`. Structured details
 
 ## Runtime artifacts
 
-Reads `.pi/tasks/<session-id>-<pid>/<task-id>.output`; does not modify output or metadata.
+Reads `<agent-dir>/tasks/<session-id>-<pid>/<task-id>.output` (`getAgentDir()`, defaults to `~/.pi/agent/tasks/`); does not modify output or metadata.
 
 ## Safety boundaries
 

@@ -11,8 +11,10 @@
  *   与宿主原生路径逐行等价,含 stdin 传输/detached/128+signal 语义)。
  *
  * 渲染器不新增:沿用宿主 bash 工具自带的渲染器(宿主按工具名的渲染路径)。
- * 配置侧差异边界:宿主交互设置里的自定义 shellPath/commandPrefix 对扩展
- * 不可见,覆盖版前台路径使用宿主默认本地 shell 解析,等价宿主缺省配置。
+ * 配置侧行为(S1 自读生效):宿主用户级 settings.json 的 shellPath/
+ * shellCommandPrefix 由扩展激活时自读并注入——读取/解析失败静默降级为宿主
+ * 缺省(不告警);前台与后台 shell/命令前缀同源。仅读用户级 settings,宿主项目级
+ * 合并不在插件读取面。
  */
 import {
   createBashToolDefinition,
@@ -21,29 +23,38 @@ import {
   type BashToolDetails,
   type ExtensionContext,
   type ToolDefinition,
-} from '@earendil-works/pi-coding-agent';
-import { Type, type Static } from 'typebox';
+} from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
 import {
   deriveCompletionDeliveryGuidance,
   taskDisplayName,
   type BgTask,
   type StartTaskOptions,
-} from './core/common.js';
+} from "./core/common.js";
 
-const COMMAND_FIELD_DESCRIPTION = 'Shell command to execute';
+const COMMAND_FIELD_DESCRIPTION = "Shell command to execute";
 const TIMEOUT_FIELD_DESCRIPTION =
-  'Timeout in seconds (optional, no default timeout)';
+  "Timeout in seconds (optional, no default timeout)";
+const TASK_NAME_FIELD_DESCRIPTION =
+  "Optional explicit task name shown in the dock, /bg-jobs, the startup receipt, and the completion notification (max 200 characters). Omitted names fall back to the full command.";
 const RUN_IN_BACKGROUND_FIELD_DESCRIPTION =
-  'Optional. Set true to detach this command into the durable background task stack: the call returns immediately with a task id and output path, and terminal state is delivered automatically as <background-task-notification> which also starts a follow-up agent turn. Omit or set false for normal foreground execution identical to the built-in bash tool.';
+  "Optional. Set true to detach this command into the durable background task stack: the call returns immediately with a task id and output path, and terminal state is delivered automatically as <background-task-notification> which also starts a follow-up agent turn. In background mode timeout is a hard-kill deadline in seconds after which the task is force-terminated (0 or omitted = no deadline); foreground timeout semantics are unchanged. Omit or set false for normal foreground execution identical to the built-in bash tool.";
 
 /**
  * 覆盖版 bash 参数 schema:原 `{command, timeout}` 字段语义与 constrained
- * sampling 保持不变,新增可选 `run_in_background` 字段,旧调用方无需兼容改动。
+ * sampling 保持不变,新增可选 `run_in_background` 与 `task_name` 字段,旧调用方
+ * 无需兼容改动。
  */
 export const BashOverrideParams = Type.Object({
   command: Type.String({ description: COMMAND_FIELD_DESCRIPTION }),
   timeout: Type.Optional(
     Type.Number({ description: TIMEOUT_FIELD_DESCRIPTION }),
+  ),
+  task_name: Type.Optional(
+    Type.String({
+      description: TASK_NAME_FIELD_DESCRIPTION,
+      maxLength: 200,
+    }),
   ),
   run_in_background: Type.Optional(
     Type.Boolean({ description: RUN_IN_BACKGROUND_FIELD_DESCRIPTION }),
@@ -54,6 +65,18 @@ export type BashOverrideParamsValue = Static<typeof BashOverrideParams>;
 
 /** 前台执行结果 detail 沿用宿主 `BashToolDetails`。 */
 export type BashOverrideDetails = BashToolDetails | undefined;
+
+/** S1 P2/REVIEW N1:宿主 shellCommandPrefix 换行拼接前置(与宿主前台
+ * bash.ts:251 的 `<prefix>\n<command>` 拼接逐行对齐);前缀缺失或为空串时
+ * 原样返回。默认前台路径经宿主 createBashToolDefinition 第二参自行生效,
+ * 本助手服务于后台路径(覆盖版 bash 后台分支与 dock「转后台」/rerun 两入口共用)。 */
+export function prependCommandPrefix(
+  prefix: string | undefined,
+  command: string,
+): string {
+  if (prefix === undefined || prefix.length === 0) return command;
+  return `${prefix}\n${command}`;
+}
 
 /** 分流执行依赖:后台落点与前台宿主执行路径(单测注入假件保持可测)。 */
 export interface BashOverrideDeps {
@@ -69,11 +92,20 @@ export interface BashOverrideDeps {
     onUpdate: AgentToolUpdateCallback<BashToolDetails | undefined> | undefined,
     ctx: ExtensionContext,
   ) => Promise<AgentToolResult<BashToolDetails | undefined>>;
+  /** S1 P2:宿主 settings.shellCommandPrefix;后台分支按宿主前台同款
+   * `` `${prefix}\n${command}` `` 换行拼接前置到命令(宿主 bash.ts:251 参照)。 */
+  hostCommandPrefix?: string | undefined;
 }
 
 export interface BashOverrideOptions {
   /** ctx 缺失时的兜底工作目录(宿主 runner 通常总是注入 ctx.cwd)。 */
   baseCwd: string;
+  /** S1 P1:宿主前台 shell 解析结果(settings.shellPath 或 getShellConfig 默认),
+   * 注入后台 shell 策略链;由扩展入口解析并注入。 */
+  hostShellPath?: string | undefined;
+  /** S1 P2:宿主 settings.shellCommandPrefix,前台与后台均生效(前台经宿主
+   * createBashToolDefinition 第二参 commandPrefix,后台经 startBackgroundTask 前置)。 */
+  hostCommandPrefix?: string | undefined;
   startBackgroundTask: (
     ctx: ExtensionContext,
     command: string,
@@ -85,11 +117,21 @@ export interface BashOverrideOptions {
 export function createBashOverrideDeps(
   options: BashOverrideOptions,
 ): BashOverrideDeps {
-  const hostDefinition = createBashToolDefinition(options.baseCwd);
+  // S1 P2 前台同源:与宿主 _buildRuntime 的 `bash: { commandPrefix, shellPath }`
+  // (agent-session.ts:3243-3254)逐行对齐;字段缺失时保持宿主缺省解析。
+  const hostDefinition = createBashToolDefinition(options.baseCwd, {
+    ...(options.hostCommandPrefix === undefined
+      ? {}
+      : { commandPrefix: options.hostCommandPrefix }),
+    ...(options.hostShellPath === undefined
+      ? {}
+      : { shellPath: options.hostShellPath }),
+  });
   return {
     startBackgroundTask: options.startBackgroundTask,
     executeForeground: (toolCallId, params, signal, onUpdate, ctx) =>
       hostDefinition.execute(toolCallId, params, signal, onUpdate, ctx),
+    hostCommandPrefix: options.hostCommandPrefix,
   };
 }
 
@@ -119,14 +161,26 @@ export async function bashOverrideExecute(
   if (params.run_in_background === true) {
     const backgroundOptions: StartTaskOptions = {
       // 模型入口语义:M2 断言覆盖版 bash 缺省 notify+trigger
-      entrySource: 'model',
+      entrySource: "model",
     };
-    if (params.timeout !== undefined) {
+    // S7 P9 命名:显式 task_name 优先(入参 ≤200 字符,存储归一沿用
+    // normalizeTaskName 80);无显式名 → task.name 保持 undefined,显示链走
+    // 完整 command 原样兜底。
+    if (typeof params.task_name === "string" && params.task_name.length > 0) {
+      backgroundOptions.name = params.task_name;
+    }
+    // P7 后台 timeout 语义:0/缺省 = 不限时(不设 timeoutSeconds);> 0 = 强杀截止
+    if (params.timeout !== undefined && params.timeout > 0) {
       backgroundOptions.timeoutSeconds = params.timeout;
     }
+    // S1 P2 commandPrefix 前置:与宿主前台拼接逐行对齐(bash.ts:251)
+    const command = prependCommandPrefix(
+      deps.hostCommandPrefix,
+      params.command,
+    );
     const task = await deps.startBackgroundTask(
       ctx,
-      params.command,
+      command,
       backgroundOptions,
     );
     const guidance = deriveCompletionDeliveryGuidance(
@@ -136,21 +190,26 @@ export async function bashOverrideExecute(
     return {
       content: [
         {
-          type: 'text' as const,
+          type: "text" as const,
           text: [
             `Started background task ${taskDisplayName(task)} (${task.id})`,
             `Status: ${task.status}`,
-            `PID: ${String(task.pid ?? 'unknown')}`,
+            `PID: ${String(task.pid ?? "unknown")}`,
             `Output: ${task.outputPath}`,
             guidance.text,
-          ].join('\n'),
+          ].join("\n"),
         },
       ],
       details: { fullOutputPath: task.outputPath },
     };
   }
-  // 前台路径:剔除新增字段后透传宿主原生执行,逐行等价
-  const { run_in_background: _omit, ...foregroundParams } = params;
+  // 前台路径:剔除新增字段(run_in_background/task_name)后透传宿主原生执行,
+  // 逐行等价;task_name 属后台命名语义,不得残留进 foregroundParams 泄漏给宿主
+  const {
+    run_in_background: _omit,
+    task_name: _omitName,
+    ...foregroundParams
+  } = params;
   return deps.executeForeground(
     toolCallId,
     foregroundParams,
@@ -170,14 +229,14 @@ type BashOverrideRenderCall = NonNullable<
     typeof BashOverrideParams,
     BashOverrideDetails,
     unknown
-  >['renderCall']
+  >["renderCall"]
 >;
 type BashOverrideRenderResult = NonNullable<
   ToolDefinition<
     typeof BashOverrideParams,
     BashOverrideDetails,
     unknown
-  >['renderResult']
+  >["renderResult"]
 >;
 
 export const bashOverrideRenderCall: BashOverrideRenderCall =

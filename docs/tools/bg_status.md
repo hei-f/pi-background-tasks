@@ -12,7 +12,7 @@ covers_sources: []
 
 <!-- pi-docs:begin name="tool-contract-bg_status" generator="scripts/docs/generate.mjs" -->
 - Label: **Background Status**
-- Source: `src/extension.ts:817`
+- Source: `src/extension.ts:844`
 - Availability: `always`
 - Available by default: **yes**
 - Description: Inspect one background task or list all running/recent background tasks. This is a point-in-time inspection tool, not a waiting primitive.
@@ -94,7 +94,7 @@ Tool execution rejects loudly; there is no silent fallback to an empty list.
 
 ## Runtime artifacts
 
-Read-only in-memory snapshots. It does not read or write `.pi/tasks` files.
+Read-only in-memory snapshots. It never reads or writes runtime task files (they live under `<agent-dir>/tasks/`, e.g. `~/.pi/agent/tasks/`).
 
 ## Safety boundaries
 

@@ -38,22 +38,22 @@ This generated registry lists production environment-variable references, runtim
 
 | Name | Access | Provenance |
 | --- | --- | --- |
-| `ComSpec` | read | `src/core/common.ts:1078`<br>`src/core/common.ts:939`<br>`src/core/common.ts:957` |
-| `COMSPEC` | read | `src/core/common.ts:1078` |
-| `path` | read | `src/core/common.ts:849` |
-| `Path` | read | `src/core/common.ts:849` |
-| `PATH` | read | `src/core/common.ts:849`<br>`src/core/common.ts:909`<br>`src/core/pi-launch.ts:425` |
-| `PathExt` | read | `src/core/common.ts:1073` |
-| `PATHEXT` | read | `src/core/common.ts:1073` |
-| `PI_BG_DISABLE_PI_TELEMETRY` | read | `src/core/registry.ts:382` |
+| `ComSpec` | read | `src/core/common.ts:1090`<br>`src/core/common.ts:947`<br>`src/core/common.ts:965` |
+| `COMSPEC` | read | `src/core/common.ts:1090` |
+| `path` | read | `src/core/common.ts:847` |
+| `Path` | read | `src/core/common.ts:847` |
+| `PATH` | read | `src/core/common.ts:847`<br>`src/core/common.ts:907`<br>`src/core/pi-launch.ts:425` |
+| `PathExt` | read | `src/core/common.ts:1085` |
+| `PATHEXT` | read | `src/core/common.ts:1085` |
+| `PI_BG_DISABLE_PI_TELEMETRY` | read | `src/core/registry.ts:383` |
 | `PI_BG_DOCK_SHORTCUT` | read | `src/core/config.ts:63` |
-| `PI_BG_MAX_OUTPUT_BYTES` | read | `src/core/registry.ts:99` |
-| `PI_BG_POSIX_SHELL` | read | `src/core/common.ts:978` |
-| `PI_BG_POSIX_SHELL_PATH` | read | `src/core/common.ts:990` |
-| `PI_BG_SHELL` | read | `src/core/common.ts:934` |
-| `PI_BG_SHELL_PATH` | read | `src/core/common.ts:935` |
-| `PI_BG_SOFT_OUTPUT_BYTES` | read | `src/core/registry.ts:102` |
-| `SHELL` | read | `src/core/common.ts:997` |
+| `PI_BG_MAX_OUTPUT_BYTES` | read | `src/core/registry.ts:98` |
+| `PI_BG_POSIX_SHELL` | read | `src/core/common.ts:986` |
+| `PI_BG_POSIX_SHELL_PATH` | read | `src/core/common.ts:998` |
+| `PI_BG_SHELL` | read | `src/core/common.ts:942` |
+| `PI_BG_SHELL_PATH` | read | `src/core/common.ts:943` |
+| `PI_BG_SOFT_OUTPUT_BYTES` | read | `src/core/registry.ts:101` |
+| `SHELL` | read | `src/core/common.ts:1005` |
 | `SystemRoot` | read | `src/core/windows-taskkill.ts:96` |
 | `WINDIR` | read | `src/core/windows-taskkill.ts:101` |
 
@@ -61,10 +61,10 @@ This generated registry lists production environment-variable references, runtim
 
 | Kind | Path/artifact | Provenance |
 | --- | --- | --- |
-| directory | `.pi/tasks/<session-id>-<pid>/` | `src/core/registry.ts:1430` |
-| task-file | `.pi/tasks/<session-id>-<pid>/<task-id>.json` | `src/core/registry.ts:1734` |
-| task-file | `.pi/tasks/<session-id>-<pid>/<task-id>.output` | `src/core/registry.ts:1733` |
-| task-file | `.pi/tasks/<session-id>-<pid>/<task-id>.pi-telemetry-wrapper.cjs` | `src/core/registry.ts:1964` |
+| directory | `.pi/tasks/<session-id>-<pid>/` | `src/core/registry.ts:1` |
+| task-file | `.pi/tasks/<session-id>-<pid>/<task-id>.json` | `src/core/registry.ts:1745` |
+| task-file | `.pi/tasks/<session-id>-<pid>/<task-id>.output` | `src/core/registry.ts:1744` |
+| task-file | `.pi/tasks/<session-id>-<pid>/<task-id>.pi-telemetry-wrapper.cjs` | `src/core/registry.ts:1976` |
 
 ### Schema identifiers
 

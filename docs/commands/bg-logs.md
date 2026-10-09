@@ -13,7 +13,7 @@ covers_sources: []
 <!-- pi-docs:begin name="command-contract-bg-logs" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-logs` | `always` | yes | Show bounded output from a background task: /bg-logs <id> [maxBytes] | `src/extension.ts:715` |
+| `/bg-logs` | `always` | yes | Show bounded output from a background task: /bg-logs <id> [maxBytes] | `src/extension.ts:737` |
 <!-- pi-docs:end name="command-contract-bg-logs" -->
 
 Show bounded output from a background task.
@@ -50,13 +50,13 @@ Use `/bg-logs` when you need task output in the host UI. For agent tool calls, u
 The notification contains output text. If truncated, a notice is prepended for tail reads:
 
 ```text
-[Showing tail <bytes-read> of <total>; <omitted> omitted. Full output: .pi/tasks/.../<task-id>.output]
+[Showing tail <bytes-read> of <total>; <omitted> omitted. Full output: <agent-dir>/tasks/.../<task-id>.output]
 ```
 
 If not truncated, the result ends with:
 
 ```text
-[Full output: .pi/tasks/.../<task-id>.output]
+[Full output: <agent-dir>/tasks/.../<task-id>.output]
 ```
 
 The full output path is preserved even when model-visible bytes are bounded.
@@ -72,7 +72,7 @@ Errors are shown as `Background logs error: ...`.
 
 ## Runtime artifacts
 
-Reads `.pi/tasks/<session-id>-<pid>/<task-id>.output`; does not modify output or metadata.
+Reads `<agent-dir>/tasks/<session-id>-<pid>/<task-id>.output` (`getAgentDir()`, defaults to `~/.pi/agent/tasks/`); does not modify output or metadata.
 
 ## Safety boundaries
 

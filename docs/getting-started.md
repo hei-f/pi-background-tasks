@@ -54,7 +54,7 @@ When Pi itself should start a long command, use the covered `bash` tool with `ru
 }
 ```
 
-The covered `bash` background path returns a task id and output path, writes output under `.pi/tasks/...`, and defaults the model entry to `notifyOnCompletion:true` and `triggerOnCompletion:true`, so Pi should not sleep or poll merely to wait. The terminal notification is the wake-up path. The command is still an ordinary local shell command; the package tracks it but does not sandbox it.
+The covered `bash` background path returns a task id and output path, writes output under the host-private agent dir (`<agent-dir>/tasks/...`, e.g. `~/.pi/agent/tasks/...`), and defaults the model entry to `notifyOnCompletion:true` and `triggerOnCompletion:true`, so Pi should not sleep or poll merely to wait. The terminal notification is the wake-up path. The command is still an ordinary local shell command; the package tracks it but does not sandbox it.
 
 ## 3. Observe completion
 

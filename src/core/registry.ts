@@ -1,16 +1,15 @@
-import { spawn as nodeSpawn, type SpawnOptions } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { createWriteStream, existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import type { Api, Model } from '@earendil-works/pi-ai';
-import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { formatSize } from '@earendil-works/pi-coding-agent';
+import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { createWriteStream, existsSync } from "node:fs";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { formatSize, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   appendErrorText,
   boundedErrorMessage,
   boundedRead,
-  deriveTaskNameFromCommand,
   deriveTerminalStatus,
   escapeXml,
   errorMessage as errorMessageText,
@@ -48,7 +47,7 @@ import {
   type TaskStatus,
   type TerminalPublicationAbandonReason,
   ReloadSurvivalError,
-} from './common.js';
+} from "./common.js";
 import {
   normalizeContextUsage,
   normalizeModel,
@@ -57,28 +56,28 @@ import {
   parseTelemetryStream,
   type TelemetryControlPayload,
   type TelemetryDelta,
-} from './telemetry.js';
-import { writeFileDurable } from './durable-fs.js';
-import { closeAndFsyncOutputStream, writeJsonAtomic } from './task-durable.js';
-import { resolvePiLaunch, type PiLaunchSpec } from './pi-launch.js';
+} from "./telemetry.js";
+import { writeFileDurable } from "./durable-fs.js";
+import { closeAndFsyncOutputStream, writeJsonAtomic } from "./task-durable.js";
+import { resolvePiLaunch, type PiLaunchSpec } from "./pi-launch.js";
 import {
   BackgroundTaskExtensionServiceClosedError,
   type BackgroundTaskTerminalPublication,
-} from './extension-api.js';
+} from "./extension-api.js";
 import {
   createReloadableShellExecutionV1,
   RELOAD_SHELL_OWNER_PROTOCOL,
-} from './reload-shell-owner.js';
+} from "./reload-shell-owner.js";
 import {
   runWindowsTaskkill,
   type TaskkillOutcome,
   type WindowsKillPhase,
   type WindowsTaskkillOptions,
-} from './windows-taskkill.js';
+} from "./windows-taskkill.js";
 import {
   collectPosixDescendantPids as collectPosixDescendantPidsDefault,
   POSIX_DESCENDANT_COLLECT_DELAY_MS,
-} from './process-tree.js';
+} from "./process-tree.js";
 
 /** 启动审计遗留 running 记录的落盘错误说明前缀。 */
 export const STARTUP_AUDIT_ERROR =
@@ -96,15 +95,15 @@ function stopInitiatorPriority(initiator?: StopInitiator): number {
 }
 
 export const MAX_OUTPUT_BYTES = Number(
-  process.env['PI_BG_MAX_OUTPUT_BYTES'] ?? 2 * 1024 * 1024 * 1024,
+  process.env["PI_BG_MAX_OUTPUT_BYTES"] ?? 2 * 1024 * 1024 * 1024,
 );
 export const SOFT_OUTPUT_BYTES = Number(
-  process.env['PI_BG_SOFT_OUTPUT_BYTES'] ?? 256 * 1024 * 1024,
+  process.env["PI_BG_SOFT_OUTPUT_BYTES"] ?? 256 * 1024 * 1024,
 );
 export const KILL_GRACE_MS = 3000;
 export const STOP_WAIT_MS = KILL_GRACE_MS + 1500;
 /** TERM 后启动 ps 后代收集的延迟窗口(定义与注入说明见 `process-tree.ts`)。 */
-export { POSIX_DESCENDANT_COLLECT_DELAY_MS } from './process-tree.js';
+export { POSIX_DESCENDANT_COLLECT_DELAY_MS } from "./process-tree.js";
 export const MAX_RECENT_TASKS = 100;
 export const TERMINAL_PUBLICATION_MAX_ATTEMPTS = 3;
 export const TERMINAL_PUBLICATION_RETRY_MS = 100;
@@ -124,7 +123,7 @@ async function readTerminalSummaryTail(
       TERMINAL_SUMMARY_TAIL_BYTES,
       true,
     );
-    const tail = read.content.replace(/\s+$/u, '');
+    const tail = read.content.replace(/\s+$/u, "");
     return tail.length > 0 ? tail : undefined;
   } catch {
     // 输出文件缺失/不可读不影响终态发布,摘要缺省
@@ -134,14 +133,14 @@ async function readTerminalSummaryTail(
 
 export type TerminalPublicationClosureReason = Extract<
   TerminalPublicationAbandonReason,
-  'registry_shutdown' | 'publisher_closed'
+  "registry_shutdown" | "publisher_closed"
 >;
 
 type TerminalPublicationGateOutcome =
-  | { readonly kind: 'released' }
-  | { readonly kind: 'rejected'; readonly error: unknown }
+  | { readonly kind: "released" }
+  | { readonly kind: "rejected"; readonly error: unknown }
   | {
-      readonly kind: 'closed';
+      readonly kind: "closed";
       readonly reason: TerminalPublicationAbandonReason;
     };
 
@@ -151,33 +150,33 @@ interface TerminalPublicationAbandonSignal {
 }
 
 export class BackgroundTaskAdmissionClosedError extends Error {
-  readonly code = 'pi_background_tasks_admission_closed';
+  readonly code = "pi_background_tasks_admission_closed";
 
   constructor(kind: string) {
     super(`Cannot start ${kind} after background task admissions have closed`);
-    this.name = 'BackgroundTaskAdmissionClosedError';
+    this.name = "BackgroundTaskAdmissionClosedError";
   }
 }
 
 export class BackgroundTaskAdmissionTimeoutError extends Error {
-  readonly code = 'pi_background_tasks_admission_timeout';
+  readonly code = "pi_background_tasks_admission_timeout";
 
   constructor(kind: string, timeoutMs: number) {
     super(`Timed out while preparing ${kind} after ${String(timeoutMs)}ms`);
-    this.name = 'BackgroundTaskAdmissionTimeoutError';
+    this.name = "BackgroundTaskAdmissionTimeoutError";
   }
 }
 
 /** REVIEW:显式传入 `argv` 但判定为无效(非空字符串数组、argv[0] 非空可执行名)
  * 时的告警错误;不得静默降级执行另一条命令。 */
 export class BackgroundTaskInvalidArgvError extends Error {
-  readonly code = 'pi_bg_argv_invalid';
+  readonly code = "pi_bg_argv_invalid";
 
   constructor() {
     super(
-      'argv direct execution requires a non-empty array whose first element is a non-empty executable name',
+      "argv direct execution requires a non-empty array whose first element is a non-empty executable name",
     );
-    this.name = 'BackgroundTaskInvalidArgvError';
+    this.name = "BackgroundTaskInvalidArgvError";
   }
 }
 
@@ -190,11 +189,11 @@ interface TaskAdmission {
   released: boolean;
 }
 export const WIN32_CMD_PI_TELEMETRY_UNAVAILABLE_REASON =
-  'win32-cmd-cannot-safely-intercept-pi-argv';
+  "win32-cmd-cannot-safely-intercept-pi-argv";
 export const NON_POSIX_SHELL_PI_TELEMETRY_UNAVAILABLE_REASON =
-  'user-non-posix-shell-cannot-safely-intercept-pi-argv';
+  "user-non-posix-shell-cannot-safely-intercept-pi-argv";
 export const DIRECT_EXEC_PI_TELEMETRY_UNAVAILABLE_REASON =
-  'direct-argv-execution-cannot-safely-intercept-pi-argv';
+  "direct-argv-execution-cannot-safely-intercept-pi-argv";
 
 /**
  * 直执行判定(M4):`options.argv` 为有效非空字符串数组(首个元素非空)时启用
@@ -209,7 +208,7 @@ function directExecutionFromOptions(
     argv === undefined ||
     !Array.isArray(argv) ||
     argv.length === 0 ||
-    typeof argv[0] !== 'string' ||
+    typeof argv[0] !== "string" ||
     argv[0].trim().length === 0
   ) {
     return undefined;
@@ -222,8 +221,8 @@ function directExecutionFromOptions(
 }
 
 export interface BackgroundTaskModelRegistry extends Pick<
-  ExtensionContext['modelRegistry'],
-  'getAll'
+  ExtensionContext["modelRegistry"],
+  "getAll"
 > {
   find?: (provider: string, modelId: string) => Model<Api> | undefined;
   isUsingOAuth?: (model: Model<Api>) => boolean;
@@ -233,11 +232,11 @@ export interface BackgroundTaskContext {
   cwd: string;
   sessionId?: string;
   modelRegistry: BackgroundTaskModelRegistry;
-  model?: ExtensionContext['model'] | undefined;
+  model?: ExtensionContext["model"] | undefined;
 }
 
 interface OutputEventSource {
-  on(event: 'data', listener: (data: Buffer | string) => void): unknown;
+  on(event: "data", listener: (data: Buffer | string) => void): unknown;
   /** M3 force-exit:释放插件持有的 pipe 读端(Node ReadStream 实现;测试假件可为缺省)。 */
   destroy?: (() => void) | undefined;
 }
@@ -245,7 +244,7 @@ interface OutputEventSource {
 interface ChildStdin {
   write(data: Buffer, callback: (error?: Error | null) => void): boolean;
   end(callback?: () => void): unknown;
-  once(event: 'error', listener: (error: Error) => void): unknown;
+  once(event: "error", listener: (error: Error) => void): unknown;
 }
 
 export interface BackgroundTaskChildProcess {
@@ -254,9 +253,9 @@ export interface BackgroundTaskChildProcess {
   stdout?: OutputEventSource | null | undefined;
   stderr?: OutputEventSource | null | undefined;
   kill(signal?: NodeJS.Signals): boolean;
-  on(event: 'error', listener: (error: Error) => void): unknown;
+  on(event: "error", listener: (error: Error) => void): unknown;
   on(
-    event: 'close',
+    event: "close",
     listener: (code: number | null, signal: NodeJS.Signals | null) => void,
   ): unknown;
 }
@@ -308,23 +307,23 @@ interface TaskWaiter {
 }
 
 function waiterAbortReason(signal: AbortSignal): unknown {
-  return signal.reason ?? new Error('Background task wait aborted');
+  return signal.reason ?? new Error("Background task wait aborted");
 }
 
 /** 判定任务是否已终止(五态终态全集,即非 running)。 */
 function isTerminalTaskStatus(status: TaskStatus): boolean {
-  return status !== 'running';
+  return status !== "running";
 }
 
 export interface CompletionNotificationMessage {
-  customType: 'background-task-notification';
+  customType: "background-task-notification";
   content: string;
   display: true;
   details: BgTaskSnapshot;
 }
 
 export interface CompletionNotificationOptions {
-  deliverAs: 'followUp';
+  deliverAs: "followUp";
   triggerTurn: boolean;
 }
 
@@ -354,13 +353,15 @@ export interface BackgroundTaskRegistryOptions {
   taskAdmissionTimeoutMs?: number;
   /** M3:可注入的 POSIX 后代收集(单测注入 fixture;缺省为真实 ps 一次扫描)。 */
   collectPosixDescendantPids?: (rootPid: number) => Promise<Set<number>>;
-  logger?: Pick<Console, 'error'>;
+  logger?: Pick<Console, "error" | "warn">;
   reloadShellOwner?: ReloadShellOwnerHubV1;
+  /** S3 P5:运行时目录根(生产缺省 = 宿主私有 `getAgentDir()`;单测注入临时目录
+   * 保持隔离,避免写入宿主真实 agent 目录)。 */
+  agentDir?: string;
 }
 
 interface RuntimeDir {
   abs: string;
-  display: string;
 }
 
 interface ModelWindowIndex {
@@ -372,27 +373,27 @@ interface ModelWindowIndex {
 }
 
 function defaultTaskId(): string {
-  return `b${randomBytes(4).toString('hex')}`;
+  return `b${randomBytes(4).toString("hex")}`;
 }
 
 export function commandMayLaunchPiAgent(
   command: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  if (env['PI_BG_DISABLE_PI_TELEMETRY'] === '1') return false;
+  if (env["PI_BG_DISABLE_PI_TELEMETRY"] === "1") return false;
   return /(^|[\s;&|()])pi(?=\s)(?=[^\n;&|]*(?:\s-p(?:\s|$)|\s--print(?:\s|$)|\s--mode(?:=|\s+)json\b))/m.test(
     command,
   );
 }
 
 export function buildModelWindowIndex(
-  ctx: Pick<BackgroundTaskContext, 'modelRegistry' | 'model'>,
+  ctx: Pick<BackgroundTaskContext, "modelRegistry" | "model">,
 ): ModelWindowIndex {
   const byQualifiedId: Record<string, number> = {};
   const candidatesById = new Map<string, Set<number>>();
   for (const model of ctx.modelRegistry.getAll()) {
     const contextWindow =
-      typeof model.contextWindow === 'number' &&
+      typeof model.contextWindow === "number" &&
       Number.isFinite(model.contextWindow) &&
       model.contextWindow > 0
         ? Math.floor(model.contextWindow)
@@ -745,7 +746,6 @@ function processLine(line) {
 `;
 }
 
-
 function noopOnChange(): void {
   return undefined;
 }
@@ -782,7 +782,8 @@ export class BackgroundTaskRegistry {
   private readonly collectPosixDescendantPids: (
     rootPid: number,
   ) => Promise<Set<number>>;
-  private readonly logger: Pick<Console, 'error'>;
+  private readonly logger: Pick<Console, "error" | "warn">;
+  private readonly agentDir: string;
   private readonly onChange: () => void;
   private readonly sendCompletionNotification: CompletionNotificationSender;
   private readonly publishTerminalPublication: (
@@ -805,7 +806,10 @@ export class BackgroundTaskRegistry {
    * 旧代次帧结算时标陈旧、不触发唤醒。 */
   private activeBranchGeneration = 0;
   private readonly terminalWaiters = new Map<string, Set<TaskWaiter>>();
-  private readonly backgroundRequestWaiters = new Map<string, Set<TaskWaiter>>();
+  private readonly backgroundRequestWaiters = new Map<
+    string,
+    Set<TaskWaiter>
+  >();
 
   constructor(options: BackgroundTaskRegistryOptions) {
     this.terminalPublicationClosedSignal = new Promise((resolve) => {
@@ -843,9 +847,10 @@ export class BackgroundTaskRegistry {
     this.taskAdmissionTimeoutMs = BackgroundTaskRegistry.positiveTimeout(
       options.taskAdmissionTimeoutMs,
       TASK_ADMISSION_TIMEOUT_MS,
-      'taskAdmissionTimeoutMs',
+      "taskAdmissionTimeoutMs",
     );
     this.logger = options.logger ?? console;
+    this.agentDir = options.agentDir ?? getAgentDir();
     this.onChange = options.onChange ?? noopOnChange;
     this.sendCompletionNotification = options.sendCompletionNotification;
     this.publishTerminalPublication = options.publishTerminal ?? noopOnChange;
@@ -936,16 +941,16 @@ export class BackgroundTaskRegistry {
     const primary = this.taskAdmissionError(admission);
     const meaningful = details.filter((detail) => {
       if (detail === undefined || detail === primary) return false;
-      if (typeof detail !== 'object' || detail === null) return true;
+      if (typeof detail !== "object" || detail === null) return true;
       return (
-        Reflect.get(detail, 'name') !== 'AbortError' &&
-        Reflect.get(detail, 'code') !== Reflect.get(primary, 'code')
+        Reflect.get(detail, "name") !== "AbortError" &&
+        Reflect.get(detail, "code") !== Reflect.get(primary, "code")
       );
     });
     if (meaningful.length === 0) return primary;
     return new AggregateError(
       [primary, ...meaningful],
-      `${primary.message}; admission cancellation or cleanup reported additional failures: ${meaningful.map(BackgroundTaskRegistry.errorMessage).join('; ')}`,
+      `${primary.message}; admission cancellation or cleanup reported additional failures: ${meaningful.map(BackgroundTaskRegistry.errorMessage).join("; ")}`,
     );
   }
 
@@ -971,15 +976,15 @@ export class BackgroundTaskRegistry {
     } catch (error) {
       if (
         admission.controller.signal.aborted &&
-        typeof error === 'object' &&
+        typeof error === "object" &&
         error !== null
       ) {
-        const isPlainAbort = Reflect.get(error, 'name') === 'AbortError';
+        const isPlainAbort = Reflect.get(error, "name") === "AbortError";
         const isCleanDurableCancellation =
-          Reflect.get(error, 'code') === 'durable_file_cancelled' &&
-          Reflect.get(error, 'renameCompleted') !== true &&
-          Array.isArray(Reflect.get(error, 'cleanupFailures')) &&
-          (Reflect.get(error, 'cleanupFailures') as unknown[]).length === 0;
+          Reflect.get(error, "code") === "durable_file_cancelled" &&
+          Reflect.get(error, "renameCompleted") !== true &&
+          Array.isArray(Reflect.get(error, "cleanupFailures")) &&
+          (Reflect.get(error, "cleanupFailures") as unknown[]).length === 0;
         if (isPlainAbort || isCleanDurableCancellation) {
           throw this.taskAdmissionError(admission);
         }
@@ -1011,7 +1016,7 @@ export class BackgroundTaskRegistry {
     if (value) {
       this.shuttingDown = true;
       this.closeTaskAdmissions();
-      this.closeTerminalPublication('registry_shutdown');
+      this.closeTerminalPublication("registry_shutdown");
       return;
     }
     // Publication and admission closure belong to one extension activation and
@@ -1030,7 +1035,7 @@ export class BackgroundTaskRegistry {
     const effectiveReason = this.terminalPublicationCloseReason ?? reason;
     for (const task of this.tasks.values()) {
       if (
-        task.terminalPublicationState === 'pending' &&
+        task.terminalPublicationState === "pending" &&
         task.terminalEmitInFlight === true
       ) {
         // A synchronous listener can close the service while emit() is still on
@@ -1044,8 +1049,8 @@ export class BackgroundTaskRegistry {
         continue;
       }
       const shouldLog =
-        task.terminalPublicationState === 'pending' &&
-        task.status !== 'running' &&
+        task.terminalPublicationState === "pending" &&
+        task.status !== "running" &&
         (task.terminalPublishAttempts > 0 ||
           task.terminalPublishRetryHandle !== undefined ||
           task.terminalPublicationGate !== undefined);
@@ -1122,7 +1127,8 @@ export class BackgroundTaskRegistry {
     options?: { signal?: AbortSignal },
   ): Promise<BgTaskSnapshot | undefined> {
     const signal = options?.signal;
-    if (signal?.aborted === true) return Promise.reject(waiterAbortReason(signal));
+    if (signal?.aborted === true)
+      return Promise.reject(waiterAbortReason(signal));
     return new Promise((resolve, reject) => {
       const waiter: TaskWaiter = { resolve, reject, signal };
       if (signal !== undefined) {
@@ -1130,7 +1136,7 @@ export class BackgroundTaskRegistry {
           this.removeTaskWaiter(waitersByTask, id, waiter);
           reject(waiterAbortReason(signal));
         };
-        signal.addEventListener('abort', waiter.onAbort, { once: true });
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
       }
       let waiters = waitersByTask.get(id);
       if (waiters === undefined) {
@@ -1151,7 +1157,7 @@ export class BackgroundTaskRegistry {
     waitersByTask.delete(id);
     for (const waiter of waiters) {
       if (waiter.signal !== undefined && waiter.onAbort !== undefined) {
-        waiter.signal.removeEventListener('abort', waiter.onAbort);
+        waiter.signal.removeEventListener("abort", waiter.onAbort);
       }
       waiter.resolve(result);
     }
@@ -1168,7 +1174,10 @@ export class BackgroundTaskRegistry {
     if (waiters.size === 0) waitersByTask.delete(id);
   }
 
-  private resolveTerminalWaiters(id: string, result: BgTaskSnapshot | undefined): void {
+  private resolveTerminalWaiters(
+    id: string,
+    result: BgTaskSnapshot | undefined,
+  ): void {
     this.resolveTaskWaiters(this.terminalWaiters, id, result);
   }
 
@@ -1227,8 +1236,8 @@ export class BackgroundTaskRegistry {
   ): Promise<ReloadShellHostAdapterV1> {
     if (claim.protocol !== RELOAD_SHELL_OWNER_PROTOCOL) {
       throw new ReloadSurvivalError(
-        'pi_bg_reload_owner_protocol_incompatible',
-        'activation claim does not use the supported reload shell owner protocol',
+        "pi_bg_reload_owner_protocol_incompatible",
+        "activation claim does not use the supported reload shell owner protocol",
       );
     }
     const staged: ReloadableShellExecutionV1[] = [];
@@ -1240,13 +1249,13 @@ export class BackgroundTaskRegistry {
         execution.task.surviveReload !== true
       ) {
         throw new ReloadSurvivalError(
-          'pi_bg_reload_owner_protocol_incompatible',
-          'activation claim contains an incompatible reload shell execution',
+          "pi_bg_reload_owner_protocol_incompatible",
+          "activation claim contains an incompatible reload shell execution",
         );
       }
       if (ids.has(execution.task.id) || this.tasks.has(execution.task.id)) {
         throw new ReloadSurvivalError(
-          'pi_bg_reload_owner_activation_conflict',
+          "pi_bg_reload_owner_activation_conflict",
           `claimed task id ${execution.task.id} conflicts with the fresh registry`,
         );
       }
@@ -1286,8 +1295,8 @@ export class BackgroundTaskRegistry {
           lease.identityKey !== claim.identityKey
         ) {
           throw new ReloadSurvivalError(
-            'pi_bg_reload_owner_stale_claim',
-            'committed lease does not match its staged activation claim',
+            "pi_bg_reload_owner_stale_claim",
+            "committed lease does not match its staged activation claim",
           );
         }
         boundLease = lease;
@@ -1334,8 +1343,8 @@ export class BackgroundTaskRegistry {
       this.reloadShellLease !== lease
     ) {
       throw new ReloadSurvivalError(
-        'pi_bg_reload_owner_stale_claim',
-        'registry does not own the requested reload activation lease',
+        "pi_bg_reload_owner_stale_claim",
+        "registry does not own the requested reload activation lease",
       );
     }
     const executions = this.reloadShellOwner.beginReloadHandoff(lease);
@@ -1344,7 +1353,7 @@ export class BackgroundTaskRegistry {
       const task = execution.task;
       if (this.tasks.get(task.id) !== task) {
         throw new ReloadSurvivalError(
-          'pi_bg_reload_owner_stale_claim',
+          "pi_bg_reload_owner_stale_claim",
           `registry no longer owns survivor ${task.id}`,
         );
       }
@@ -1375,15 +1384,15 @@ export class BackgroundTaskRegistry {
     while (true) {
       const unsettled = [...this.tasks.values()].filter(
         (task) =>
-          task.reloadExecution?.phase === 'terminal' &&
+          task.reloadExecution?.phase === "terminal" &&
           (task.reloadHostNotificationSettled !== true ||
-            task.terminalPublicationState === 'pending'),
+            task.terminalPublicationState === "pending"),
       );
       if (unsettled.length === 0) return;
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         throw new Error(
-          `Timed out waiting for reload shell host settlement: ${unsettled.map((task) => task.id).join(', ')}`,
+          `Timed out waiting for reload shell host settlement: ${unsettled.map((task) => task.id).join(", ")}`,
         );
       }
       await new Promise<void>((resolve) =>
@@ -1427,16 +1436,18 @@ export class BackgroundTaskRegistry {
       ctx.sessionId ?? `session-${String(process.pid)}`,
     );
     const runId = `${sessionId}-${String(process.pid)}`;
-    const runtimeDirAbs = join(ctx.cwd, '.pi', 'tasks', runId);
-    const runtimeDirDisplay = join('.pi', 'tasks', runId);
+    // S3 P5:运行时目录迁宿主私有 agent 目录(`getAgentDir()/tasks/<runId>/`,
+    // 与宿主 sessions 同级);旧项目内 `.pi/tasks` 目录不迁移、不删除,README
+    // 注明可手动清理。对外路径由此统一为绝对路径(P4)。
+    const runtimeDirAbs = join(this.agentDir, "tasks", runId);
     await mkdir(runtimeDirAbs, { recursive: true });
-    this.runtimeDir = { abs: runtimeDirAbs, display: runtimeDirDisplay };
+    this.runtimeDir = { abs: runtimeDirAbs };
     return this.runtimeDir;
   }
 
   /**
-   * 启动审计:扩展激活路径遍历 `.pi/tasks/<runId>/` 目录(目录层 runId、文件层
-   * `<task-id>.json`),`status=running` 遗留记录一律更新为 `lost`
+   * 启动审计:扩展激活路径遍历 `<getAgentDir()>/tasks/<runId>/` 目录(目录层
+   * runId、文件层 `<task-id>.json`),`status=running` 遗留记录一律更新为 `lost`
    * (writeFileDurable 落盘);输出文件保留、不复活进程。当前注册表内活动的
    * `running` 任务(含 reload 让渡的存活执行)不触碰。
    * 返回被改写为 lost 的记录数。
@@ -1447,16 +1458,16 @@ export class BackgroundTaskRegistry {
     if (dir === undefined) return 0;
     const liveIds = new Set(
       [...this.tasks.values()]
-        .filter((task) => task.status === 'running')
+        .filter((task) => task.status === "running")
         .map((task) => task.id),
     );
     const entries = await readdir(dir.abs, { withFileTypes: true });
     let audited = 0;
     for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-      const id = entry.name.slice(0, -'.json'.length);
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const id = entry.name.slice(0, -".json".length);
       if (liveIds.has(id)) continue;
-      const record = await readFile(join(dir.abs, entry.name), 'utf8').catch(
+      const record = await readFile(join(dir.abs, entry.name), "utf8").catch(
         () => undefined,
       );
       if (record === undefined) continue;
@@ -1470,12 +1481,12 @@ export class BackgroundTaskRegistry {
       if (!isJsonObject(parsed)) continue;
       // 兼容性:旧记录缺失新字段(如 stopInitiator/branchGeneration/failedReason)
       // 按类型默认处理,只按 status 字段判定
-      if (parsed['status'] !== 'running') continue;
+      if (parsed["status"] !== "running") continue;
       await writeFileDurable(
         join(dir.abs, entry.name),
         JSON.stringify({
           ...parsed,
-          status: 'lost',
+          status: "lost",
           endTime: this.now(),
           error: STARTUP_AUDIT_ERROR,
         }),
@@ -1494,10 +1505,10 @@ export class BackgroundTaskRegistry {
     if (stream === undefined || stream.closed) return;
     await new Promise<void>((resolve) => {
       const closed = () => {
-        stream.off('close', closed);
+        stream.off("close", closed);
         resolve();
       };
-      stream.once('close', closed);
+      stream.once("close", closed);
       if (!stream.destroyed) stream.destroy();
       if (stream.closed) closed();
     });
@@ -1530,7 +1541,7 @@ export class BackgroundTaskRegistry {
   ): Promise<void> {
     this.tasks.delete(task.id);
     task.finalized = true;
-    task.status = 'failed';
+    task.status = "failed";
     if (task.timeoutHandle !== undefined) clearTimeout(task.timeoutHandle);
     if (task.killEscalationTimer !== undefined)
       clearTimeout(task.killEscalationTimer);
@@ -1541,8 +1552,8 @@ export class BackgroundTaskRegistry {
     const failures: Error[] = [];
     for (let index = 0; index < removals.length; index++) {
       const result = removals[index];
-      if (result?.status !== 'rejected') continue;
-      const path = paths[index] ?? '<unknown admission artifact>';
+      if (result?.status !== "rejected") continue;
+      const path = paths[index] ?? "<unknown admission artifact>";
       failures.push(
         new Error(
           `Failed to remove interrupted admission artifact ${path}: ${BackgroundTaskRegistry.errorMessage(result.reason)}`,
@@ -1552,7 +1563,7 @@ export class BackgroundTaskRegistry {
     if (failures.length > 0) {
       throw new AggregateError(
         failures,
-        'Interrupted task admission artifact cleanup failed',
+        "Interrupted task admission artifact cleanup failed",
       );
     }
   }
@@ -1564,7 +1575,7 @@ export class BackgroundTaskRegistry {
     task.child = child;
     task.pid = child.pid;
     if (
-      this.platform !== 'win32' &&
+      this.platform !== "win32" &&
       child.pid !== undefined &&
       Number.isSafeInteger(child.pid) &&
       child.pid > 0
@@ -1585,12 +1596,12 @@ export class BackgroundTaskRegistry {
         this.taskAdmissionError(admission),
       );
     };
-    admission.controller.signal.addEventListener('abort', cancelOwnedTask, {
+    admission.controller.signal.addEventListener("abort", cancelOwnedTask, {
       once: true,
     });
     if (admission.controller.signal.aborted) cancelOwnedTask();
     return () => {
-      admission.controller.signal.removeEventListener('abort', cancelOwnedTask);
+      admission.controller.signal.removeEventListener("abort", cancelOwnedTask);
     };
   }
 
@@ -1598,14 +1609,14 @@ export class BackgroundTaskRegistry {
     task: BgTask,
     error: Error,
   ): void {
-    if (task.status !== 'running') return;
+    if (task.status !== "running") return;
     task.killKind =
       error instanceof BackgroundTaskAdmissionTimeoutError
-        ? 'timeout'
-        : 'shutdown';
+        ? "timeout"
+        : "shutdown";
     task.error = error.message;
     try {
-      this.requestKill(task, 'SIGTERM');
+      this.requestKill(task, "SIGTERM");
     } catch (killError) {
       this.logger.error(
         `[background-tasks] failed to stop ${task.id} after admission cancellation:`,
@@ -1621,26 +1632,26 @@ export class BackgroundTaskRegistry {
   ): Promise<BgTask> {
     const hasSurvival = Object.prototype.hasOwnProperty.call(
       options,
-      'surviveReload',
+      "surviveReload",
     );
-    if (hasSurvival && typeof options.surviveReload !== 'boolean') {
+    if (hasSurvival && typeof options.surviveReload !== "boolean") {
       throw new ReloadSurvivalError(
-        'pi_bg_survive_reload_invalid',
-        'surviveReload must be a boolean when present',
+        "pi_bg_survive_reload_invalid",
+        "surviveReload must be a boolean when present",
       );
     }
     const surviveReload = options.surviveReload === true;
     if (surviveReload && options.isAgent === true) {
       throw new ReloadSurvivalError(
-        'pi_bg_survive_reload_requires_non_agent',
-        'surviveReload requires isAgent:false',
+        "pi_bg_survive_reload_requires_non_agent",
+        "surviveReload requires isAgent:false",
       );
     }
     const hasDirectArgv =
       options.argv !== undefined &&
       Array.isArray(options.argv) &&
       options.argv.length > 0 &&
-      typeof options.argv[0] === 'string' &&
+      typeof options.argv[0] === "string" &&
       options.argv[0].trim().length > 0;
     if (options.argv !== undefined && !hasDirectArgv) {
       // REVIEW:显式传 argv 但判定无效时失败告警,不得静默执行另一条命令
@@ -1649,19 +1660,19 @@ export class BackgroundTaskRegistry {
     if (surviveReload && hasDirectArgv) {
       // 直执行无 shell 中介,reload handoff 依赖 shell 语义,二者互斥
       throw new ReloadSurvivalError(
-        'pi_bg_survive_reload_requires_shell_command',
-        'argv direct execution has no shell mediation and cannot survive a same-process reload; drop surviveReload or pass a command string',
+        "pi_bg_survive_reload_requires_shell_command",
+        "argv direct execution has no shell mediation and cannot survive a same-process reload; drop surviveReload or pass a command string",
       );
     }
     const reloadLease = surviveReload ? this.currentReloadLease() : undefined;
     if (surviveReload && reloadLease === undefined) {
       throw new ReloadSurvivalError(
-        'pi_bg_reload_owner_unavailable',
-        'no successfully bound same-process reload owner activation is available',
+        "pi_bg_reload_owner_unavailable",
+        "no successfully bound same-process reload owner activation is available",
       );
     }
 
-    const admission = this.beginTaskAdmission('a background task');
+    const admission = this.beginTaskAdmission("a background task");
     try {
       if (surviveReload && reloadLease !== undefined) {
         return await this.startReloadableTaskAdmitted(
@@ -1686,11 +1697,11 @@ export class BackgroundTaskRegistry {
     lease: ReloadShellActivationLeaseV1,
   ): Promise<BgTask> {
     const normalizedCommand = command.trim();
-    if (!normalizedCommand) throw new Error('Background command is empty');
+    if (!normalizedCommand) throw new Error("Background command is empty");
     if (options.isAgent === true) {
       throw new ReloadSurvivalError(
-        'pi_bg_survive_reload_requires_non_agent',
-        'surviveReload requires isAgent:false',
+        "pi_bg_survive_reload_requires_non_agent",
+        "surviveReload requires isAgent:false",
       );
     }
     if (
@@ -1700,17 +1711,17 @@ export class BackgroundTaskRegistry {
       !this.reloadShellOwner.isCurrentLease(lease)
     ) {
       throw new ReloadSurvivalError(
-        'pi_bg_reload_owner_unavailable',
-        'reload owner activation became unavailable before launch',
+        "pi_bg_reload_owner_unavailable",
+        "reload owner activation became unavailable before launch",
       );
     }
     if (ctx.sessionId !== this.reloadShellIdentity.sessionId) {
       throw new ReloadSurvivalError(
-        'pi_bg_reload_owner_stale_claim',
-        'launch context session id does not match the bound reload owner identity',
+        "pi_bg_reload_owner_stale_claim",
+        "launch context session id does not match the bound reload owner identity",
       );
     }
-    this.assertTaskAdmissionOpen('a background task', admission);
+    this.assertTaskAdmissionOpen("a background task", admission);
 
     const shellPolicy = this.resolvedShellPolicy();
     const invocation = shellInvocationForPolicy(normalizedCommand, shellPolicy);
@@ -1718,31 +1729,31 @@ export class BackgroundTaskRegistry {
       this.ensureRuntimeDir(ctx),
       admission,
     );
-    this.assertTaskAdmissionOpen('a background task', admission);
+    this.assertTaskAdmissionOpen("a background task", admission);
     if (
       this.reloadShellLease !== lease ||
       !this.reloadShellOwner.isCurrentLease(lease)
     ) {
       throw new ReloadSurvivalError(
-        'pi_bg_reload_owner_stale_claim',
-        'reload owner activation changed during task preflight',
+        "pi_bg_reload_owner_stale_claim",
+        "reload owner activation changed during task preflight",
       );
     }
 
     const id = this.makeTaskIdFn();
     const outputAbsPath = join(dir.abs, `${id}.output`);
     const metadataAbsPath = join(dir.abs, `${id}.json`);
-    const outputPath = join(dir.display, `${id}.output`);
+    // S2 P4:对外输出路径唯一取 dir.abs(绝对);outputAbsPath 保留为 BgTask 别名
+    const outputPath = outputAbsPath;
     const timeoutSeconds =
-      typeof options.timeoutSeconds === 'number' &&
+      typeof options.timeoutSeconds === "number" &&
       Number.isFinite(options.timeoutSeconds) &&
       options.timeoutSeconds > 0
         ? Math.floor(options.timeoutSeconds)
         : undefined;
-    const taskName =
-      normalizeTaskName(options.name) ??
-      normalizeTaskName(options.description) ??
-      deriveTaskNameFromCommand(normalizedCommand);
+    // S7 P9:仅当显式 name 存在时赋值;无显式名保持 undefined,显示链在
+    // taskDisplayName 内以 description > 完整 command 原样 > id 兜底
+    const taskName = normalizeTaskName(options.name);
     const trimmedDescription = options.description?.trim();
     const description =
       trimmedDescription && trimmedDescription.length > 0
@@ -1753,7 +1764,7 @@ export class BackgroundTaskRegistry {
       name: taskName,
       command: normalizedCommand,
       description,
-      status: 'running',
+      status: "running",
       outputPath,
       outputAbsPath,
       metadataAbsPath,
@@ -1768,10 +1779,10 @@ export class BackgroundTaskRegistry {
       notifyOnCompletion: options.notifyOnCompletion ?? true,
       // 唤醒默认值按入口语义:模型入口缺省 notify+trigger;其余入口缺省仅通知
       triggerOnCompletion:
-        options.triggerOnCompletion ?? (options.entrySource === 'model'),
+        options.triggerOnCompletion ?? options.entrySource === "model",
       timeoutSeconds,
       terminalPublished: false,
-      terminalPublicationState: 'pending',
+      terminalPublicationState: "pending",
       terminalPublishAttempts: 0,
       terminalPublicationGate: options.terminalPublicationGate,
       shellPolicy: shellPolicySnapshot(shellPolicy),
@@ -1779,8 +1790,8 @@ export class BackgroundTaskRegistry {
       branchGeneration: this.activeBranchGeneration,
       entrySource: options.entrySource,
     };
-    const launchNonce = randomBytes(16).toString('hex');
-    this.assertTaskAdmissionOpen('a background task', admission);
+    const launchNonce = randomBytes(16).toString("hex");
+    this.assertTaskAdmissionOpen("a background task", admission);
     this.tasks.set(id, task);
 
     let execution: ReloadableShellExecutionV1 | undefined;
@@ -1815,8 +1826,8 @@ export class BackgroundTaskRegistry {
         execution.failAdmission(error);
         const kind: KillKind =
           error instanceof BackgroundTaskAdmissionTimeoutError
-            ? 'timeout'
-            : 'shutdown';
+            ? "timeout"
+            : "shutdown";
         void execution
           .requestStop(kind, error.message)
           .catch((stopError: unknown) => {
@@ -1826,7 +1837,7 @@ export class BackgroundTaskRegistry {
             );
           });
       };
-      admission.controller.signal.addEventListener('abort', abortListener, {
+      admission.controller.signal.addEventListener("abort", abortListener, {
         once: true,
       });
       if (admission.controller.signal.aborted) abortListener();
@@ -1835,14 +1846,14 @@ export class BackgroundTaskRegistry {
         execution.commitInitialMetadata(admission.controller.signal),
         admission,
       );
-      this.assertTaskAdmissionOpen('a background task', admission);
+      this.assertTaskAdmissionOpen("a background task", admission);
       if (
         this.reloadShellLease !== lease ||
         !this.reloadShellOwner.isCurrentLease(lease)
       ) {
         throw new ReloadSurvivalError(
-          'pi_bg_reload_owner_stale_claim',
-          'reload owner activation changed before admission commit',
+          "pi_bg_reload_owner_stale_claim",
+          "reload owner activation changed before admission commit",
         );
       }
       this.reloadShellOwner.markAdmissionCommitted(lease, execution);
@@ -1859,12 +1870,12 @@ export class BackgroundTaskRegistry {
       let cleanupError: unknown;
       if (execution !== undefined) {
         try {
-          if (task.status === 'running') {
+          if (task.status === "running") {
             await execution.requestStop(
               admission.controller.signal.aborted &&
                 primary instanceof BackgroundTaskAdmissionTimeoutError
-                ? 'timeout'
-                : 'shutdown',
+                ? "timeout"
+                : "shutdown",
               primary.message,
             );
           }
@@ -1884,9 +1895,9 @@ export class BackgroundTaskRegistry {
           rm(metadataAbsPath, { force: true }),
         ]);
         const removalFailure = removals.find(
-          (result) => result.status === 'rejected',
+          (result) => result.status === "rejected",
         );
-        if (removalFailure?.status === 'rejected')
+        if (removalFailure?.status === "rejected")
           cleanupError = removalFailure.reason;
       }
       if (admission.controller.signal.aborted) {
@@ -1901,7 +1912,7 @@ export class BackgroundTaskRegistry {
       throw new Error(`Failed to start background task: ${primary.message}`);
     } finally {
       if (abortListener !== undefined) {
-        admission.controller.signal.removeEventListener('abort', abortListener);
+        admission.controller.signal.removeEventListener("abort", abortListener);
       }
     }
   }
@@ -1919,11 +1930,11 @@ export class BackgroundTaskRegistry {
     });
     const normalizedCommand = command.trim();
     if (!normalizedCommand && directExecution === undefined)
-      throw new Error('Background command is empty');
-    this.assertTaskAdmissionOpen('a background task', admission);
+      throw new Error("Background command is empty");
+    this.assertTaskAdmissionOpen("a background task", admission);
     const displayCommand =
       directExecution !== undefined && options.argv !== undefined
-        ? options.argv.join(' ')
+        ? options.argv.join(" ")
         : normalizedCommand;
 
     const isAgent = options.isAgent ?? false;
@@ -1947,11 +1958,12 @@ export class BackgroundTaskRegistry {
       this.ensureRuntimeDir(ctx),
       admission,
     );
-    this.assertTaskAdmissionOpen('a background task', admission);
+    this.assertTaskAdmissionOpen("a background task", admission);
     const id = this.makeTaskIdFn();
     const outputAbsPath = join(dir.abs, `${id}.output`);
     const metadataAbsPath = join(dir.abs, `${id}.json`);
-    const outputPath = join(dir.display, `${id}.output`);
+    // S2 P4:对外输出路径唯一取 dir.abs(绝对);outputAbsPath 保留为 BgTask 别名
+    const outputPath = outputAbsPath;
     let commandToSpawn = normalizedCommand;
     let wrapperAbsPath: string | undefined;
     try {
@@ -1960,7 +1972,7 @@ export class BackgroundTaskRegistry {
         shellPolicy?.supportsPosixFunctionWrapper === true
       ) {
         if (piTelemetryLaunch === undefined)
-          throw new Error('Pi telemetry launch spec was not resolved');
+          throw new Error("Pi telemetry launch spec was not resolved");
         wrapperAbsPath = join(dir.abs, `${id}.pi-telemetry-wrapper.cjs`);
         try {
           await writeFile(
@@ -1969,14 +1981,14 @@ export class BackgroundTaskRegistry {
               buildModelWindowIndex(ctx),
               piTelemetryLaunch,
             ),
-            { encoding: 'utf8', signal: admission.controller.signal },
+            { encoding: "utf8", signal: admission.controller.signal },
           );
         } catch (error) {
           if (admission.controller.signal.aborted)
             throw this.taskAdmissionError(admission);
           throw error;
         }
-        this.assertTaskAdmissionOpen('a background task', admission);
+        this.assertTaskAdmissionOpen("a background task", admission);
         commandToSpawn = `pi() { ${shellQuote(process.execPath)} ${shellQuote(wrapperAbsPath)} "$@"; }\n${normalizedCommand}`;
       }
     } catch (error) {
@@ -1998,15 +2010,14 @@ export class BackgroundTaskRegistry {
               shellPolicy ?? this.resolvedShellPolicy(),
             );
     const timeoutSeconds =
-      typeof options.timeoutSeconds === 'number' &&
+      typeof options.timeoutSeconds === "number" &&
       Number.isFinite(options.timeoutSeconds) &&
       options.timeoutSeconds > 0
         ? Math.floor(options.timeoutSeconds)
         : undefined;
-    const taskName =
-      normalizeTaskName(options.name) ??
-      normalizeTaskName(options.description) ??
-      deriveTaskNameFromCommand(displayCommand);
+    // S7 P9:仅当显式 name 存在时赋值;无显式名保持 undefined,显示链在
+    // taskDisplayName 内以 description > 完整 command 原样 > id 兜底
+    const taskName = normalizeTaskName(options.name);
     const trimmedDescription = options.description?.trim();
     const description =
       trimmedDescription && trimmedDescription.length > 0
@@ -2018,7 +2029,7 @@ export class BackgroundTaskRegistry {
       name: taskName,
       command: displayCommand,
       description,
-      status: 'running',
+      status: "running",
       outputPath,
       outputAbsPath,
       metadataAbsPath,
@@ -2033,10 +2044,10 @@ export class BackgroundTaskRegistry {
       notifyOnCompletion: options.notifyOnCompletion ?? true,
       // 唤醒默认值按入口语义:模型入口缺省 notify+trigger;其余入口缺省仅通知
       triggerOnCompletion:
-        options.triggerOnCompletion ?? (options.entrySource === 'model'),
+        options.triggerOnCompletion ?? options.entrySource === "model",
       timeoutSeconds,
       terminalPublished: false,
-      terminalPublicationState: 'pending',
+      terminalPublicationState: "pending",
       terminalPublishAttempts: 0,
       terminalPublicationGate: options.terminalPublicationGate,
       shellPolicy:
@@ -2050,42 +2061,43 @@ export class BackgroundTaskRegistry {
     if (commandToSpawn !== normalizedCommand) task.telemetryWrapped = true;
     if (directExecution !== undefined && isAgent) {
       // 直执行无 shell 中介,无法写入 pi 函数包装器,遥测不可用
-      task.telemetryUnavailableReason = DIRECT_EXEC_PI_TELEMETRY_UNAVAILABLE_REASON;
+      task.telemetryUnavailableReason =
+        DIRECT_EXEC_PI_TELEMETRY_UNAVAILABLE_REASON;
     } else if (
       piTelemetryRequested &&
       shellPolicy?.supportsPosixFunctionWrapper !== true
     ) {
       task.telemetryUnavailableReason =
-        shellPolicy?.dialect === 'cmd'
+        shellPolicy?.dialect === "cmd"
           ? WIN32_CMD_PI_TELEMETRY_UNAVAILABLE_REASON
           : NON_POSIX_SHELL_PI_TELEMETRY_UNAVAILABLE_REASON;
     }
-    this.assertTaskAdmissionOpen('a background task', admission);
+    this.assertTaskAdmissionOpen("a background task", admission);
     this.tasks.set(id, task);
 
     const stream = createWriteStream(outputAbsPath, {
-      flags: 'a',
-      encoding: 'utf8',
+      flags: "a",
+      encoding: "utf8",
     });
     task.stream = stream;
-    stream.on('error', (error) => {
+    stream.on("error", (error) => {
       // M3 force-exit:终止流程已锁存(finalized)或销毁引发的尾写错误
       // (ERR_STREAM_DESTROYED)时,不得覆盖权威失败文案(如 Descendant
       // processes may have leaked)与锁存状态;终态化阶段的真实耐久性错误
       // 由 finalizeTask 自身捕获并追加。
       if (task.finalized === true) return;
-      if (Reflect.get(error, 'code') === 'ERR_STREAM_DESTROYED') return;
+      if (Reflect.get(error, "code") === "ERR_STREAM_DESTROYED") return;
       task.error = `Output file write failed: ${error.message}`;
-      if (task.status === 'running') {
+      if (task.status === "running") {
         const diskFull = isEnospcError(error);
-        task.killKind = diskFull ? 'disk_full' : 'output_cap';
-        if (diskFull) task.failedReason = 'disk_full';
+        task.killKind = diskFull ? "disk_full" : "output_cap";
+        if (diskFull) task.failedReason = "disk_full";
         try {
-          this.requestKill(task, 'SIGTERM');
+          this.requestKill(task, "SIGTERM");
         } catch (killError) {
           void this.finalizeTask(
             task,
-            'failed',
+            "failed",
             null,
             undefined,
             `${task.error}; kill failed: ${killError instanceof Error ? killError.message : String(killError)}`,
@@ -2096,14 +2108,14 @@ export class BackgroundTaskRegistry {
 
     let unbindAdmissionCancellation = (): void => undefined;
     try {
-      this.assertTaskAdmissionOpen('a background task', admission);
+      this.assertTaskAdmissionOpen("a background task", admission);
       const child = this.spawn(
-        'shell' in invocation ? invocation.shell : invocation.file,
+        "shell" in invocation ? invocation.shell : invocation.file,
         [...invocation.args],
         {
           cwd: ctx.cwd,
-          detached: this.platform !== 'win32',
-          stdio: ['ignore', 'pipe', 'pipe'],
+          detached: this.platform !== "win32",
+          stdio: ["ignore", "pipe", "pipe"],
           env: this.env,
           windowsHide: true,
           windowsVerbatimArguments: invocation.windowsVerbatimArguments,
@@ -2112,23 +2124,23 @@ export class BackgroundTaskRegistry {
 
       this.captureSpawnedChild(task, child);
 
-      child.stdout?.on('data', (data) => {
-        this.appendChildOutput(task, data, 'stdout');
+      child.stdout?.on("data", (data) => {
+        this.appendChildOutput(task, data, "stdout");
       });
-      child.stderr?.on('data', (data) => {
-        this.appendChildOutput(task, data, 'stderr');
+      child.stderr?.on("data", (data) => {
+        this.appendChildOutput(task, data, "stderr");
       });
 
-      child.on('error', (error) => {
+      child.on("error", (error) => {
         this.writeNotice(
           task,
           `\n[background task spawn error: ${error.message}]\n`,
         );
-        task.failedReason = 'spawn_error';
-        void this.finalizeTask(task, 'failed', null, undefined, error.message);
+        task.failedReason = "spawn_error";
+        void this.finalizeTask(task, "failed", null, undefined, error.message);
       });
 
-      child.on('close', (code, signalName) => {
+      child.on("close", (code, signalName) => {
         // M2 状态迁移表(六态迁移表共享判定):user/model 停止 → cancelled;
         // system 关闭 → killed;退出码非 0 / timeout / output_limit / spawn_error /
         // ENOSPC → failed(带细分 reason)
@@ -2150,19 +2162,19 @@ export class BackgroundTaskRegistry {
 
       if (timeoutSeconds !== undefined) {
         task.timeoutHandle = setTimeout(() => {
-          if (task.status !== 'running') return;
-          task.killKind = 'timeout';
+          if (task.status !== "running") return;
+          task.killKind = "timeout";
           task.error = `Timed out after ${String(timeoutSeconds)}s`;
           this.writeNotice(
             task,
             `\n[background task timeout: ${task.error}]\n`,
           );
           try {
-            this.requestKill(task, 'SIGTERM');
+            this.requestKill(task, "SIGTERM");
           } catch (error) {
             void this.finalizeTask(
               task,
-              'failed',
+              "failed",
               null,
               undefined,
               `${task.error}; kill failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -2179,7 +2191,7 @@ export class BackgroundTaskRegistry {
         this.writeMetadata(task, admission.controller.signal),
         admission,
       );
-      this.assertTaskAdmissionOpen('a background task', admission);
+      this.assertTaskAdmissionOpen("a background task", admission);
       this.onChange();
       return task;
     } catch (error) {
@@ -2206,7 +2218,7 @@ export class BackgroundTaskRegistry {
         task,
         `\n[background task spawn exception: ${message}]\n`,
       );
-      await this.finalizeTask(task, 'failed', null, undefined, message);
+      await this.finalizeTask(task, "failed", null, undefined, message);
       throw new Error(`Failed to start background task: ${message}`);
     } finally {
       unbindAdmissionCancellation();
@@ -2215,7 +2227,7 @@ export class BackgroundTaskRegistry {
 
   resolveTask(idOrPrefix: string): BgTask {
     const id = idOrPrefix.trim();
-    if (!id) throw new Error('Task ID is required');
+    if (!id) throw new Error("Task ID is required");
     const exact = this.tasks.get(id);
     if (exact) return exact;
     const matches = [...this.tasks.values()].filter((task) =>
@@ -2225,7 +2237,7 @@ export class BackgroundTaskRegistry {
     if (matches.length === 1 && onlyMatch) return onlyMatch;
     if (matches.length > 1)
       throw new Error(
-        `Ambiguous task ID prefix "${id}": ${matches.map((task) => task.id).join(', ')}`,
+        `Ambiguous task ID prefix "${id}": ${matches.map((task) => task.id).join(", ")}`,
       );
     throw new Error(`Unknown background task ID: ${id}`);
   }
@@ -2236,7 +2248,7 @@ export class BackgroundTaskRegistry {
     reason?: string,
     initiator?: StopInitiator,
   ): Promise<BgTask> {
-    if (task.status !== 'running') {
+    if (task.status !== "running") {
       throw new Error(`Task ${task.id} is ${task.status}, not running`);
     }
     // 停止分派按发起者记录,冲突优先级 user > model > system(参照 ZCode background.ts)
@@ -2254,7 +2266,7 @@ export class BackgroundTaskRegistry {
     }
     const stopWaitMs = this.stopWaitMs;
     if (
-      this.platform !== 'win32' &&
+      this.platform !== "win32" &&
       task.posixProcessGroupSignalAuthorityReleased === true &&
       this.posixProcessGroupKillStates.get(task) === undefined
     ) {
@@ -2273,11 +2285,11 @@ export class BackgroundTaskRegistry {
     // 后到停止不得覆盖先到停止的 killKind(与 requestKill 的 killSignalSent 守卫同一语义)
     if (!task.killSignalSent) task.killKind = kind;
     if (reason) task.error = reason;
-    this.requestKill(task, 'SIGTERM');
+    this.requestKill(task, "SIGTERM");
     let stopped: boolean;
     try {
       stopped =
-        this.platform === 'win32'
+        this.platform === "win32"
           ? await this.waitForEndOrWindowsForceFailure(task, stopWaitMs)
           : await this.waitForEndOrPosixForceFailure(task, stopWaitMs);
     } catch (error) {
@@ -2326,7 +2338,7 @@ export class BackgroundTaskRegistry {
     reason?: string,
     initiator?: StopInitiator,
   ): Promise<{ stopped: number; failures: string[] }> {
-    const running = this.allTasks().filter((task) => task.status === 'running');
+    const running = this.allTasks().filter((task) => task.status === "running");
     const failures: string[] = [];
     let stopped = 0;
     await Promise.all(
@@ -2355,8 +2367,8 @@ export class BackgroundTaskRegistry {
       );
     }
     const read = await boundedRead(task.outputAbsPath, maxBytes, tail);
-    const direction = tail ? 'tail' : 'head';
-    let text = read.content.length > 0 ? read.content : '(no output yet)';
+    const direction = tail ? "tail" : "head";
+    let text = read.content.length > 0 ? read.content : "(no output yet)";
     if (read.truncated) {
       const omitted = read.totalBytes - read.bytesRead;
       const notice = `\n\n[Showing ${direction} ${formatSize(read.bytesRead)} of ${formatSize(read.totalBytes)}; ${formatSize(omitted)} omitted. Full output: ${task.outputPath}]`;
@@ -2400,7 +2412,7 @@ export class BackgroundTaskRegistry {
 
   private ingestTelemetry(task: BgTask, text: string): void {
     if (!text) return;
-    const parsed = parseTelemetryStream(text, task.contextUsageBuffer ?? '');
+    const parsed = parseTelemetryStream(text, task.contextUsageBuffer ?? "");
     task.contextUsageBuffer = parsed.retained;
     this.commitTelemetry(task, parsed.latest);
   }
@@ -2446,51 +2458,51 @@ export class BackgroundTaskRegistry {
       },
     });
     if (!capExceeded) return;
-    task.killKind = 'output_cap';
-    task.failedReason = 'output_limit';
+    task.killKind = "output_cap";
+    task.failedReason = "output_limit";
     try {
-      this.requestKill(task, 'SIGTERM');
+      this.requestKill(task, "SIGTERM");
     } catch (error) {
       task.error = `${task.error}; kill failed: ${errorMessageText(error)}`;
-      void this.finalizeTask(task, 'failed', null, undefined, task.error);
+      void this.finalizeTask(task, "failed", null, undefined, task.error);
     }
   }
 
   /** Persist an internally generated notice (spawn/timeout/cap diagnostics) verbatim. */
   private writeNotice(task: BgTask, text: string): void {
     if (!text) return;
-    this.writeToStream(task, Buffer.from(text, 'utf8'));
+    this.writeToStream(task, Buffer.from(text, "utf8"));
   }
 
   private appendChildOutput(
     task: BgTask,
     data: Buffer | string,
-    source: 'stdout' | 'stderr',
+    source: "stdout" | "stderr",
   ): void {
     if (!task.stream || task.stream.destroyed) return;
-    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
+    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
     if (buffer.length === 0) return;
     if (task.telemetryWrapped) {
       // Wrapped Pi agents stream control lines on stdout (telemetry + activity); child
       // stderr is raw diagnostics and is always passed through to the transcript verbatim.
-      if (source === 'stdout')
-        this.processAgentStdout(task, buffer.toString('utf8'));
+      if (source === "stdout")
+        this.processAgentStdout(task, buffer.toString("utf8"));
       else this.writeToStream(task, buffer);
       return;
     }
-    this.ingestTelemetry(task, buffer.toString('utf8'));
+    this.ingestTelemetry(task, buffer.toString("utf8"));
     this.writeToStream(task, buffer);
   }
 
   /** Reconstruct wrapped-agent stdout into whole control lines, routing telemetry to metrics and activity to the transcript. */
   private processAgentStdout(task: BgTask, text: string): void {
-    const buffered = `${task.agentStdoutBuffer ?? ''}${text}`;
-    const lastNewline = buffered.lastIndexOf('\n');
+    const buffered = `${task.agentStdoutBuffer ?? ""}${text}`;
+    const lastNewline = buffered.lastIndexOf("\n");
     task.agentStdoutBuffer =
       lastNewline >= 0 ? buffered.slice(lastNewline + 1) : buffered;
     if (lastNewline < 0) return;
     const latest: TelemetryDelta = {};
-    for (const line of buffered.slice(0, lastNewline).split('\n'))
+    for (const line of buffered.slice(0, lastNewline).split("\n"))
       this.consumeAgentLine(task, line, latest);
     this.commitTelemetry(task, latest);
   }
@@ -2499,7 +2511,7 @@ export class BackgroundTaskRegistry {
   private flushAgentStdout(task: BgTask): void {
     const remainder = task.agentStdoutBuffer;
     if (!remainder) return;
-    task.agentStdoutBuffer = '';
+    task.agentStdoutBuffer = "";
     const latest: TelemetryDelta = {};
     this.consumeAgentLine(task, remainder, latest);
     this.commitTelemetry(task, latest);
@@ -2510,10 +2522,10 @@ export class BackgroundTaskRegistry {
     rawLine: string,
     latest: TelemetryDelta,
   ): void {
-    const line = rawLine.replace(/\r$/, '');
+    const line = rawLine.replace(/\r$/, "");
     const trimmed = line.trim();
     if (!trimmed) return;
-    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
       this.writeNotice(task, `${line}\n`);
       return;
     }
@@ -2530,12 +2542,12 @@ export class BackgroundTaskRegistry {
     }
     const record: TelemetryControlPayload = parsed;
     const type = record.type;
-    if (type === 'background-task-context-usage') {
+    if (type === "background-task-context-usage") {
       const context = normalizeContextUsage(record);
       if (context) latest.context = context;
       return;
     }
-    if (type === 'background-task-telemetry') {
+    if (type === "background-task-telemetry") {
       const context = normalizeContextUsage(record.contextUsage);
       if (context) latest.context = context;
       const tokens = normalizeTokenUsage(record.tokenUsage);
@@ -2656,9 +2668,9 @@ export class BackgroundTaskRegistry {
       return false;
     } catch (error) {
       if (
-        typeof error === 'object' &&
+        typeof error === "object" &&
         error !== null &&
-        Reflect.get(error, 'code') === 'ESRCH'
+        Reflect.get(error, "code") === "ESRCH"
       ) {
         this.finishPosixProcessGroupKill(task, state, true);
         return true;
@@ -2705,7 +2717,7 @@ export class BackgroundTaskRegistry {
     if (remainingMs <= 0) {
       const probeDetail =
         state.lastProbeError === undefined
-          ? ''
+          ? ""
           : `; last group probe failed: ${state.lastProbeError.message}`;
       this.recordPosixProcessGroupForceFailure(
         task,
@@ -2740,7 +2752,7 @@ export class BackgroundTaskRegistry {
 
     let groupFailure: Error | undefined;
     try {
-      const forced = this.killProcess(-state.groupId, 'SIGKILL');
+      const forced = this.killProcess(-state.groupId, "SIGKILL");
       if (!forced) {
         groupFailure = new Error(
           `POSIX process-group SIGKILL returned false for task ${task.id} group ${String(state.groupId)}. Descendant processes may have leaked.`,
@@ -2764,9 +2776,12 @@ export class BackgroundTaskRegistry {
     if (descendantFailures.length > 0) {
       const message =
         `POSIX descendant SIGKILL failed for task ${task.id} group ${String(state.groupId)}: ` +
-        `${descendantFailures.join('; ')}. Descendant processes may have leaked.`;
+        `${descendantFailures.join("; ")}. Descendant processes may have leaked.`;
       task.error = BackgroundTaskRegistry.appendTaskError(task.error, message);
-      this.writeNotice(task, `\n[background task POSIX termination: ${message}]\n`);
+      this.writeNotice(
+        task,
+        `\n[background task POSIX termination: ${message}]\n`,
+      );
       this.onChange();
       void this.writeMetadata(task).catch((metadataError: unknown) => {
         this.logger.error(
@@ -2795,21 +2810,18 @@ export class BackgroundTaskRegistry {
       Math.floor(this.killGraceMs / 2),
       ownershipMs,
     );
-    state.descendantCollectTimer = setTimeout(
-      () => {
-        state.descendantCollectTimer = undefined;
-        if (state.settled || state.forceAttempted) return;
-        void this.collectPosixDescendantPids(state.groupId)
-          .then((pids) => {
-            if (state.settled || state.forceAttempted) return;
-            state.descendantPids = pids;
-          })
-          .catch(() => {
-            // 收集失败不改变终止流程,退化到组信号路径。
-          });
-      },
-      delayMs,
-    ).unref();
+    state.descendantCollectTimer = setTimeout(() => {
+      state.descendantCollectTimer = undefined;
+      if (state.settled || state.forceAttempted) return;
+      void this.collectPosixDescendantPids(state.groupId)
+        .then((pids) => {
+          if (state.settled || state.forceAttempted) return;
+          state.descendantPids = pids;
+        })
+        .catch(() => {
+          // 收集失败不改变终止流程,退化到组信号路径。
+        });
+    }, delayMs).unref();
   }
 
   private clearPosixDescendantCollectTimer(
@@ -2833,7 +2845,7 @@ export class BackgroundTaskRegistry {
     const failures: string[] = [];
     for (const pid of descendants) {
       try {
-        const forced = this.killProcess(pid, 'SIGKILL');
+        const forced = this.killProcess(pid, "SIGKILL");
         if (!forced) {
           failures.push(`pid ${String(pid)} SIGKILL returned false`);
         }
@@ -2848,8 +2860,8 @@ export class BackgroundTaskRegistry {
   }
 
   private requestPosixKill(task: BgTask, signal: NodeJS.Signals): void {
-    const state = this.beginPosixProcessGroupKill(task, signal !== 'SIGKILL');
-    if (signal === 'SIGKILL') {
+    const state = this.beginPosixProcessGroupKill(task, signal !== "SIGKILL");
+    if (signal === "SIGKILL") {
       task.killSignalSent = true;
       this.forceOwnedPosixProcessGroup(task, state);
       return;
@@ -2866,9 +2878,9 @@ export class BackgroundTaskRegistry {
       if (!killed) errors.push(`process group ${signal} returned false`);
     } catch (error) {
       if (
-        typeof error === 'object' &&
+        typeof error === "object" &&
         error !== null &&
-        Reflect.get(error, 'code') === 'ESRCH'
+        Reflect.get(error, "code") === "ESRCH"
       ) {
         this.finishPosixProcessGroupKill(task, state, true);
       } else {
@@ -2893,14 +2905,14 @@ export class BackgroundTaskRegistry {
       // If TERM reached neither target, waiting out grace has no benefit. Keep
       // the same owner but attempt its one force phase immediately.
       if (!state.settled) this.forceOwnedPosixProcessGroup(task, state);
-      throw new Error(`Could not kill task ${task.id}: ${errors.join('; ')}`);
+      throw new Error(`Could not kill task ${task.id}: ${errors.join("; ")}`);
     }
   }
 
   private async awaitPosixProcessGroupBeforeTerminal(
     task: BgTask,
   ): Promise<Error | undefined> {
-    if (this.platform === 'win32') return undefined;
+    if (this.platform === "win32") return undefined;
     const state = this.posixProcessGroupKillStates.get(task);
     if (state === undefined) {
       // No tree stop won the race before direct-child finalization. Release
@@ -2953,9 +2965,9 @@ export class BackgroundTaskRegistry {
   /** 判定错误是否进程不存在(errno ESRCH),用于 sig-0 证明与逐后代补杀的吞错边界。 */
   private static isEsrchError(error: unknown): boolean {
     return (
-      typeof error === 'object' &&
+      typeof error === "object" &&
       error !== null &&
-      Reflect.get(error, 'code') === 'ESRCH'
+      Reflect.get(error, "code") === "ESRCH"
     );
   }
 
@@ -2968,27 +2980,27 @@ export class BackgroundTaskRegistry {
 
   private static describeTaskkillOutcome(outcome: TaskkillOutcome): string {
     const exitCode =
-      outcome.exitCode === null ? 'null' : String(outcome.exitCode);
-    const signal = outcome.signal === null ? 'null' : outcome.signal;
+      outcome.exitCode === null ? "null" : String(outcome.exitCode);
+    const signal = outcome.signal === null ? "null" : outcome.signal;
     const stdout =
       outcome.stdout.length > 0
         ? ` stdout=${JSON.stringify(outcome.stdout)}`
-        : '';
+        : "";
     const stderr =
       outcome.stderr.length > 0
         ? ` stderr=${JSON.stringify(outcome.stderr)}`
-        : '';
+        : "";
     const stdoutTruncated = outcome.stdoutTruncated
-      ? ' stdout_truncated=true'
-      : '';
+      ? " stdout_truncated=true"
+      : "";
     const stderrTruncated = outcome.stderrTruncated
-      ? ' stderr_truncated=true'
-      : '';
+      ? " stderr_truncated=true"
+      : "";
     return `exit=${exitCode} signal=${signal}${stdout}${stderr}${stdoutTruncated}${stderrTruncated}`;
   }
 
   private isWindowsTaskkillTerminalRace(task: BgTask): boolean {
-    return task.status !== 'running' || task.finalized === true;
+    return task.status !== "running" || task.finalized === true;
   }
 
   private clearKillEscalationTimer(task: BgTask): void {
@@ -3078,7 +3090,7 @@ export class BackgroundTaskRegistry {
       );
       return undefined;
     }
-    if (phase === 'terminate') {
+    if (phase === "terminate") {
       this.recordWindowsSoftFailure(task, pid, detail);
       return undefined;
     }
@@ -3108,7 +3120,7 @@ export class BackgroundTaskRegistry {
 
     let launched: Promise<TaskkillOutcome>;
     try {
-      launched = this.killTree(pid, 'terminate', controller.signal);
+      launched = this.killTree(pid, "terminate", controller.signal);
     } catch (error) {
       delete state.softController;
       throw new Error(
@@ -3126,7 +3138,7 @@ export class BackgroundTaskRegistry {
         const failure = this.evaluateWindowsTaskkillOutcome(
           task,
           pid,
-          'terminate',
+          "terminate",
           outcome,
         );
         if (failure !== undefined) throw failure;
@@ -3153,7 +3165,7 @@ export class BackgroundTaskRegistry {
     });
     if (resolveForce === undefined || rejectForce === undefined) {
       throw new Error(
-        'Windows force termination promise could not be initialized',
+        "Windows force termination promise could not be initialized",
       );
     }
     const resolveForceReady = resolveForce;
@@ -3176,7 +3188,7 @@ export class BackgroundTaskRegistry {
 
     let launched: Promise<TaskkillOutcome>;
     try {
-      launched = this.killTree(pid, 'force');
+      launched = this.killTree(pid, "force");
     } catch (error) {
       const failure = this.makeWindowsForceFailure(
         task,
@@ -3194,7 +3206,7 @@ export class BackgroundTaskRegistry {
         const failure = this.evaluateWindowsTaskkillOutcome(
           task,
           pid,
-          'force',
+          "force",
           outcome,
         );
         if (failure !== undefined) {
@@ -3231,7 +3243,7 @@ export class BackgroundTaskRegistry {
     pid: number,
     signal: NodeJS.Signals,
   ): void {
-    if (signal === 'SIGKILL') {
+    if (signal === "SIGKILL") {
       this.startWindowsForceKill(task, pid);
       task.killSignalSent = true;
       return;
@@ -3242,9 +3254,9 @@ export class BackgroundTaskRegistry {
     if (task.killEscalationTimer !== undefined) return;
     task.killEscalationTimer = setTimeout(() => {
       task.killEscalationTimer = undefined;
-      if (task.status !== 'running') return;
+      if (task.status !== "running") return;
       try {
-        this.requestKill(task, 'SIGKILL');
+        this.requestKill(task, "SIGKILL");
       } catch (error) {
         task.error = BackgroundTaskRegistry.appendTaskError(
           task.error,
@@ -3260,16 +3272,16 @@ export class BackgroundTaskRegistry {
     }, this.killGraceMs).unref();
   }
 
-  private requestKill(task: BgTask, signal: NodeJS.Signals = 'SIGTERM'): void {
-    if (task.status !== 'running') {
+  private requestKill(task: BgTask, signal: NodeJS.Signals = "SIGTERM"): void {
+    if (task.status !== "running") {
       throw new Error(`Task ${task.id} is ${task.status}, not running`);
     }
     if (!task.child) {
       throw new Error(`Task ${task.id} has no child process handle`);
     }
-    if (task.killSignalSent && signal === 'SIGTERM') return;
+    if (task.killSignalSent && signal === "SIGTERM") return;
 
-    if (this.platform === 'win32') {
+    if (this.platform === "win32") {
       if (!task.pid) throw new Error(`Task ${task.id} has no process id`);
       this.requestWindowsKill(task, task.pid, signal);
       return;
@@ -3279,7 +3291,7 @@ export class BackgroundTaskRegistry {
   }
 
   private waitForEnd(task: BgTask, timeoutMs: number): Promise<boolean> {
-    if (task.status !== 'running') return Promise.resolve(true);
+    if (task.status !== "running") return Promise.resolve(true);
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         const idx = task.waiters.indexOf(done);
@@ -3330,7 +3342,7 @@ export class BackgroundTaskRegistry {
   ): Promise<boolean> {
     const failure = failureSource.readFailure();
     if (failure !== undefined) return Promise.reject(failure);
-    if (task.status !== 'running') return Promise.resolve(true);
+    if (task.status !== "running") return Promise.resolve(true);
     return new Promise((resolve, reject) => {
       const cleanup = () => {
         clearTimeout(timeout);
@@ -3395,7 +3407,7 @@ export class BackgroundTaskRegistry {
       this.publishTerminal(task);
       const deliveryGate = await this.waitForTerminalPublicationGate(task);
       if (!this.ownsReloadExecution(execution, lease)) return;
-      if (deliveryGate.kind === 'rejected') {
+      if (deliveryGate.kind === "rejected") {
         this.logger.error(
           `[background-tasks] completion delivery gate failed for ${task.id}: ${this.terminalPublicationError(deliveryGate.error)}`,
         );
@@ -3403,7 +3415,7 @@ export class BackgroundTaskRegistry {
         task.notifyOnCompletion &&
         !task.notified &&
         !this.shuttingDown &&
-        execution.notificationState === 'pending'
+        execution.notificationState === "pending"
       ) {
         const token = execution.beginNotification(lease);
         if (token !== undefined) {
@@ -3441,9 +3453,9 @@ export class BackgroundTaskRegistry {
     const lease = this.reloadShellLease;
     if (
       execution === undefined ||
-      execution.phase !== 'terminal' ||
+      execution.phase !== "terminal" ||
       task.reloadHostNotificationSettled !== true ||
-      task.terminalPublicationState === 'pending' ||
+      task.terminalPublicationState === "pending" ||
       !this.ownsReloadExecution(execution, lease) ||
       this.reloadShellOwner === undefined ||
       lease === undefined
@@ -3454,9 +3466,9 @@ export class BackgroundTaskRegistry {
       this.reloadShellOwner.releaseExecution(lease, execution);
     } catch (error) {
       if (
-        typeof error !== 'object' ||
+        typeof error !== "object" ||
         error === null ||
-        Reflect.get(error, 'code') !== 'pi_bg_reload_owner_stale_claim'
+        Reflect.get(error, "code") !== "pi_bg_reload_owner_stale_claim"
       ) {
         this.logger.error(
           `[background-tasks] failed to release reload shell execution ${task.id}:`,
@@ -3486,14 +3498,14 @@ export class BackgroundTaskRegistry {
     if (task.reloadExecution !== undefined && this.tasks.get(task.id) !== task)
       return;
     if (
-      task.terminalPublicationState !== 'pending' ||
+      task.terminalPublicationState !== "pending" ||
       task.terminalPublishInFlight
     )
       return;
     if (this.terminalPublicationClosed) {
       this.abandonTerminalPublication(
         task,
-        this.terminalPublicationCloseReason ?? 'registry_shutdown',
+        this.terminalPublicationCloseReason ?? "registry_shutdown",
       );
       return;
     }
@@ -3514,12 +3526,12 @@ export class BackgroundTaskRegistry {
       task.terminalPublishInFlight = false;
       return;
     }
-    if (outcome.kind === 'closed') {
+    if (outcome.kind === "closed") {
       this.abandonTerminalPublication(task, outcome.reason);
       return;
     }
-    if (outcome.kind === 'rejected') {
-      this.abandonTerminalPublication(task, 'gate_rejected', outcome.error);
+    if (outcome.kind === "rejected") {
+      this.abandonTerminalPublication(task, "gate_rejected", outcome.error);
       return;
     }
     // The gate and registry closure can settle in the same microtask turn.
@@ -3527,11 +3539,11 @@ export class BackgroundTaskRegistry {
     // activation or revive a task already abandoned by shutdown.
     if (
       this.terminalPublicationClosed ||
-      task.terminalPublicationState !== 'pending'
+      task.terminalPublicationState !== "pending"
     ) {
       this.abandonTerminalPublication(
         task,
-        this.terminalPublicationCloseReason ?? 'registry_shutdown',
+        this.terminalPublicationCloseReason ?? "registry_shutdown",
       );
       return;
     }
@@ -3543,37 +3555,37 @@ export class BackgroundTaskRegistry {
   ): Promise<TerminalPublicationGateOutcome> {
     if (this.terminalPublicationClosed) {
       return {
-        kind: 'closed',
-        reason: this.terminalPublicationCloseReason ?? 'registry_shutdown',
+        kind: "closed",
+        reason: this.terminalPublicationCloseReason ?? "registry_shutdown",
       };
     }
-    if (task.terminalPublicationState === 'abandoned') {
-      if (task.terminalPublicationAbandonReason === 'gate_rejected') {
+    if (task.terminalPublicationState === "abandoned") {
+      if (task.terminalPublicationAbandonReason === "gate_rejected") {
         return {
-          kind: 'rejected',
-          error: new Error('terminal publication gate rejected'),
+          kind: "rejected",
+          error: new Error("terminal publication gate rejected"),
         };
       }
       return {
-        kind: 'closed',
-        reason: task.terminalPublicationAbandonReason ?? 'registry_shutdown',
+        kind: "closed",
+        reason: task.terminalPublicationAbandonReason ?? "registry_shutdown",
       };
     }
     const gate = task.terminalPublicationGate;
-    if (gate === undefined) return { kind: 'released' };
+    if (gate === undefined) return { kind: "released" };
 
     const gateOutcome: Promise<TerminalPublicationGateOutcome> = gate.then(
-      () => ({ kind: 'released' }),
-      (error: unknown) => ({ kind: 'rejected', error }),
+      () => ({ kind: "released" }),
+      (error: unknown) => ({ kind: "rejected", error }),
     );
     const closureOutcome: Promise<TerminalPublicationGateOutcome> =
       this.terminalPublicationClosedSignal.then((reason) => ({
-        kind: 'closed',
+        kind: "closed",
         reason,
       }));
     const abandonmentOutcome: Promise<TerminalPublicationGateOutcome> =
       this.terminalPublicationAbandonSignal(task).promise.then((reason) => ({
-        kind: 'closed',
+        kind: "closed",
         reason,
       }));
     const outcome = await Promise.race([
@@ -3586,8 +3598,8 @@ export class BackgroundTaskRegistry {
     // of which promise queued its reaction first.
     if (this.terminalPublicationClosed) {
       return {
-        kind: 'closed',
-        reason: this.terminalPublicationCloseReason ?? 'registry_shutdown',
+        kind: "closed",
+        reason: this.terminalPublicationCloseReason ?? "registry_shutdown",
       };
     }
     return outcome;
@@ -3601,7 +3613,7 @@ export class BackgroundTaskRegistry {
       task.terminalPublishInFlight = false;
       return;
     }
-    if (task.terminalPublicationState !== 'pending') {
+    if (task.terminalPublicationState !== "pending") {
       task.terminalPublishInFlight = false;
       return;
     }
@@ -3609,7 +3621,7 @@ export class BackgroundTaskRegistry {
       task.terminalPublishInFlight = false;
       this.abandonTerminalPublication(
         task,
-        this.terminalPublicationCloseReason ?? 'registry_shutdown',
+        this.terminalPublicationCloseReason ?? "registry_shutdown",
       );
       this.pruneOldTasks();
       return;
@@ -3657,7 +3669,7 @@ export class BackgroundTaskRegistry {
     task.terminalPublicationGate = undefined;
     task.terminalEmitInFlight = false;
     task.terminalPublishInFlight = false;
-    task.terminalPublicationState = 'delivered';
+    task.terminalPublicationState = "delivered";
     delete task.terminalPublicationAbandonReason;
     task.terminalPublished = true;
     this.maybeReleaseReloadExecution(task);
@@ -3676,16 +3688,16 @@ export class BackgroundTaskRegistry {
     task.terminalPublicationGate = undefined;
     if (task.terminalEmitInFlight !== true)
       task.terminalPublishInFlight = false;
-    if (task.terminalPublicationState === 'delivered') return;
-    if (task.terminalPublicationState === 'abandoned') return;
+    if (task.terminalPublicationState === "delivered") return;
+    if (task.terminalPublicationState === "abandoned") return;
 
-    task.terminalPublicationState = 'abandoned';
+    task.terminalPublicationState = "abandoned";
     task.terminalPublicationAbandonReason = reason;
     task.terminalPublished = false;
     this.terminalPublicationAbandonSignal(task).resolve(reason);
     if (log) {
       const detail =
-        error === undefined ? '' : `: ${this.terminalPublicationError(error)}`;
+        error === undefined ? "" : `: ${this.terminalPublicationError(error)}`;
       this.logger.error(
         `[background-tasks] terminal publication abandoned for ${task.id} (${reason}) after ${String(task.terminalPublishAttempts)}/${String(TERMINAL_PUBLICATION_MAX_ATTEMPTS)} emit attempts${detail}`,
       );
@@ -3699,22 +3711,22 @@ export class BackgroundTaskRegistry {
 
   private handleTerminalPublishFailure(task: BgTask, error: unknown): void {
     task.terminalPublishInFlight = false;
-    if (task.terminalPublicationState !== 'pending') return;
+    if (task.terminalPublicationState !== "pending") return;
     if (error instanceof BackgroundTaskExtensionServiceClosedError) {
-      this.closeTerminalPublication('publisher_closed');
+      this.closeTerminalPublication("publisher_closed");
       return;
     }
     if (this.terminalPublicationClosed) {
       this.abandonTerminalPublication(
         task,
-        this.terminalPublicationCloseReason ?? 'registry_shutdown',
+        this.terminalPublicationCloseReason ?? "registry_shutdown",
         error,
       );
       this.pruneOldTasks();
       return;
     }
     if (task.terminalPublishAttempts >= TERMINAL_PUBLICATION_MAX_ATTEMPTS) {
-      this.abandonTerminalPublication(task, 'retry_exhausted', error);
+      this.abandonTerminalPublication(task, "retry_exhausted", error);
       this.pruneOldTasks();
       return;
     }
@@ -3727,7 +3739,7 @@ export class BackgroundTaskRegistry {
       task.terminalPublishRetryHandle = undefined;
       if (
         this.terminalPublicationClosed ||
-        task.terminalPublicationState !== 'pending' ||
+        task.terminalPublicationState !== "pending" ||
         (task.reloadExecution !== undefined && this.tasks.get(task.id) !== task)
       )
         return;
@@ -3739,25 +3751,26 @@ export class BackgroundTaskRegistry {
   private notifyCompletion(task: BgTask): void {
     if (!task.notifyOnCompletion || task.notified || this.shuttingDown) return;
     task.notified = true;
+    // S4 P6:严格判空 —— null/undefined 均省略 <exit-code>(禁止宽松相等)
     const exit =
-      task.exitCode === undefined
-        ? ''
+      task.exitCode === undefined || task.exitCode === null
+        ? ""
         : `\n  <exit-code>${String(task.exitCode)}</exit-code>`;
     const error = task.error
       ? `\n  <error>${escapeXml(task.error)}</error>`
-      : '';
+      : "";
     const taskName = taskDisplayName(task);
     const guidance =
-      'Terminal state and output metadata are durable. Do not call bg_status to reconfirm; use bg_logs only if output is needed.';
+      "Terminal state and output metadata are durable. Do not call bg_status to reconfirm; use bg_logs only if output is needed.";
     // M5 REVIEW:完成通知自动携带有界 tail 摘要(64KiB 内,复用 finalize/reload
     // 交付路径已计算好的 terminalSummaryTail);缺失(空输出/读失败)时省略字段,
     // 不含完整日志,output-file 字段维持。
     const summaryTail =
       task.terminalSummaryTail === undefined
-        ? ''
+        ? ""
         : `\n  <summary-tail>${escapeXml(task.terminalSummaryTail)}</summary-tail>`;
     const content = [
-      '<background-task-notification>',
+      "<background-task-notification>",
       `  <task-id>${task.id}</task-id>`,
       `  <task-name>${escapeXml(taskName)}</task-name>`,
       `  <status>${task.status}</status>`,
@@ -3767,21 +3780,21 @@ export class BackgroundTaskRegistry {
       summaryTail,
       `  <summary>${escapeXml(`Background task ${JSON.stringify(taskName)} ${task.status}`)}</summary>`,
       `  <guidance>${escapeXml(guidance)}</guidance>`,
-      '</background-task-notification>',
+      "</background-task-notification>",
     ]
       .filter(Boolean)
-      .join('\n');
+      .join("\n");
 
     try {
       this.sendCompletionNotification(
         {
-          customType: 'background-task-notification',
+          customType: "background-task-notification",
           content,
           display: true,
           details: snapshot(task),
         },
         {
-          deliverAs: 'followUp',
+          deliverAs: "followUp",
           // 迟到结算 fence:旧代次帧只通知、不触发唤醒
           triggerTurn:
             task.triggerOnCompletion === true && task.staleBranchFrame !== true,
@@ -3789,6 +3802,14 @@ export class BackgroundTaskRegistry {
       );
     } catch (error) {
       task.notified = false;
+      // S6 P8 投递确认(近似语义):同步失败可观测 → 回滚锁存 + warn 留痕。
+      // 如实说明:插件的 warn 是本次失败唯一新增留痕点;同一失败下调用方
+      // finalizeTask 既有 logger.error 记录属宿主通道既有保留,两者先后各记
+      // 一次(warn + error 双通道留痕,非重复新增)。异步失败经宿主 bindCore
+      // sendMessage→emitError 通道留痕,插件无法观测(README 已声明局限)。
+      this.logger.warn(
+        `[background-tasks] notification delivery failed for ${task.id}; notified reset to false: ${error instanceof Error ? error.message : String(error)}`,
+      );
       throw new Error(
         `Failed to send background task notification for ${task.id}: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -3805,13 +3826,13 @@ export class BackgroundTaskRegistry {
     if (task.finalized) return;
     task.finalized = true;
     if (task.timeoutHandle) clearTimeout(task.timeoutHandle);
-    if (this.platform === 'win32') this.clearKillEscalationTimer(task);
+    if (this.platform === "win32") this.clearKillEscalationTimer(task);
     let finalStatus = status;
     let finalError = error;
     const posixForceFailure =
       await this.awaitPosixProcessGroupBeforeTerminal(task);
     if (posixForceFailure !== undefined) {
-      finalStatus = 'failed';
+      finalStatus = "failed";
       finalError = BackgroundTaskRegistry.appendTaskError(
         finalError,
         posixForceFailure.message,
@@ -3820,7 +3841,7 @@ export class BackgroundTaskRegistry {
     const windowsForceFailure =
       await this.awaitWindowsForceBeforeTerminal(task);
     if (windowsForceFailure !== undefined) {
-      finalStatus = 'failed';
+      finalStatus = "failed";
       finalError = BackgroundTaskRegistry.appendTaskError(
         finalError,
         windowsForceFailure.message,
@@ -3846,7 +3867,7 @@ export class BackgroundTaskRegistry {
       if (task.stream && !task.stream.destroyed)
         await closeAndFsyncOutputStream(task.stream);
     } catch (finalizeError) {
-      finalStatus = 'failed';
+      finalStatus = "failed";
       const message =
         finalizeError instanceof Error
           ? finalizeError.message
@@ -3865,8 +3886,8 @@ export class BackgroundTaskRegistry {
       });
       task.status = finalStatus;
     } catch (metadataError) {
-      finalStatus = 'failed';
-      task.status = 'failed';
+      finalStatus = "failed";
+      task.status = "failed";
       task.error = `Terminal metadata write failed: ${metadataError instanceof Error ? metadataError.message : String(metadataError)}`;
       this.logger.error(
         `[background-tasks] failed to write metadata for ${task.id}:`,
@@ -3894,7 +3915,7 @@ export class BackgroundTaskRegistry {
     this.onChange();
     this.publishTerminal(task);
     const deliveryGate = await this.waitForTerminalPublicationGate(task);
-    if (deliveryGate.kind === 'rejected') {
+    if (deliveryGate.kind === "rejected") {
       this.logger.error(
         `[background-tasks] completion delivery gate failed for ${task.id}: ${this.terminalPublicationError(deliveryGate.error)}`,
       );
@@ -3926,14 +3947,14 @@ export class BackgroundTaskRegistry {
     const removable = [...this.tasks.values()]
       .filter(
         (task) =>
-          task.status !== 'running' && task.terminalEmitInFlight !== true,
+          task.status !== "running" && task.terminalEmitInFlight !== true,
       )
       .sort((a, b) => (a.endTime ?? a.startTime) - (b.endTime ?? b.startTime));
     while (this.tasks.size > this.maxRecentTasks && removable.length > 0) {
       const task = removable.shift();
       if (task === undefined) continue;
-      if (task.terminalPublicationState === 'pending') {
-        this.abandonTerminalPublication(task, 'retention_limit');
+      if (task.terminalPublicationState === "pending") {
+        this.abandonTerminalPublication(task, "retention_limit");
       }
       this.tasks.delete(task.id);
     }
