@@ -97,6 +97,8 @@ The background `inherit` branch resolves in this order (S1 P1):
 
 With `run_in_background:true`, `timeout` is a hard-kill deadline in seconds: `0` or omitted means no deadline (never force-terminated by timeout); `> 0` sets the kill deadline. Foreground `timeout` semantics are unchanged (host built-in behavior).
 
+**ZCode comparison (P3 note):** ZCode backgrounding forces `timeoutMs: 0` structurally (background tasks never time out; the parameter is ignored on backgrounding), and models no task-level admission timeout — external stops uniformly become `cancelled`, and `timed_out` is produced only by the execution-layer timer. This plugin intentionally keeps the P7 ruling: `timeout > 0` still kills background tasks (documented, not silent), while the timed_out/cancelled discrimination (user/model stop → `cancelled`; timeout expiry → `failed` + `timed_out`) already matches ZCode.
+
 ## Output and log caps
 
 | Setting/surface                                 | Value/behavior                                                                                                                        |

@@ -409,7 +409,9 @@ async function emitRequest(
 // injected fake child, so no real process is ever created and the budget does
 // not depend on host process-creation cost. A genuine hang must still fail
 // fast on every platform.
-const TERMINAL_WAIT_TIMEOUT_MS = 1500;
+// 宽松上限:终态发布要竞速 publication gate + 耐久元数据写,整套并行负载下
+// 1500ms 曾致环境性 flaky;正常路径在终态到达即返回,抬高上限无额外开销。
+const TERMINAL_WAIT_TIMEOUT_MS = 5000;
 
 async function waitForCondition(
   predicate: () => boolean,

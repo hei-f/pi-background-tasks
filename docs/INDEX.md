@@ -92,16 +92,16 @@ Generated navigation for every package-local documentation page. This index inte
 
 | Kind | Name | ID | Availability | Default | Provenance |
 | --- | --- | --- | --- | --- | --- |
-| command | `bg-clear` | `command:bg-clear` | `always` | yes | `src/extension.ts:688` |
-| command | `bg-jobs` | `command:bg-jobs` | `always` | yes | `src/extension.ts:722` |
-| command | `bg-kill` | `command:bg-kill` | `always` | yes | `src/extension.ts:769` |
-| command | `bg-logs` | `command:bg-logs` | `always` | yes | `src/extension.ts:737` |
-| tool | `bash` | `tool:bash` | `always` | yes | `src/extension.ts:824` |
-| tool | `bg_kill` | `tool:bg_kill` | `always` | yes | `src/extension.ts:925` |
-| tool | `bg_logs` | `tool:bg_logs` | `always` | yes | `src/extension.ts:877` |
-| tool | `bg_status` | `tool:bg_status` | `always` | yes | `src/extension.ts:844` |
-| shortcut | `ctrl+alt+b` | `shortcut:ctrl+alt+b` | `dock:ctrl+alt+b` | no | `src/extension.ts:706` |
-| shortcut | `ctrl+alt+c` | `shortcut:ctrl+alt+c` | `always` | yes | `src/extension.ts:714` |
-| shortcut | `shift+down` | `shortcut:shift+down` | `dock:shift+down` | yes | `src/extension.ts:697` |
+| command | `bg-clear` | `command:bg-clear` | `always` | yes | `src/extension.ts:696` |
+| command | `bg-jobs` | `command:bg-jobs` | `always` | yes | `src/extension.ts:730` |
+| command | `bg-kill` | `command:bg-kill` | `always` | yes | `src/extension.ts:777` |
+| command | `bg-logs` | `command:bg-logs` | `always` | yes | `src/extension.ts:745` |
+| tool | `bash` | `tool:bash` | `always` | yes | `src/extension.ts:832` |
+| tool | `bg_kill` | `tool:bg_kill` | `always` | yes | `src/extension.ts:933` |
+| tool | `bg_logs` | `tool:bg_logs` | `always` | yes | `src/extension.ts:885` |
+| tool | `bg_status` | `tool:bg_status` | `always` | yes | `src/extension.ts:852` |
+| shortcut | `ctrl+alt+b` | `shortcut:ctrl+alt+b` | `dock:ctrl+alt+b` | no | `src/extension.ts:714` |
+| shortcut | `ctrl+alt+c` | `shortcut:ctrl+alt+c` | `always` | yes | `src/extension.ts:722` |
+| shortcut | `shift+down` | `shortcut:shift+down` | `dock:shift+down` | yes | `src/extension.ts:705` |
 | renderer | `background-task-notification` | `renderer:background-task-notification` | `always` | yes | `src/extension.ts:546` |
 | eventbus | `background-task-v1` | `eventbus:background-task-v1` | `always` | yes | `src/core/extension-api.ts` |

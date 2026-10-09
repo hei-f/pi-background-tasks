@@ -402,7 +402,13 @@ export default async function backgroundTasksExtension(pi) {
             ? `\n${theme.fg("dim", `Output: ${task.outputPath}`)}`
             : "";
         const error = task?.error ? `\n${theme.fg("error", task.error)}` : "";
-        return new Text(`${theme.fg(color, `[bg ${status}]`)} ${theme.fg("accent", name)} ${theme.fg("dim", `(${id})`)}${output}${error}`, 0, 0);
+        // 批合并时 details 仅承载首任务(P3 显示代表);按 content 块数补注批规模,
+        // 避免仅凭首任务横幅误判整批状态。
+        const batchSize = typeof message.content === "string"
+            ? message.content.split("<background-task-notification>").length - 1
+            : 1;
+        const more = batchSize > 1 ? theme.fg("dim", ` +${String(batchSize - 1)} more`) : "";
+        return new Text(`${theme.fg(color, `[bg ${status}]`)} ${theme.fg("accent", name)} ${theme.fg("dim", `(${id})`)}${more}${output}${error}`, 0, 0);
     });
     pi.on("session_start", async (_event, ctx) => {
         // Pi replacement binds a fresh extension instance. Never revive this old
@@ -624,11 +630,11 @@ export default async function backgroundTasksExtension(pi) {
     pi.registerTool({
         name: "bash",
         label: "bash",
-        description: "Execute a bash command in the current working directory (identical to the built-in bash tool). Returns stdout and stderr; output is truncated to a bounded tail and the full output path is included when truncated. Optionally provide a timeout in seconds. Set run_in_background:true to detach the command as a durable background task instead: the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification> and starts a follow-up agent turn.",
+        description: "Execute a bash command in the current working directory (identical to the built-in bash tool). Returns stdout and stderr; output is truncated to a bounded tail and the full output path is included when truncated. Optionally provide a timeout in seconds. Set run_in_background:true to detach the command as a durable background task instead: the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification>, injected into the current turn while the agent is streaming or starting a follow-up turn when idle; concurrent terminal states merge into one notification.",
         promptSnippet: "Execute bash commands (ls, grep, find, etc.); set run_in_background:true to detach long-running work",
         promptGuidelines: [
             "Run short commands with bash as usual. Use run_in_background:true for commands expected to run for a long time, such as test suites, dev servers, watchers, or builds.",
-            "With run_in_background:true the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification> and starts a follow-up agent turn, so do not sleep or poll merely to wait.",
+            "With run_in_background:true the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification> (injected into the current turn while the agent is streaming; when idle it starts a follow-up agent turn; concurrent terminal states merge into one notification), so do not sleep or poll merely to wait.",
             "Treat <background-task-notification> as durable terminal truth. Do not call bg_status to reconfirm it; call bg_logs only when the task output is needed.",
             "Use bg_status/bg_logs only when the user explicitly requests an update, automatic notification or wake-up was deliberately disabled, there is concrete evidence the task is hung, or a terminal notification arrived and output details are needed.",
         ],

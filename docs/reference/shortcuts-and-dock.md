@@ -13,9 +13,9 @@ covers_sources: []
 <!-- pi-docs:begin name="shortcut-contracts" generator="scripts/docs/generate.mjs" -->
 | Shortcut | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `ctrl+alt+b` | `dock:ctrl+alt+b` | no | Open focused background task footer dock | `src/extension.ts:706` |
-| `ctrl+alt+c` | `always` | yes | Clear finished background task footer notices (terminal-dependent fallback for /bg-clear) | `src/extension.ts:714` |
-| `shift+down` | `dock:shift+down` | yes | Open focused background task footer dock | `src/extension.ts:697` |
+| `ctrl+alt+b` | `dock:ctrl+alt+b` | no | Open focused background task footer dock | `src/extension.ts:714` |
+| `ctrl+alt+c` | `always` | yes | Clear finished background task footer notices (terminal-dependent fallback for /bg-clear) | `src/extension.ts:722` |
+| `shift+down` | `dock:shift+down` | yes | Open focused background task footer dock | `src/extension.ts:705` |
 <!-- pi-docs:end name="shortcut-contracts" -->
 
 ## Registered shortcuts
