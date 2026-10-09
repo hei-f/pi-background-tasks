@@ -13,7 +13,7 @@ covers_sources: []
 <!-- pi-docs:begin name="command-contract-bg-kill" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-kill` | `always` | yes | Stop a running background task: /bg-kill <id> | `src/extension.ts:769` |
+| `/bg-kill` | `always` | yes | Stop a running background task: /bg-kill <id> | `src/extension.ts:777` |
 <!-- pi-docs:end name="command-contract-bg-kill" -->
 
 Stop a running background task.

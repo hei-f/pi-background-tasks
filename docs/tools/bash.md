@@ -12,16 +12,16 @@ covers_sources: [src/bash-override.ts]
 
 <!-- pi-docs:begin name="tool-contract-bash" generator="scripts/docs/generate.mjs" -->
 - Label: **bash**
-- Source: `src/extension.ts:824`
+- Source: `src/extension.ts:832`
 - Availability: `always`
 - Available by default: **yes**
-- Description: Execute a bash command in the current working directory (identical to the built-in bash tool). Returns stdout and stderr; output is truncated to a bounded tail and the full output path is included when truncated. Optionally provide a timeout in seconds. Set run_in_background:true to detach the command as a durable background task instead: the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification> and starts a follow-up agent turn.
+- Description: Execute a bash command in the current working directory (identical to the built-in bash tool). Returns stdout and stderr; output is truncated to a bounded tail and the full output path is included when truncated. Optionally provide a timeout in seconds. Set run_in_background:true to detach the command as a durable background task instead: the call returns immediately with a task id and output path; default completion delivery sends <background-task-notification>, injected into the current turn while the agent is streaming or starting a follow-up turn when idle; concurrent terminal states merge into one notification.
 - Root schema: `object`
 
 | Field | Required | Type | Description | Constraints |
 | --- | --- | --- | --- | --- |
 | `command` | yes | `string` | Shell command to execute |  |
-| `run_in_background` | no | `boolean` | Optional. Set true to detach this command into the durable background task stack: the call returns immediately with a task id and output path, and terminal state is delivered automatically as <background-task-notification> which also starts a follow-up agent turn. In background mode timeout is a hard-kill deadline in seconds after which the task is force-terminated (0 or omitted = no deadline); foreground timeout semantics are unchanged. Omit or set false for normal foreground execution identical to the built-in bash tool. |  |
+| `run_in_background` | no | `boolean` | Optional. Set true to detach this command into the durable background task stack: the call returns immediately with a task id and output path, and terminal state is delivered automatically as <background-task-notification>, injected into the current turn while the agent is streaming or starting a follow-up turn when idle; concurrent terminal states merge into one notification. In background mode timeout is a hard-kill deadline in seconds after which the task is force-terminated (0 or omitted = no deadline); foreground timeout semantics are unchanged. Omit or set false for normal foreground execution identical to the built-in bash tool. |  |
 | `task_name` | no | `string` | Optional explicit task name shown in the dock, /bg-jobs, the startup receipt, and the completion notification (max 200 characters). Omitted names fall back to the full command. |  |
 | `timeout` | no | `number` | Timeout in seconds (optional, no default timeout) |  |
 
@@ -37,7 +37,7 @@ covers_sources: [src/bash-override.ts]
       "type": "string"
     },
     "run_in_background": {
-      "description": "Optional. Set true to detach this command into the durable background task stack: the call returns immediately with a task id and output path, and terminal state is delivered automatically as <background-task-notification> which also starts a follow-up agent turn. In background mode timeout is a hard-kill deadline in seconds after which the task is force-terminated (0 or omitted = no deadline); foreground timeout semantics are unchanged. Omit or set false for normal foreground execution identical to the built-in bash tool.",
+      "description": "Optional. Set true to detach this command into the durable background task stack: the call returns immediately with a task id and output path, and terminal state is delivered automatically as <background-task-notification>, injected into the current turn while the agent is streaming or starting a follow-up turn when idle; concurrent terminal states merge into one notification. In background mode timeout is a hard-kill deadline in seconds after which the task is force-terminated (0 or omitted = no deadline); foreground timeout semantics are unchanged. Omit or set false for normal foreground execution identical to the built-in bash tool.",
       "type": "boolean"
     },
     "task_name": {
@@ -104,10 +104,15 @@ S1 P2(自读生效):扩展激活时读取宿主**用户级** `settings.json` 的
 时代的 `name`),缺省任务名 = 完整命令原样;`isAgent` 恒为 false(无遥测包装),
 后台任务不支持跨 reload 保活。
 
-**通知投递留痕(P8)**:完成通知经宿主 `sendMessage(→ void)` 投递,插件仅能观测
-同步接受;同步失败回滚 `notified=false` 并以 warn 留痕,异步失败由宿主
-`sendMessage → emitError` 通道留痕(插件无法观测,声明见
-[background-task-runtime](../subsystems/background-task-runtime.md))。
+**通知投递(P3 合并 + P8 留痕)**:终态通知先入批队列,由微任务排水把同一排水段
+的任务合成一条(完整块空行拼接,单条逐字节不变),以 `deliverAs:'steer'` 发送——
+宿主 streaming 时注入**当前轮**下一次模型请求(模型同轮实时看到,不新开轮),
+空闲时触发新轮;批内任一任务触发唤醒 → 整批唤醒。投递经宿主
+`sendMessage(→ void)`,插件仅能观测同步接受;批排水同步失败回滚该批全部
+`notified=false` 并以单处 warn 留痕(不重抛、不重试;结单路径先等排水结算再落盘,持久化值恒等于投递结果),异步失败由宿主
+`sendMessage → emitError` 通道留痕(插件无法观测)。steer 通道依赖宿主 ≥0.84,
+更早宿主(0.81-0.83,peer 范围仍允许)**未核验**,预期回退 follow-up 投递、失去
+合并收益但不破坏功能;细节见 [background-task-runtime](../subsystems/background-task-runtime.md)。
 
 ## 用户启动入口
 

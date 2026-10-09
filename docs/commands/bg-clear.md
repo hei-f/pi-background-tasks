@@ -13,7 +13,7 @@ covers_sources: []
 <!-- pi-docs:begin name="command-contract-bg-clear" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-clear` | `always` | yes | Clear finished background task footer notices | `src/extension.ts:688` |
+| `/bg-clear` | `always` | yes | Clear finished background task footer notices | `src/extension.ts:696` |
 <!-- pi-docs:end name="command-contract-bg-clear" -->
 
 Clear finished background task footer notices.

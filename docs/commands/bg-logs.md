@@ -13,7 +13,7 @@ covers_sources: []
 <!-- pi-docs:begin name="command-contract-bg-logs" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-logs` | `always` | yes | Show bounded output from a background task: /bg-logs <id> [maxBytes] | `src/extension.ts:737` |
+| `/bg-logs` | `always` | yes | Show bounded output from a background task: /bg-logs <id> [maxBytes] | `src/extension.ts:745` |
 <!-- pi-docs:end name="command-contract-bg-logs" -->
 
 Show bounded output from a background task.

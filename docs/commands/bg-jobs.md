@@ -13,7 +13,7 @@ covers_sources: []
 <!-- pi-docs:begin name="command-contract-bg-jobs" generator="scripts/docs/generate.mjs" -->
 | Command | Availability | Default | Description | Provenance |
 | --- | --- | --- | --- | --- |
-| `/bg-jobs` | `always` | yes | List running and recent background tasks: /bg-jobs | `src/extension.ts:722` |
+| `/bg-jobs` | `always` | yes | List running and recent background tasks: /bg-jobs | `src/extension.ts:730` |
 <!-- pi-docs:end name="command-contract-bg-jobs" -->
 
 List running and recent background tasks.

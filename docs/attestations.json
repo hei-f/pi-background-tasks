@@ -16,7 +16,7 @@
       "verdict": "PASS"
     },
     {
-      "authored_body_sha256": "sha256:18ac797b23f5950119af219faecac3868d8b4a1d8dcacb61756cb7970854d5e2",
+      "authored_body_sha256": "sha256:115118cca610ff4aafca4b828b15b10c55af80f809051cad615236ed4c361044",
       "covers_sources": [
         "src/core/common.ts",
         "src/core/host-settings.ts",
@@ -28,14 +28,14 @@
         "src/core/windows-taskkill.ts"
       ],
       "doc_id": "subsystems/background-task-runtime",
-      "notes": "Q3 null退出码语义统一(exitCode===0判completed,外部信号杀死不再误判completed);R2删除零引用deriveTaskNameFromCommand;N4 formatSnapshotList exitCode严格判空;R3/R4 host-settings file://边界注释与parseJsonText复用;Q2 warn留痕注释如实化",
-      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
+      "notes": "P3:finalize/reload结单路径先await批排水结算再落盘notified,持久化值恒等于投递结果,消除写序竞态",
+      "reviewer": "P3 REVIEW修复agent(结单先等排水结算再落盘)",
       "schema_version": "pi-background-tasks.docs-attestation.v1",
       "source_sha256": {
-        "src/core/common.ts": "sha256:916e5f9ee87139943b8ba16153eeb608882bdc171f3d42ef78984fbca11b4fa2",
+        "src/core/common.ts": "sha256:3aee11c23aa61690c166ad84f670e9d0aa2f62e7417f88e4c3f99f699de0122e",
         "src/core/host-settings.ts": "sha256:4588ad3f49b6dc7b4d1dc20cb9c14369d85426d8685ddec54e77bcf4ca8a10bc",
         "src/core/process-tree.ts": "sha256:c65b59f7c92593dd118f2161cb8ce4a99cf854538b3117a707b515a0bb389f7a",
-        "src/core/registry.ts": "sha256:3c1ffcc28908fdef46c27f85d791741e21474caf1f82c760f0d2c6d86c780066",
+        "src/core/registry.ts": "sha256:9982daa30b9a3cdc16d80802fca152af722fce6a8d17bf2bc8ebca174f6e7a23",
         "src/core/reload-shell-owner.ts": "sha256:156695a6f60f508e90392c34d13ebb75466bfc5f559857f1fd7825f3b9a186b4",
         "src/core/shell-policy.ts": "sha256:777c1a4662237bf4b839943556166f0c08e9f0197461ab0e4c0a80fdcb2741e9",
         "src/core/telemetry.ts": "sha256:a2f315e3e0cf54c4046d487dc0ccce85e4f359bf76bc841bd6415831741d213b",
@@ -73,29 +73,29 @@
         "src/ui/background-tasks-manager.ts"
       ],
       "doc_id": "subsystems/host-ui-and-telemetry",
-      "notes": "N1 dock转后台与rerun经startTask helper统一前置hostCommandPrefix(换行拼接);N2 rerun仅显式name透传,无显式名任务沿完整command原样兜底",
-      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
+      "notes": "P3:通知渲染器按content块数补注批规模;工具描述合并投递语义",
+      "reviewer": "P3 REVIEW修复agent(渲染器批规模+描述同步)",
       "schema_version": "pi-background-tasks.docs-attestation.v1",
       "source_sha256": {
         "extensions/background-tasks.ts": "sha256:468def605480f61ebf35a6520ed8499b99e24ec090b115add39cec4573fe501c",
         "src/core/config.ts": "sha256:f2668a161a6f293a405ed26493ac81580dd028cbcfa1a7e91c4588d35d5b7505",
         "src/core/lazy-module.ts": "sha256:cc58caaa48b734134574683f2eceba980885b9c98cefd689c87df5f42bccd82a",
-        "src/extension.ts": "sha256:4c0547a33298f654b41431d73bbe66324f0935cc40dde0fae618d56650930b0a",
+        "src/extension.ts": "sha256:21076a13e22ee19ceee70fa86c1e585d0dc54afb94ae130c1566be3f9bbb49ca",
         "src/ui/background-tasks-manager.ts": "sha256:a3321bcb5185af72151425d8fe8347d7e955cc9479bc41a9e0169c176ce98939"
       },
       "verdict": "PASS"
     },
     {
-      "authored_body_sha256": "sha256:4242018e608d1e2a6f8c679286e3efc731130180bd16b0bc4242fc097a488682",
+      "authored_body_sha256": "sha256:98b359e43758007923a94d3e1caa16894a1e97c393626fe1e17582bbd79cc1bf",
       "covers_sources": [
         "src/bash-override.ts"
       ],
       "doc_id": "tools/bash",
-      "notes": "Q1前台分流剔除task_name防泄漏宿主透传;R1文件头注释更新为S1宿主settings自读生效现行为;N1抽prependCommandPrefix助手统一后台与dock两入口前缀前置",
-      "reviewer": "REVIEW2修复实施agent(代码实测+单测+docs门禁复核)",
+      "notes": "P3:通知投递段措辞同步(结单先等排水结算再落盘)",
+      "reviewer": "P3 REVIEW修复agent(结单落盘策略)",
       "schema_version": "pi-background-tasks.docs-attestation.v1",
       "source_sha256": {
-        "src/bash-override.ts": "sha256:902a2b932bcf20ceffc5a5c387f3711c89eb5fb1bd4a8b153a48910efd616880"
+        "src/bash-override.ts": "sha256:de15f8e5a58242bfd410310a25782d664fbb3de0d6c98d77a7548062c9ce451a"
       },
       "verdict": "PASS"
     }
