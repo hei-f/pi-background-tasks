@@ -13,7 +13,11 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
-import { parseJsonText, shellQuote } from "../../src/core/common.js";
+import {
+  buildTaskNotificationContent,
+  parseJsonText,
+  shellQuote,
+} from "../../src/core/common.js";
 import {
   BackgroundTaskRegistry,
   TERMINAL_SUMMARY_TAIL_BYTES,
@@ -128,6 +132,9 @@ interface HarnessOptions {
     message: CompletionNotificationMessage,
     options: CompletionNotificationOptions,
   ) => void;
+  /** S3 S1:通知批排水调度器注入(透传 registryOptions;缺省生产 queueMicrotask,
+   * 需要手动控制排水时传捕获式 `(d) => { captured = d; }`)。 */
+  scheduleDrain?: (drain: () => void) => void;
   /** M5:终态帧发布负载(任务快照 + 完成摘要)。 */
   publishTerminal?: (publication: BackgroundTaskTerminalPublication) => void;
   logger?: Pick<Console, "error" | "warn">;
@@ -209,6 +216,8 @@ async function createHarness(options: HarnessOptions = {}) {
     registryOptions.taskAdmissionTimeoutMs = options.taskAdmissionTimeoutMs;
   // S3 P5:运行时目录迁宿主私有 agent 目录——单测注入临时 agentDir 保持隔离
   registryOptions.agentDir = agentDir;
+  if (options.scheduleDrain !== undefined)
+    registryOptions.scheduleDrain = options.scheduleDrain;
   if (options.now !== undefined) registryOptions.now = options.now;
   if (options.killProcess !== undefined)
     registryOptions.killProcess = options.killProcess;
@@ -265,6 +274,23 @@ async function waitFor(
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for ${message}`);
+}
+
+/** S3 S1 捕获式排水触发:等待首个入队调度出排水回调后手动执行。
+ * 排水回调在微任务内同步取空队列,调用即完成本批投递(空队列调用为无害 no-op)。 */
+async function drainCaptured(
+  getCaptured: () => (() => void) | undefined,
+  label: string,
+  timeoutMs = 1000,
+): Promise<void> {
+  await waitFor(
+    () => getCaptured() !== undefined,
+    `${label} drain scheduled`,
+    timeoutMs,
+  );
+  const drain = getCaptured();
+  assert.ok(drain, `${label} drain callback must be captured`);
+  drain();
 }
 
 function pidExists(pid: number): boolean {
@@ -1190,7 +1216,16 @@ void describe("BackgroundTaskRegistry", () => {
       assert.ok(execution);
       h.registry.prepareReloadHandoff(lease);
 
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // 负载下固定等待不足:先等待 stop 路径结算(pid 消失 + 终态 + execution 释放),
+      // 再断言其余状态,消除环境性 flaky。
+      await waitFor(
+        () =>
+          !pidExists(pid as number) &&
+          task.status === "failed" &&
+          execution.phase === "released",
+        "handoff deadline stop settles",
+        5000,
+      );
 
       assert.equal(pidExists(pid as number), false);
       assert.equal(task.status, "failed");
@@ -1764,7 +1799,12 @@ void describe("BackgroundTaskRegistry", () => {
       assert.equal(task.killEscalationTimer, undefined);
       assert.equal(terminals.length, 1);
       assert.equal(terminals[0]?.status, "cancelled");
-      assert.equal(h.notifications.length, 1);
+      // S1 排水异步化:生产缺省 queueMicrotask 在 await 间自然排水,计数断言
+      // 按 waitFor 口径等待送达
+      await waitFor(
+        () => h.notifications.length === 1,
+        "root-close barrier notification",
+      );
     } finally {
       groupAlive = false;
       await cleanup(h.root);
@@ -2806,8 +2846,9 @@ void describe("BackgroundTaskRegistry", () => {
         notification.message.content,
         /<guidance>Terminal state and output metadata are durable\. Do not call bg_status to reconfirm; use bg_logs only if output is needed\.<\/guidance>/,
       );
+      // S1:通知以 deliverAs:"steer" 注入(宿主按 streaming/triggerTurn 分流)
       assert.deepEqual(notification.options, {
-        deliverAs: "followUp",
+        deliverAs: "steer",
         triggerTurn: true,
       });
 
@@ -3181,19 +3222,31 @@ void describe("BackgroundTaskRegistry", () => {
         () => task.status === "completed",
         "notification failure task completion",
       );
+      // S1:投递留痕迁至排水层 —— 发送失败在批量排水时回滚 notified 并单处
+      // warn 留痕(调用点不再触发 logger.error),因此等待 warns 而非 errors
       await waitFor(
-        () => failingNotify.errors.length > 0,
-        "notification failure log",
+        () => failingNotify.warns.length === 1,
+        "notification failure warn",
       );
       assert.equal(task.notified, false);
+      // S1:回滚同时回写持久化元数据(经 metadataWriteChain 串行于 finalize 的
+      // 先写之后),故磁盘 notified 最终收敛为 false——等待该回写落盘。
+      await waitFor(
+        async () =>
+          parseJsonObject(
+            await readFile(task.metadataAbsPath, "utf8"),
+            "notification metadata must be an object",
+          )["notified"] === false,
+        "notification rollback persisted",
+      );
       const metadata = parseJsonObject(
         await readFile(task.metadataAbsPath, "utf8"),
         "notification metadata must be an object",
       );
       assert.equal(metadata["notified"], false);
       assert.match(
-        failingNotify.errors.flat().join(" "),
-        /notification failed|send failed/,
+        failingNotify.warns.flat().join(" "),
+        /notification delivery failed for batch|send failed/,
       );
     } finally {
       await cleanup(failingNotify.root);
@@ -3880,7 +3933,11 @@ void describe("BackgroundTaskRegistry", () => {
         true,
         "old-generation frame must be marked stale",
       );
-      assert.equal(h.notifications.length, 1);
+      // S1 排水异步化:送达等待以 waitFor 口径断言
+      await waitFor(
+        () => h.notifications.length === 1,
+        "stale frame notification",
+      );
       assert.equal(
         h.notifications[0]?.options.triggerTurn,
         false,
@@ -3895,7 +3952,10 @@ void describe("BackgroundTaskRegistry", () => {
         "fresh terminal settlement",
       );
       assert.equal(fresh.task.staleBranchFrame, undefined);
-      assert.equal(h.notifications.length, 2);
+      await waitFor(
+        () => h.notifications.length === 2,
+        "fresh frame notification",
+      );
       assert.equal(
         h.notifications[1]?.options.triggerTurn,
         true,
@@ -4163,7 +4223,15 @@ void describe("BackgroundTaskRegistry", () => {
   });
 
   void it("S4 P6: omits <exit-code> for null/undefined and keeps it for numeric exit codes", async () => {
-    const h = await createHarness();
+    // S1 捕获式排水:排水缺省为 queueMicrotask,直调 notifyCompletion(及终态
+    // 异步入队)后排水未自动运行;显式触发 captured() 后再断言。
+    // 通知序:null[0]、manual[1]、zero[2]、three[3]
+    let captured: (() => void) | undefined;
+    const h = await createHarness({
+      scheduleDrain: (drain) => {
+        captured = drain;
+      },
+    });
     try {
       // null:信号终止(close code 恒为 number|null)→ exitCode null → 省略
       const nullTask = await startFakeTask(h, "Exit Code null");
@@ -4172,10 +4240,8 @@ void describe("BackgroundTaskRegistry", () => {
         () => nullTask.task.status !== "running",
         "exit-code null terminal",
       );
-      await waitFor(
-        () => h.notifications.length === 1,
-        "exit-code null notification",
-      );
+      await drainCaptured(() => captured, "exit-code null");
+      assert.equal(h.notifications.length, 1);
       assert.doesNotMatch(
         h.notifications[0]?.message.content ?? "",
         /<exit-code>/u,
@@ -4193,6 +4259,9 @@ void describe("BackgroundTaskRegistry", () => {
         task: unknown,
       ) => void;
       notifyCompletion.call(h.registry, manual);
+      // 直调仅入队,需显式触发排水后通知才送达
+      await drainCaptured(() => captured, "exit-code undefined");
+      assert.equal(h.notifications.length, 2);
       assert.doesNotMatch(
         h.notifications[1]?.message.content ?? "",
         /<exit-code>/u,
@@ -4207,10 +4276,8 @@ void describe("BackgroundTaskRegistry", () => {
       });
       lastSpawn(h).child.close(0, null);
       await waitFor(() => zero.status !== "running", "exit-code zero terminal");
-      await waitFor(
-        () => h.notifications.length === 3,
-        "exit-code zero notification",
-      );
+      await drainCaptured(() => captured, "exit-code zero");
+      assert.equal(h.notifications.length, 3);
       assert.match(
         h.notifications[2]?.message.content ?? "",
         /<exit-code>0<\/exit-code>/u,
@@ -4227,10 +4294,8 @@ void describe("BackgroundTaskRegistry", () => {
         () => three.status !== "running",
         "exit-code three terminal",
       );
-      await waitFor(
-        () => h.notifications.length === 4,
-        "exit-code three notification",
-      );
+      await drainCaptured(() => captured, "exit-code three");
+      assert.equal(h.notifications.length, 4);
       assert.match(
         h.notifications[3]?.message.content ?? "",
         /<exit-code>3<\/exit-code>/u,
@@ -4351,6 +4416,279 @@ void describe("BackgroundTaskRegistry", () => {
         /notification delivery failed/u,
         "warn 仅放一处,不进入 error 通道重复",
       );
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+});
+
+/** S1 批语义测试:启动任务并允许按用例指定 triggerOnCompletion。 */
+async function startBatchTask(
+  h: Awaited<ReturnType<typeof createHarness>>,
+  name: string,
+  triggerOnCompletion = true,
+): Promise<{ task: BgTask; child: FakeChild }> {
+  const task = await h.registry.startTask(h.ctx, "node batch.js", {
+    name,
+    isAgent: false,
+    notifyOnCompletion: true,
+    triggerOnCompletion,
+  });
+  return { task, child: lastSpawn(h).child };
+}
+
+void describe("BackgroundTaskRegistry notification batching", () => {
+  void it("S1 批聚合:同一排水段多条终态合成一次发送,块顺序与终态顺序一致", async () => {
+    let captured: (() => void) | undefined;
+    const h = await createHarness({
+      scheduleDrain: (drain) => {
+        captured = drain;
+      },
+    });
+    try {
+      const first = await startBatchTask(h, "First Batch");
+      const second = await startBatchTask(h, "Second Batch");
+      const third = await startBatchTask(h, "Third Batch");
+      // 连续三任务终态(同一排水段),期间不触发排水;逐个等终态完成以锁定入队
+      // (终态)顺序:状态可见即已入队,而队列只在手动排水时取空,故入队序 = 终态序
+      first.child.close(0, null);
+      await waitFor(() => first.task.status === "completed", "first terminal");
+      second.child.close(0, null);
+      await waitFor(
+        () => second.task.status === "completed",
+        "second terminal",
+      );
+      third.child.close(0, null);
+      await waitFor(() => third.task.status === "completed", "third terminal");
+
+      await drainCaptured(() => captured, "three-task batch");
+      // 手动排水恰一次 → 恰好 1 次发送
+      assert.equal(h.notifications.length, 1);
+      const sent = h.notifications[0];
+      assert.ok(sent, "batch notification should be captured");
+      assert.deepEqual(sent.options, { deliverAs: "steer", triggerTurn: true });
+      assert.equal(sent.message.customType, "background-task-notification");
+      assert.equal(sent.message.display, true);
+      assert.equal(
+        sent.message.content,
+        [
+          buildTaskNotificationContent(first.task),
+          buildTaskNotificationContent(second.task),
+          buildTaskNotificationContent(third.task),
+        ].join("\n\n"),
+      );
+      assert.equal(
+        sent.message.content.split("<background-task-notification>").length - 1,
+        3,
+        "content 应含 3 个完整通知块",
+      );
+      assert.equal(first.task.notified, true);
+      assert.equal(second.task.notified, true);
+      assert.equal(third.task.notified, true);
+      assert.equal(h.warns.length, 0);
+      // 空队列排水为无害 no-op(队列已取空,再次排水直接返回)
+      captured?.();
+      assert.equal(h.notifications.length, 1, "空队列排水不得再次发送");
+      // details 以批内首任务快照作 UI 展示代表
+      assert.equal(sent.message.details.id, first.task.id);
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it("S1 单条兼容:单任务终态一次发送,content 与 helper 单条输出逐字节一致", async () => {
+    let captured: (() => void) | undefined;
+    const h = await createHarness({
+      scheduleDrain: (drain) => {
+        captured = drain;
+      },
+    });
+    try {
+      const { task, child } = await startBatchTask(h, "Single Task");
+      child.close(2, null);
+      await waitFor(() => task.status === "failed", "single terminal");
+      await drainCaptured(() => captured, "single-task batch");
+      assert.equal(h.notifications.length, 1);
+      const sent = h.notifications[0];
+      assert.ok(sent, "single notification should be captured");
+      assert.equal(sent.message.content, buildTaskNotificationContent(task));
+      assert.equal(sent.message.details.id, task.id);
+      assert.equal(task.notified, true);
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it("S1 triggerTurn 批语义:批内任一 trigger+非陈旧 → true,全 false/stale → false", async () => {
+    // 全 false:批内无任何 trigger
+    let noTriggerCaptured: (() => void) | undefined;
+    const noTrigger = await createHarness({
+      scheduleDrain: (drain) => {
+        noTriggerCaptured = drain;
+      },
+    });
+    try {
+      const a = await startBatchTask(noTrigger, "No Trigger A", false);
+      const b = await startBatchTask(noTrigger, "No Trigger B", false);
+      a.child.close(0, null);
+      b.child.close(0, null);
+      await waitFor(
+        () => a.task.status === "completed" && b.task.status === "completed",
+        "all-false terminals",
+      );
+      await drainCaptured(() => noTriggerCaptured, "all-false batch");
+      assert.equal(noTrigger.notifications.length, 1);
+      assert.equal(
+        noTrigger.notifications[0]?.options.triggerTurn,
+        false,
+        "全 false → triggerTurn false",
+      );
+    } finally {
+      noTrigger.registry.setShuttingDown(true);
+      await cleanup(noTrigger.root);
+    }
+
+    // 任一 trigger+非陈旧 → true
+    let anyCaptured: (() => void) | undefined;
+    const anyTrigger = await createHarness({
+      scheduleDrain: (drain) => {
+        anyCaptured = drain;
+      },
+    });
+    try {
+      const quiet = await startBatchTask(anyTrigger, "Quiet Task", false);
+      const wake = await startBatchTask(anyTrigger, "Wake Task", true);
+      quiet.child.close(0, null);
+      wake.child.close(0, null);
+      await waitFor(
+        () =>
+          quiet.task.status === "completed" && wake.task.status === "completed",
+        "any-trigger terminals",
+      );
+      await drainCaptured(() => anyCaptured, "any-trigger batch");
+      assert.equal(
+        anyTrigger.notifications[0]?.options.triggerTurn,
+        true,
+        "批内任一 trigger → triggerTurn true",
+      );
+    } finally {
+      anyTrigger.registry.setShuttingDown(true);
+      await cleanup(anyTrigger.root);
+    }
+
+    // trigger 但陈旧帧 → false(与现状按任务决策的组合等价)
+    let staleCaptured: (() => void) | undefined;
+    const stale = await createHarness({
+      scheduleDrain: (drain) => {
+        staleCaptured = drain;
+      },
+    });
+    try {
+      const staleTask = await startBatchTask(stale, "Stale Wake Task", true);
+      // 推进注册表代次,模拟 reload 后新激活 epoch 与旧代次帧不匹配
+      stale.registry.setActiveBranchGeneration(1);
+      staleTask.child.close(0, null);
+      await waitFor(
+        () => staleTask.task.status === "completed",
+        "stale terminal",
+      );
+      assert.equal(
+        staleTask.task.staleBranchFrame,
+        true,
+        "old-generation frame must be marked stale",
+      );
+      await drainCaptured(() => staleCaptured, "stale batch");
+      assert.equal(
+        stale.notifications[0]?.options.triggerTurn,
+        false,
+        "陈旧帧 trigger → triggerTurn false",
+      );
+    } finally {
+      stale.registry.setShuttingDown(true);
+      await cleanup(stale.root);
+    }
+  });
+
+  void it("S1 P8 批回滚:投递失败回滚批内全部 notified(含持久化)且 warn 恰一次", async () => {
+    let captured: (() => void) | undefined;
+    const h = await createHarness({
+      scheduleDrain: (drain) => {
+        captured = drain;
+      },
+      sendCompletionNotification: () => {
+        throw new Error("send failed");
+      },
+    });
+    try {
+      const first = await startBatchTask(h, "Rollback First");
+      const second = await startBatchTask(h, "Rollback Second");
+      first.child.close(0, null);
+      second.child.close(0, null);
+      await waitFor(
+        () =>
+          first.task.status === "completed" &&
+          second.task.status === "completed",
+        "rollback terminals",
+      );
+      await drainCaptured(() => captured, "failing batch");
+      // 发送失败 → 批内全部回滚 notified=false
+      assert.equal(first.task.notified, false);
+      assert.equal(second.task.notified, false);
+      assert.equal(h.notifications.length, 0);
+      assert.equal(h.warns.length, 1, "批量失败仅单处 warn");
+      assert.match(
+        h.warns.flat().join(" "),
+        /notification delivery failed for batch|send failed/,
+      );
+      // 回滚同步回写持久化元数据,磁盘收敛为 notified=false
+      await waitFor(async () => {
+        const m = parseJsonObject(
+          await readFile(first.task.metadataAbsPath, "utf8"),
+          "rollback metadata must be an object",
+        );
+        return m["notified"] === false;
+      }, "notification rollback persisted");
+    } finally {
+      h.registry.setShuttingDown(true);
+      await cleanup(h.root);
+    }
+  });
+
+  void it("S1 批间隔离:再入队新任务并再次排水 → 独立批次发送、互不回滚", async () => {
+    let captured: (() => void) | undefined;
+    const h = await createHarness({
+      scheduleDrain: (drain) => {
+        captured = drain;
+      },
+    });
+    try {
+      const first = await startBatchTask(h, "First Batch Task");
+      first.child.close(0, null);
+      await waitFor(() => first.task.status === "completed", "first terminal");
+      await drainCaptured(() => captured, "first batch");
+      assert.equal(h.notifications.length, 1);
+      assert.equal(first.task.notified, true);
+
+      // 批间隔离:新任务终态入队后再次手动排水 → 第二次发送
+      const second = await startBatchTask(h, "Second Batch Task");
+      second.child.close(3, null);
+      await waitFor(() => second.task.status === "failed", "second terminal");
+      await drainCaptured(() => captured, "second batch");
+      assert.equal(h.notifications.length, 2);
+      const secondSent = h.notifications[1];
+      assert.ok(secondSent, "second batch notification should be captured");
+      assert.equal(
+        secondSent.message.content,
+        buildTaskNotificationContent(second.task),
+        "第二批只含新任务单块",
+      );
+      assert.equal(secondSent.message.details.id, second.task.id);
+      assert.equal(first.task.notified, true);
+      assert.equal(second.task.notified, true);
+      assert.equal(h.warns.length, 0, "隔离批次无任何告警");
     } finally {
       h.registry.setShuttingDown(true);
       await cleanup(h.root);
